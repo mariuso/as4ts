@@ -10,8 +10,9 @@ import type { Profile } from './types.js';
 
 /**
  * The Peppol AS4 profile constants, in one place. [PEPPOLAS4] fixes the party id
- * type, roles, agreement and default MPC; the MimeType part property is required
- * by [AS4PROFILE] §3.1 but not pinned by Peppol (see README "Open questions").
+ * type, roles, agreement and default MPC. The `MimeType` part property is
+ * required by [AS4PROFILE] §3.1 but Peppol does not pin a value for it, so
+ * `application/xml` is an unverified choice (see README "Verification notes").
  */
 export const peppolProfile: Profile = {
   partyIdType: PEPPOL_PARTY_ID_TYPE,

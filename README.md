@@ -353,6 +353,14 @@ node --import tsx examples/send-one.ts --help
 `examples/smp-lookup.ts` does not verify the SMP response signature and is not
 part of the package.
 
+`examples/send-one.ts` takes the sender credentials either as a PKCS#12
+(`--sender-p12` with `--p12-passphrase`, `--p12-passphrase-file` or
+`AS4_P12_PASSPHRASE`) or as a PEM pair (`--sender-cert`/`--sender-key`). The
+PKCS#12 loader understands the modern PBES2 form only: a container exported with
+a legacy algorithm (RC2/3DES, e.g. `openssl pkcs12 -legacy`) is rejected with a
+hint to re-export it with a current OpenSSL or to pass `--sender-cert` /
+`--sender-key` instead.
+
 ---
 
 ## 11. Specification references
@@ -370,6 +378,12 @@ part of the package.
 | [EBbpsig]             | ebBP Signals 2.0                                        | `NonRepudiationInformation`                                                                                                                                            |
 | [RFC5280]             | X.509 PKI                                               | path validation, CRL/OCSP                                                                                                                                              |
 | [RFC1952] / [RFC2822] | GZIP / Internet Message Format                          | compression, `msg-id`                                                                                                                                                  |
+
+### Verification notes
+
+- **`PartProperties/MimeType` = `application/xml`.** [AS4PROFILE] §3.1 requires
+  the property, but the Peppol AS4 profile does not pin a value for it, so this
+  choice is not confirmed by a Peppol specification.
 
 ---
 

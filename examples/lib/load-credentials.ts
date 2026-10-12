@@ -1,4 +1,4 @@
-import { createPrivateKey, webcrypto } from 'node:crypto';
+import { createPrivateKey, createPublicKey, webcrypto } from 'node:crypto';
 import type { KeyObject } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import * as asn1js from 'asn1js';
@@ -44,42 +44,66 @@ export async function loadSigningMaterialFromP12(path: string, passphrase: strin
   const password = new Uint8Array(Buffer.from(passphrase, 'utf8')).buffer as ArrayBuffer;
   const der = readFileSync(path);
   const pfx = pkijs.PFX.fromBER(new Uint8Array(der));
-  await pfx.parseInternalValues({ password, checkIntegrity: true });
-
-  const authenticatedSafe = pfx.parsedValue?.authenticatedSafe;
-  if (!authenticatedSafe) throw new Error('no authenticated safe found in the PKCS#12 container');
 
   let keyDer: Buffer | null = null;
   const certs: string[] = [];
-  for (const contentInfo of authenticatedSafe.safeContents) {
-    const safeContents = await decryptSafeContents(contentInfo, password);
-    if (!safeContents) continue;
-    for (const bag of safeContents.safeBags) {
-      if (bag.bagId === CERT_BAG) {
-        const certificate = (bag.bagValue as pkijs.CertBag).parsedValue as pkijs.Certificate;
-        certs.push(pem(Buffer.from(certificate.toSchema(true).toBER(false)), 'CERTIFICATE'));
-      } else if (bag.bagId === SHROUDED_KEY_BAG) {
-        const keyBag = bag.bagValue as pkijs.PKCS8ShroudedKeyBag;
-        await decryptKeyBag(keyBag, password);
-        const info = keyBag.parsedValue;
-        if (info) keyDer = Buffer.from(info.toSchema().toBER(false));
-      } else if (bag.bagId === KEY_BAG) {
-        const info = bag.bagValue as pkijs.PrivateKeyInfo;
-        keyDer = Buffer.from(info.toSchema().toBER(false));
+  try {
+    await pfx.parseInternalValues({ password, checkIntegrity: true });
+
+    const authenticatedSafe = pfx.parsedValue?.authenticatedSafe;
+    if (!authenticatedSafe) throw new Error('no authenticated safe found in the PKCS#12 container');
+
+    for (const contentInfo of authenticatedSafe.safeContents) {
+      const safeContents = await decryptSafeContents(contentInfo, password);
+      if (!safeContents) continue;
+      for (const bag of safeContents.safeBags) {
+        if (bag.bagId === CERT_BAG) {
+          const certificate = (bag.bagValue as pkijs.CertBag).parsedValue as pkijs.Certificate;
+          certs.push(pem(Buffer.from(certificate.toSchema(true).toBER(false)), 'CERTIFICATE'));
+        } else if (bag.bagId === SHROUDED_KEY_BAG) {
+          const keyBag = bag.bagValue as pkijs.PKCS8ShroudedKeyBag;
+          await decryptKeyBag(keyBag, password);
+          const info = keyBag.parsedValue;
+          if (info) keyDer = Buffer.from(info.toSchema().toBER(false));
+        } else if (bag.bagId === KEY_BAG) {
+          const info = bag.bagValue as pkijs.PrivateKeyInfo;
+          keyDer = Buffer.from(info.toSchema().toBER(false));
+        }
       }
     }
+  } catch (error) {
+    throw describeP12Error(error);
   }
 
   if (!keyDer) throw new Error('no private key found in the PKCS#12 container');
   if (certs.length === 0) throw new Error('no certificate found in the PKCS#12 container');
 
-  const leaf = pickLeafCertificate(certs);
+  const signingKey = createPrivateKey({ key: keyDer, format: 'der', type: 'pkcs8' });
+  const leaf = pickLeafCertificate(certs, signingKey);
   return {
-    signingKey: createPrivateKey({ key: keyDer, format: 'der', type: 'pkcs8' }),
+    signingKey,
     signingCertificate: leaf,
     chainPem: certs.filter((pemString) => pemString !== leaf),
     source: 'p12',
   };
+}
+
+/**
+ * Translate the opaque errors pkijs raises for pre-PBES2 containers. OpenSSL's
+ * `-legacy` (and older AP exports) use PBE-SHA1-3DES / PBE-SHA1-RC2-40, which
+ * live under the 1.2.840.113549.1.12.1.* OID arc and which pkijs cannot decrypt;
+ * it fails deep in the crypto engine with `Unknown "contentEncryptionAlgorithm"`.
+ */
+function describeP12Error(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/1\.2\.840\.113549\.1\.12\.1\.\d/.test(message) || /contentEncryptionAlgorithm/i.test(message)) {
+    return new Error(
+      'unsupported PKCS#12 encryption: this container uses a legacy algorithm (RC2/3DES, e.g. `openssl -legacy`). ' +
+        'Re-export it with a current OpenSSL or your access-point portal, or pass the key and certificate directly ' +
+        'with --sender-cert and --sender-key.',
+    );
+  }
+  return error instanceof Error ? error : new Error(message);
 }
 
 async function decryptKeyBag(bag: pkijs.PKCS8ShroudedKeyBag, password: ArrayBuffer): Promise<void> {
@@ -111,20 +135,20 @@ export function loadSigningMaterialFromPem(certPath: string, keyPath: string): S
   return { signingKey, signingCertificate, chainPem: [], source: 'pem' };
 }
 
-function pickLeafCertificate(certs: readonly string[]): string {
+/**
+ * Pick the certificate whose public key matches the private key. Peppol AP
+ * certificates carry `CA:FALSE` basic constraints, so the manager certificate is
+ * indistinguishable from its CA by extensions alone — and containers list the CA
+ * first as often as not. The key is the only reliable discriminator.
+ */
+function pickLeafCertificate(certs: readonly string[], signingKey: KeyObject): string {
+  const wanted = createPublicKey(signingKey).export({ type: 'spki', format: 'der' });
   for (const certPem of certs) {
     try {
-      const basic = pkijs.Certificate.fromBER(Buffer.from(pemToDer(certPem))).extensions?.find(
-        (e) => e.extnID === '2.5.29.19',
-      );
-      if (!basic) return certPem;
+      if (createPublicKey(certPem).export({ type: 'spki', format: 'der' }).equals(wanted)) return certPem;
     } catch {
-      // ignore unreadable
+      // ignore unreadable certificate
     }
   }
-  return certs[0]!;
-}
-
-function pemToDer(certPem: string): Uint8Array {
-  return new Uint8Array(Buffer.from(certPem.replace(/-----[A-Z ]+-----/g, '').replace(/\s+/g, ''), 'base64'));
+  throw new Error('no certificate in the PKCS#12 container matches the private key');
 }

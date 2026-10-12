@@ -3,8 +3,7 @@
  *
  * Every URI here is taken from a specification. The reference after each value
  * points at the document and section listed in README.md "Specification
- * references". Values that could not be confirmed against a specification are
- * marked UNVERIFIED and repeated under "Open questions".
+ * references".
  */
 
 // SOAP 1.2. [SOAP12] §2.

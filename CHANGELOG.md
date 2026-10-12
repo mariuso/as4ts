@@ -100,6 +100,15 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   forwarded the message), not `retryable`.
 - **`sentAt` is optional** and absent when no envelope was built, instead of an
   empty string.
+- **The PKCS#12 loader picks the certificate that matches the private key.** It
+  previously used "first certificate without basic constraints, else file order",
+  which chose the CA whenever the manager certificate carried `CA:FALSE` (as
+  Peppol AP certificates do) and the CA was listed first — surfacing later as
+  `signature.mismatch`.
+- **Legacy PKCS#12 containers fail with an actionable message.** Pre-PBES2
+  containers (RC2/3DES, e.g. `openssl pkcs12 -legacy`) now report "re-export with
+  a current OpenSSL, or pass `--sender-cert`/`--sender-key`" instead of pkijs's
+  `Unknown "contentEncryptionAlgorithm"`.
 
 ### Security
 
