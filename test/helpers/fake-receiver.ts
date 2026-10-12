@@ -78,14 +78,13 @@ export interface FakeReceiverOptions {
 
 export async function startFakeReceiver(options: FakeReceiverOptions): Promise<FakeReceiver> {
   const received: ReceivedMessage[] = [];
-  let requests = 0;
+  let cachedReceipt: string | null = null;
   const server: Server = createServer({ cert: options.tlsCertPem, key: options.tlsKeyPem }, (req, res) => {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
     req.on('end', () => {
       const body = Buffer.concat(chunks);
-      requests += 1;
-      const dropFirst = options.mode?.kind === 'drop-first' && requests === 1;
+      const dropFirst = options.mode?.kind === 'drop-first';
       if (options.mode?.kind === 'drop') {
         req.socket.destroy();
         return;
@@ -111,8 +110,15 @@ export async function startFakeReceiver(options: FakeReceiverOptions): Promise<F
         const message = processIncoming(body, String(req.headers['content-type'] ?? ''), options.receiver);
         received.push(message);
         if (dropFirst) {
-          // The receiver accepted and stored the message but its response is lost.
-          req.socket.destroy();
+          if (!cachedReceipt) {
+            // Accept and store the message, retain its receipt, then lose the response.
+            cachedReceipt = buildReceipt(message, options.receiver);
+            req.socket.destroy();
+            return;
+          }
+          // Return the exact receipt generated for the first attempt.
+          res.writeHead(200, { 'Content-Type': 'application/soap+xml; charset=UTF-8' });
+          res.end(cachedReceipt);
           return;
         }
         res.writeHead(200, { 'Content-Type': 'application/soap+xml; charset=UTF-8' });

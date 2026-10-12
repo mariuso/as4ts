@@ -28,6 +28,19 @@ export function emit(onEvent: OnEvent | undefined, event: SendEvent): void {
   }
 }
 
+/**
+ * Run a cleanup and report (never throw) a failure as a `cleanup` event, so a
+ * removal failure cannot mask an already-computed result.
+ */
+export async function cleanupQuietly(cleanup: () => Promise<void>, onEvent: OnEvent | undefined): Promise<void> {
+  const start = performance.now();
+  try {
+    await cleanup();
+  } catch (err) {
+    emit(onEvent, { phase: 'cleanup', durationMs: performance.now() - start, error: safeMessage(err) });
+  }
+}
+
 export function isAbortError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   return err.name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ABORT_ERR';

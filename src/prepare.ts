@@ -10,7 +10,15 @@ import { writePreparedMessage } from './artifact.js';
 import { createTempWorkspace, type TempWorkspace, type TempWorkspaceOptions } from './temp-file.js';
 import { commonNameOf, isValidMessageId, parseCertificate, safeMessage } from './util.js';
 import { peppolProfile } from './profile.js';
-import { callValidator, endpointHost, isAbortError, isFileSystemError, mapSenderFault, timed } from './send-common.js';
+import {
+  callValidator,
+  cleanupQuietly,
+  endpointHost,
+  isAbortError,
+  isFileSystemError,
+  mapSenderFault,
+  timed,
+} from './send-common.js';
 import type { NotSentReason, PrepareAs4Input, PrepareAs4Result } from './types.js';
 import type { SignedReference } from './xml/ws-security.js';
 
@@ -152,7 +160,8 @@ export async function prepareAs4Internal(
     return notPrepared('internal.error', safeMessage(err));
   } finally {
     // A failed preparation leaves nothing behind; a success hands the workspace to
-    // the caller, which owns disposal.
-    if (workspace && !keep) await workspace.cleanup().catch(() => {});
+    // the caller, which owns disposal. A failed cleanup is reported, never thrown.
+    const ws = workspace;
+    if (ws && !keep) await cleanupQuietly(() => ws.cleanup(), onEvent);
   }
 }

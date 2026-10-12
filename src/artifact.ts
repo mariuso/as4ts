@@ -47,9 +47,25 @@ export async function writePreparedMessage(
   return messageFrom(workspace.dir, metadata, () => workspace.cleanup());
 }
 
+/** Artifact fields that must be present, non-empty strings. */
+const REQUIRED_STRING_FIELDS = [
+  'as4MessageId',
+  'sentAt',
+  'endpointUrl',
+  'transportProfile',
+  'receiverCertificateCommonName',
+  'receiverCertificate',
+  'soapXml',
+  'attachmentHref',
+  'boundary',
+  'soapContentId',
+] as const;
+
 /**
- * Reload a persisted artifact from `directory`. Throws when the metadata is
- * missing/unsupported or the attachment is absent or the wrong size.
+ * Reload a persisted artifact from `directory`. Every required field is
+ * validated, the attachment name is pinned to the v1 layout, and the attachment
+ * must be a regular file of the recorded size — an incomplete artifact is
+ * rejected before it can be transmitted.
  */
 export async function loadPreparedMessage(directory: string): Promise<PreparedMessage> {
   let metadata: ArtifactMetadata;
@@ -61,18 +77,56 @@ export async function loadPreparedMessage(directory: string): Promise<PreparedMe
   if (metadata.version !== ARTIFACT_VERSION) {
     throw new Error(`unsupported as4ts artifact version ${metadata.version}`);
   }
-  for (const key of ['as4MessageId', 'soapXml', 'attachmentHref', 'boundary', 'soapContentId'] as const) {
+  // The v1 layout has a single attachment; a different name would make
+  // readAttachment() and transmission read different files.
+  if (metadata.attachmentFile !== ATTACHMENT_FILE) {
+    throw new Error(`unsupported artifact attachment name ${String(metadata.attachmentFile)}`);
+  }
+  for (const key of REQUIRED_STRING_FIELDS) {
     if (typeof metadata[key] !== 'string' || metadata[key] === '') {
       throw new Error(`artifact metadata is missing ${key}`);
     }
   }
-  const attachmentPath = join(directory, metadata.attachmentFile ?? ATTACHMENT_FILE);
+  if (!isScopedId(metadata.documentType) || !isScopedId(metadata.process)) {
+    throw new Error('artifact metadata has an invalid document type or process');
+  }
+  if (
+    typeof metadata.attachmentByteLength !== 'number' ||
+    !Number.isInteger(metadata.attachmentByteLength) ||
+    metadata.attachmentByteLength < 0
+  ) {
+    throw new Error('artifact metadata has an invalid attachment length');
+  }
+  if (!isSignedReferenceList(metadata.signedReferences)) {
+    throw new Error('artifact metadata has invalid signed references');
+  }
+  const attachmentPath = join(directory, ATTACHMENT_FILE);
   const info = await stat(attachmentPath).catch(() => null);
-  if (!info) throw new Error('artifact attachment is missing');
+  if (!info || !info.isFile()) throw new Error('artifact attachment is missing');
   if (info.size !== metadata.attachmentByteLength) {
     throw new Error('artifact attachment does not match its metadata');
   }
   return messageFrom(directory, metadata, () => rm(directory, { recursive: true, force: true }));
+}
+
+function isScopedId(value: unknown): value is ScopedId {
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as Partial<ScopedId>;
+  return typeof candidate.scheme === 'string' && typeof candidate.value === 'string';
+}
+
+function isSignedReferenceList(value: unknown): value is SignedReference[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (reference) =>
+        typeof reference === 'object' &&
+        reference !== null &&
+        typeof (reference as SignedReference).uri === 'string' &&
+        typeof (reference as SignedReference).digest === 'string',
+    )
+  );
 }
 
 /** Absolute path of the encrypted attachment for a prepared message (v1 layout). */

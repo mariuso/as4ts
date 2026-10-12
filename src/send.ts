@@ -1,10 +1,10 @@
 import { prepareAs4Internal } from './prepare.js';
 import { transmitAs4 } from './transmit.js';
 import { createTempWorkspace, type TempWorkspace, type TempWorkspaceOptions } from './temp-file.js';
-import { emit } from './send-common.js';
-import { commonNameOf, parseCertificate, safeMessage } from './util.js';
+import { cleanupQuietly } from './send-common.js';
+import { commonNameOf, parseCertificate } from './util.js';
 import type { Entropy } from './entropy.js';
-import type { NotSentReason, OnEvent, PreparedMessage, SendAs4Input, SendAs4Result } from './types.js';
+import type { NotSentReason, SendAs4Input, SendAs4Result } from './types.js';
 
 /**
  * The one-shot send core: prepare once, transmit once, dispose. It is the
@@ -75,19 +75,6 @@ export async function sendAs4Internal(
       now: input.now,
     });
   } finally {
-    await cleanupMessage(prepared.message, input.onEvent);
-  }
-}
-
-/**
- * Remove the artifact without letting a cleanup failure mask an already-computed
- * result. A `cleanup` event carries a secret-free reason so the caller can retry.
- */
-async function cleanupMessage(message: PreparedMessage, onEvent: OnEvent | undefined): Promise<void> {
-  const start = performance.now();
-  try {
-    await message.dispose();
-  } catch (err) {
-    emit(onEvent, { phase: 'cleanup', durationMs: performance.now() - start, error: safeMessage(err) });
+    await cleanupQuietly(() => prepared.message.dispose(), input.onEvent);
   }
 }

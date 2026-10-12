@@ -109,7 +109,9 @@ test('abort during HTTP: stops the request and removes the temp files', async ()
           http: { connectMs: 5_000, totalMs: 30_000, ca: [tls.caPem] },
         }),
       );
-      setTimeout(() => controller.abort(), 50);
+      // Long enough that preparation completes and the request is in flight
+      // against the hanging receiver before the abort fires.
+      setTimeout(() => controller.abort(), 300);
       const result = await pending;
       assert.equal(result.outcome, 'transport-failure');
       if (result.outcome === 'transport-failure') assert.equal(result.aborted, true);
