@@ -27,7 +27,14 @@ export interface TestPki {
   readonly receiver: TestCert;
   readonly revoked: TestCert;
   /** Build a CRL signed by the intermediate that revokes the given serials. */
-  makeCrl(revokedSerialHexes?: readonly string[], opts?: { thisUpdate?: Date; nextUpdate?: Date }): Buffer;
+  makeCrl(
+    revokedSerialHexes?: readonly string[],
+    opts?: {
+      thisUpdate?: Date;
+      nextUpdate?: Date;
+      extensions?: readonly { readonly oid: string; readonly critical: boolean; readonly der: Buffer }[];
+    },
+  ): Buffer;
 }
 
 export interface TestPkiOptions {
@@ -314,7 +321,11 @@ export function createTestPki(options: TestPkiOptions = {}): TestPki {
 
   const makeCrl = (
     revokedSerialHexes: readonly string[] = [revoked.cert.serialHex],
-    opts: { thisUpdate?: Date; nextUpdate?: Date } = {},
+    opts: {
+      thisUpdate?: Date;
+      nextUpdate?: Date;
+      extensions?: readonly { readonly oid: string; readonly critical: boolean; readonly der: Buffer }[];
+    } = {},
   ): Buffer => buildCrl(intermediate.cert.cert, intermediate.key.keyObject, revokedSerialHexes, opts, now);
 
   return {
@@ -344,13 +355,30 @@ function buildCrl(
   issuerCert: X509Certificate,
   issuerKey: KeyObject,
   revokedSerials: readonly string[],
-  opts: { thisUpdate?: Date; nextUpdate?: Date },
+  opts: {
+    thisUpdate?: Date;
+    nextUpdate?: Date;
+    extensions?: readonly { readonly oid: string; readonly critical: boolean; readonly der: Buffer }[];
+  },
   now: Date,
 ): Buffer {
   const parsed = pkijs.Certificate.fromBER(Buffer.from(issuerCert.raw));
   const issuerName = Buffer.from(parsed.subject.toSchema().toBER(false));
   const signatureAlgorithm = derSequence(derOid(RSA_SHA256_WITH_RSA), derNull());
   const entries = revokedSerials.map((hex) => derSequence(derInteger(Buffer.from(hex, 'hex')), utcTime(now)));
+  const extensionList = opts.extensions ?? [];
+  const crlExtensions =
+    extensionList.length > 0
+      ? derContext(
+          0,
+          derSequence(
+            ...extensionList.map((e) =>
+              derSequence(derOid(e.oid), ...(e.critical ? [tlv(0x01, Buffer.from([0xff]))] : []), tlv(0x04, e.der)),
+            ),
+          ),
+          true,
+        )
+      : null;
   const tbs = derSequence(
     derInteger(Buffer.from([1])),
     signatureAlgorithm,
@@ -358,6 +386,7 @@ function buildCrl(
     utcTime(opts.thisUpdate ?? new Date(now.getTime() - 60_000)),
     utcTime(opts.nextUpdate ?? new Date(now.getTime() + 7 * 24 * 3600 * 1000)),
     derSequence(...entries),
+    ...(crlExtensions ? [crlExtensions] : []),
   );
   const signature = cryptoSign('sha256', tbs, { key: issuerKey, padding: constants.RSA_PKCS1_PADDING });
   return derSequence(tbs, signatureAlgorithm, derBitString(signature));

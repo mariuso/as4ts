@@ -82,6 +82,35 @@ is a deliberate, stricter choice than treating anchor constraints as advisory.
 The configured intermediate set limits which chains can be constructed; it is not
 a substitute for the checks above.
 
+## Revocation
+
+Revocation is a separate, mandatory stage: a certificate is checked against its
+issuer's OCSP responder or CRL, and an answer that cannot be obtained is `unknown`
+(the configured `unreachable` policy decides).
+
+- **OCSP.** The response must be signed by the certificate's issuer, or by a
+  delegated responder that the issuer signed, carries `id-kp-OCSPSigning` and
+  `digitalSignature` (when Key Usage is present), is within its validity window,
+  has no unsupported critical extension, and matches the response's `ResponderID`
+  (by name or key hash). The response must carry a `CertID` for this certificate
+  and a valid `thisUpdate`. An answer whose `nextUpdate` has passed, or which has
+  no `nextUpdate` and is older than `ocspMaxAgeMs` (default 24 hours), is
+  `unknown`; an answer without `nextUpdate` is bounded and expires at
+  `thisUpdate + ocspMaxAgeMs`.
+- **CRL.** The CRL must be signed by, and issued by, the certificate's issuer
+  (compared by full `Name`, not common name), and the issuer must assert
+  `cRLSign` when its Key Usage is present. Delta CRLs (`deltaCRLIndicator`),
+  scoped or indirect CRLs (`issuingDistributionPoint`), unsupported critical CRL
+  extensions, and CRLs without a `nextUpdate` are rejected (`unknown`) rather than
+  treated as "not revoked".
+- **SHA-1.** Revocation signatures (OCSP and CRL) may use SHA-1 for compatibility
+  with deployed responders and CAs, unlike certificate signatures, which are
+  SHA-256/384/512 only. This is separate from the SHA-1 used to compute OCSP
+  `CertID` identifier hashes.
+- **Responder revocation.** A delegated responder's own revocation status is not
+  checked; it is expected to be directly issued by the configured CA and
+  short-lived. This is a stated limit, not an authorization bypass.
+
 ## Limits of this profile
 
 This is a constrained validator, not a general RFC 5280 implementation. It does

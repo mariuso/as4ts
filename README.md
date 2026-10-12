@@ -212,11 +212,10 @@ Current limits:
   envelope. Reusing a message ID alone does not preserve the original signed
   references; a replayable outbound artifact is still needed for reliable
   AS4 retries.
-- **Certificate revocation policy needs a dedicated review.** CRL scope, delegated
-  responder authorization, freshness and cache policy are implemented but have not
-  been reviewed to the same depth as the rest of the PKI path. The
-  [sending review](docs/sending-review.md) records this; its earlier security
-  findings describe the reviewed snapshot.
+- **Revocation has stated limits.** Delta and scoped/indirect CRLs are rejected
+  rather than followed, a CRL must carry a `nextUpdate`, and a delegated OCSP
+  responder's own revocation is not checked. See
+  [`docs/certificate-profile.md`](docs/certificate-profile.md).
 - **Discovery has open compatibility questions.** Wildcard document-type
   matching needs further specification validation, and SMP redirect
   `CertificateUID` matching is not implemented. Supply the correct SML zone

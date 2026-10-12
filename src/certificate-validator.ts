@@ -76,6 +76,7 @@ export function defaultRevocationPolicy(overrides: Partial<RevocationPolicy> = {
     crl: true,
     timeoutMs: 5_000,
     maxResponseBytes: 1024 * 1024,
+    ocspMaxAgeMs: 24 * 60 * 60 * 1000,
     maxCacheMs: 60 * 60 * 1000,
     ...overrides,
   };

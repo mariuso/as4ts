@@ -95,6 +95,24 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **OCSP `nextUpdate` was never parsed, and `thisUpdate` was optional.** OCSP
+  encodes `nextUpdate` inside `[0] EXPLICIT`, but the parser looked for two direct
+  time fields, so a correctly-encoded expired `nextUpdate` was ignored and an
+  answer missing the mandatory `thisUpdate` still returned `good`. The
+  `SingleResponse` is now decoded positionally, `thisUpdate` is required, and a
+  malformed or inconsistent date is rejected.
+- **OCSP freshness could outlive the answer.** An answer without `nextUpdate` is
+  now bounded by `ocspMaxAgeMs` (default 24 hours, configurable) and expires at
+  `thisUpdate + ocspMaxAgeMs`, so it is never cached beyond that.
+- **CRL verification accepted CRLs that do not cover the certificate.** Delta
+  CRLs, scoped or indirect CRLs, and unknown critical CRL extensions are now
+  rejected; the CRL issuer Name must match the certificate issuer (full `Name`,
+  not common name); the issuer must assert `cRLSign` when Key Usage is present;
+  and a CRL without `nextUpdate` is rejected.
+- **A delegated OCSP responder was not bound to the response.** The responder
+  certificate must now match the response's `ResponderID` (by name or key hash),
+  assert `digitalSignature` when Key Usage is present, and carry no unsupported
+  critical extension.
 - **The signer could not be cancelled.** `Signer.sign` now accepts an optional
   `AbortSignal`; the sender passes its own signal to the signer and stops starting
   new phases once the caller aborts. `signerFromKey` refuses to sign when the

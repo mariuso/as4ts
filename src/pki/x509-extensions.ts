@@ -119,7 +119,7 @@ interface RawExtension {
 }
 
 /** Decode a certificate's extensions, rejecting malformed, duplicate or unsupported ones. */
-export function readCertificateExtensions(der: Buffer): ExtensionsResult {
+export function readCertificateExtensions(der: Buffer, allowCritical?: ReadonlySet<string>): ExtensionsResult {
   let raw: RawExtension[];
   try {
     raw = rawExtensions(der);
@@ -140,7 +140,7 @@ export function readCertificateExtensions(der: Buffer): ExtensionsResult {
       if (UNSUPPORTED_PATH_CONSTRAINTS.has(ext.oid)) {
         return { ok: false, reason: `unsupported path-affecting extension ${ext.oid}` };
       }
-      if (ext.critical && !SUPPORTED_CRITICAL.has(ext.oid)) {
+      if (ext.critical && !SUPPORTED_CRITICAL.has(ext.oid) && !allowCritical?.has(ext.oid)) {
         return { ok: false, reason: `unsupported critical extension ${ext.oid}` };
       }
 

@@ -15,6 +15,7 @@ import {
   type DerNode,
 } from './asn1.js';
 import { certFingerprint256, commonNameOf } from '../util.js';
+import { readCertificateExtensions } from './x509-extensions.js';
 
 export type RevocationMode =
   /** A revocation answer that cannot be obtained is treated as failure. Default. */
@@ -33,6 +34,13 @@ export interface RevocationPolicy {
   readonly timeoutMs: number;
   /** Maximum bytes read from an OCSP/CRL response body. Defaults to 1 MiB. */
   readonly maxResponseBytes?: number;
+  /**
+   * Maximum age of an OCSP answer that carries no `nextUpdate`: an answer whose
+   * `thisUpdate` is older than this is treated as `unknown`, and its effective
+   * expiry is `thisUpdate + ocspMaxAgeMs`, so it is never cached beyond that.
+   * Defaults to 24 hours. [RFC6960] §3.2.
+   */
+  readonly ocspMaxAgeMs?: number;
   /** Maximum cache lifetime for a positive/negative revocation answer, milliseconds. */
   readonly maxCacheMs: number;
 }
@@ -182,14 +190,27 @@ export class RevocationCache {
 // CRL
 // ---------------------------------------------------------------------------
 
+interface CrlExtension {
+  readonly oid: string;
+  readonly critical: boolean;
+}
+
 interface ParsedCrl {
+  readonly version: number;
+  /** DER of the CRL issuer Name, compared with the certificate issuer's Name. */
+  readonly issuerDer: Buffer;
   readonly thisUpdate: Date;
   readonly nextUpdate: Date | null;
   readonly revoked: ReadonlySet<string>;
+  readonly extensions: readonly CrlExtension[];
   readonly tbsRaw: Buffer;
   readonly signature: Buffer;
   readonly signatureAlgorithmOid: string;
 }
+
+/** CRL extensions the constrained profile cannot honour. [RFC5280] §5.2.4. */
+const CRL_DELTA_INDICATOR = '2.5.29.27';
+const CRL_ISSUING_DISTRIBUTION_POINT = '2.5.29.28';
 
 function parseCrl(der: Buffer): ParsedCrl {
   const list = parseDer(der).node;
@@ -200,10 +221,17 @@ function parseCrl(der: Buffer): ParsedCrl {
   if (!tbs || !sigAlg || !sigValue) throw new Error('CRL: malformed');
   const tbsChildren = children(tbs);
   let i = 0;
-  if (tbsChildren[i] && tbsChildren[i]!.tag === TAG.INTEGER) i += 1; // version
+  let version = 0; // v1
+  if (tbsChildren[i] && tbsChildren[i]!.tag === TAG.INTEGER) {
+    version = tbsChildren[i]!.value[0] ?? 0;
+    i += 1;
+  }
   i += 1; // signature AlgorithmIdentifier
-  i += 1; // issuer
-  const thisNode = tbsChildren[i++];
+  const issuer = tbsChildren[i];
+  i += 1;
+  if (!issuer) throw new Error('CRL: no issuer');
+  const thisNode = tbsChildren[i];
+  i += 1;
   if (!thisNode) throw new Error('CRL: no thisUpdate');
   const thisUpdate = decodeTime(thisNode);
   let nextUpdate: Date | null = null;
@@ -218,13 +246,45 @@ function parseCrl(der: Buffer): ParsedCrl {
       const serial = children(entry)[0];
       if (serial && serial.tag === TAG.INTEGER) revoked.add(decodeIntegerHex(serial.value));
     }
+    i += 1;
+  }
+  // crlExtensions [0] EXPLICIT Extensions OPTIONAL. Extensions require v2.
+  const extensions: CrlExtension[] = [];
+  const extWrap = tbsChildren[i];
+  if (extWrap && extWrap.cls === 2 && extWrap.tag === 0) {
+    if (version < 1) throw new Error('CRL: extensions on a v1 CRL');
+    const extSeq = parseDer(extWrap.value).node;
+    for (const ext of children(extSeq)) {
+      const extParts = children(ext);
+      const oidNode = extParts[0];
+      if (!oidNode || oidNode.tag !== TAG.OID) throw new Error('CRL: malformed extension');
+      const booleanNode = extParts.find((n) => n.tag === TAG.BOOLEAN);
+      extensions.push({ oid: decodeOid(oidNode.value), critical: booleanNode ? booleanNode.value[0] !== 0 : false });
+    }
   }
   const algChildren = children(sigAlg);
   const signatureAlgorithmOid = algChildren[0] ? decodeOid(algChildren[0].value) : '';
   const signature = sigValue.value.subarray(1); // drop unused-bits byte
-  return { thisUpdate, nextUpdate, revoked, tbsRaw: tbs.raw, signature, signatureAlgorithmOid };
+  return {
+    version,
+    issuerDer: Buffer.from(issuer.raw),
+    thisUpdate,
+    nextUpdate,
+    revoked,
+    extensions,
+    tbsRaw: tbs.raw,
+    signature,
+    signatureAlgorithmOid,
+  };
 }
 
+/**
+ * Hash algorithms accepted for OCSP-response and CRL signatures. Unlike the
+ * certificate profile, which rejects SHA-1 certificates, revocation responses are
+ * accepted with SHA-1 for compatibility with deployed responders and CAs. This is
+ * deliberately separate from the SHA-1 used to compute OCSP CertID identifier
+ * hashes (see `expectedCertId`).
+ */
 const RSA_HASH_BY_OID: Record<string, string> = {
   '1.2.840.113549.1.1.5': 'sha1',
   '1.2.840.113549.1.1.11': 'sha256',
@@ -329,7 +389,15 @@ interface ParsedOcsp {
   readonly signatureAlgorithmOid: string;
   /** Certificates embedded in the response, used to find a delegated responder. */
   readonly certs: readonly Buffer[];
+  /** ResponderID carried by the response: byName (subject) or byKey (key hash). */
+  readonly responderId: ResponderId | null;
   readonly responses: readonly OcspSingleResponse[];
+}
+
+interface ResponderId {
+  readonly kind: 'name' | 'key';
+  /** The Name DER for `name`, or the KeyHash bytes for `key`. */
+  readonly value: Buffer;
 }
 
 /** Parse a CertID SEQUENCE. */
@@ -393,62 +461,101 @@ function parseOcspResponse(der: Buffer): ParsedOcsp {
     for (const cert of children(certsSeq)) certs.push(Buffer.from(cert.raw));
   }
 
-  // ResponseData -> responses SEQUENCE OF SingleResponse
-  const responses: OcspSingleResponse[] = [];
+  // ResponseData -> responderID (byName [1] or byKey [2]) and responses.
   const rdChildren = children(tbsResponseData);
+  let responderId: ResponderId | null = null;
+  for (const node of rdChildren) {
+    if (node.cls !== 2) continue;
+    if (node.tag === 1) {
+      responderId = { kind: 'name', value: Buffer.from(node.value) };
+      break;
+    }
+    if (node.tag === 2) {
+      let value = Buffer.from(node.value);
+      if (node.constructed) {
+        const inner = children(parseDer(node.value).node)[0];
+        if (inner && inner.tag === TAG.OCTET_STRING) value = Buffer.from(inner.value);
+      }
+      responderId = { kind: 'key', value };
+      break;
+    }
+  }
+
+  const responses: OcspSingleResponse[] = [];
   const responsesSeq = rdChildren.find(
     (c) => c.tag === TAG.SEQUENCE && children(c).some((x) => x.tag === TAG.SEQUENCE),
   );
   if (responsesSeq) {
     for (const single of children(responsesSeq)) {
       const sc = children(single);
-      if (sc.length === 0) continue;
+      if (sc.length < 3) continue; // certID, certStatus and thisUpdate are mandatory
       const certId = parseCertId(sc[0]!);
-      const certStatus = sc.find((c) => c.cls === 2 && (c.tag === 0 || c.tag === 1 || c.tag === 2));
-      const times = sc.filter((c) => c.tag === TAG.UTC_TIME || c.tag === TAG.GENERALIZED_TIME);
+      const certStatus = sc[1];
       let status: RevocationStatus = 'unknown';
-      if (certStatus) {
+      if (certStatus && certStatus.cls === 2) {
         if (certStatus.tag === OcspCertStatus.Good) status = 'good';
         else if (certStatus.tag === OcspCertStatus.Revoked) status = 'revoked';
       }
-      responses.push({
-        certId,
-        status,
-        thisUpdate: times[0] ? decodeTime(times[0]) : null,
-        nextUpdate: times[1] ? decodeTime(times[1]) : null,
-      });
+      // thisUpdate is a mandatory direct GeneralizedTime/UTCTime.
+      let index = 2;
+      const thisNode = sc[index];
+      let thisUpdate: Date | null = null;
+      if (thisNode && (thisNode.tag === TAG.GENERALIZED_TIME || thisNode.tag === TAG.UTC_TIME)) {
+        thisUpdate = decodeTime(thisNode);
+        index += 1;
+      }
+      // nextUpdate is optional and wrapped in [0] EXPLICIT, so its time sits one
+      // level deeper than thisUpdate's; the previous parser missed it entirely.
+      let nextUpdate: Date | null = null;
+      const nextNode = sc[index];
+      if (nextNode && nextNode.cls === 2 && nextNode.tag === 0) {
+        const inner = parseDer(nextNode.value).node;
+        if (inner.tag === TAG.GENERALIZED_TIME || inner.tag === TAG.UTC_TIME) nextUpdate = decodeTime(inner);
+      }
+      responses.push({ certId, status, thisUpdate, nextUpdate });
     }
   }
-  return { tbsRaw: tbsResponseData.raw, signature, signatureAlgorithmOid: sigAlgOid, certs, responses };
+  return { tbsRaw: tbsResponseData.raw, signature, signatureAlgorithmOid: sigAlgOid, certs, responderId, responses };
 }
 
 const OID_OCSP_SIGNING = '1.3.6.1.5.5.7.3.9';
-const OID_EKU = '2.5.29.37';
+/** id-pkix-ocsp-nocheck: asserts the responder need not be checked for revocation. */
+const OID_OCSP_NO_CHECK = '1.3.6.1.5.5.7.48.1.5';
+const RESPONDER_CRITICAL_ALLOWLIST: ReadonlySet<string> = new Set([OID_OCSP_NO_CHECK]);
 
-/** True when the certificate asserts the id-kp-OCSPSigning extended key usage. */
-function hasOcspSigningEku(cert: X509Certificate): boolean {
-  try {
-    const tbs = tbsOfCert(Buffer.from(cert.raw));
-    for (const ext of extensionsOf(tbs)) {
-      const list = children(ext);
-      const oidNode = list[0];
-      if (!oidNode || oidNode.tag !== TAG.OID || decodeOid(oidNode.value) !== OID_EKU) continue;
-      const valueNode = list.find((n) => n.tag === TAG.OCTET_STRING);
-      if (!valueNode) continue;
-      const eku = parseDer(valueNode.value).node;
-      return children(eku).some((n) => n.tag === TAG.OID && decodeOid(n.value) === OID_OCSP_SIGNING);
-    }
-  } catch {
-    return false;
-  }
-  return false;
+/** SHA-1 of the responder's public key, per [RFC6960] §4.2.2.2 (excludes tag/length). */
+function responderKeyHash(cert: X509Certificate): Buffer {
+  return sha1(publicKeyBits(Buffer.from(cert.raw)));
 }
 
-/** Verify the OCSP signature with the issuer key or a delegated responder cert. */
+/** The response's ResponderID must identify the certificate that signed it. [RFC6960] §4.2.2.2.1. */
+function matchesResponderId(responder: X509Certificate, id: ResponderId): boolean {
+  if (id.kind === 'name') {
+    try {
+      return Buffer.compare(id.value, subjectNameDer(Buffer.from(responder.raw))) === 0;
+    } catch {
+      return false;
+    }
+  }
+  return Buffer.compare(id.value, responderKeyHash(responder)) === 0;
+}
+
+/**
+ * Verify the OCSP signature with the issuer key or a delegated responder cert.
+ *
+ * A delegated responder is accepted only when it is an end entity the issuer
+ * signed, carries id-kp-OCSPSigning, is within its validity window, asserts
+ * digitalSignature when Key Usage is present, has no unsupported critical
+ * extension, and its identity matches the response's ResponderID. The responder's
+ * own revocation status is not checked (it is directly issued by the configured
+ * CA and short-lived); that policy is deliberate and can be tightened later.
+ */
 function verifyOcspSignature(parsed: ParsedOcsp, issuer: X509Certificate, now: Date): boolean {
   if (verifySignature(parsed.signatureAlgorithmOid, parsed.tbsRaw, parsed.signature, issuer.publicKey)) {
     return true;
   }
+  const id = parsed.responderId;
+  if (!id) return false;
   for (const der of parsed.certs) {
     let responder: X509Certificate;
     try {
@@ -459,7 +566,11 @@ function verifyOcspSignature(parsed: ParsedOcsp, issuer: X509Certificate, now: D
     const from = new Date(responder.validFrom);
     const to = new Date(responder.validTo);
     if (now < from || now > to) continue;
-    if (!hasOcspSigningEku(responder)) continue;
+    const extensions = readCertificateExtensions(Buffer.from(responder.raw), RESPONDER_CRITICAL_ALLOWLIST);
+    if (!extensions.ok) continue;
+    if (!extensions.extensions.extendedKeyUsage?.includes(OID_OCSP_SIGNING)) continue;
+    if (extensions.extensions.keyUsage && !extensions.extensions.keyUsage.includes('digitalSignature')) continue;
+    if (!matchesResponderId(responder, id)) continue;
     try {
       if (!responder.verify(issuer.publicKey)) continue;
     } catch {
@@ -478,6 +589,9 @@ function verifyOcspSignature(parsed: ParsedOcsp, issuer: X509Certificate, now: D
 
 /** Default cap on an OCSP/CRL response body, in bytes. */
 const DEFAULT_MAX_REVOCATION_RESPONSE_BYTES = 1024 * 1024;
+
+/** Default maximum age of an OCSP answer that carries no `nextUpdate`. */
+const DEFAULT_OCSP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Fetch a revocation resource and read at most `maxBytes` of its body while the
@@ -620,18 +734,35 @@ async function tryOcsp(
     const expected = expectedCertId(cert, issuer);
     const match = parsed.responses.find((r) => r.certId && certIdMatches(r.certId, expected));
     if (!match) return null;
-    if (match.thisUpdate && verifiedAt < match.thisUpdate) {
+    if (!match.thisUpdate || Number.isNaN(match.thisUpdate.getTime())) {
+      return { status: 'unknown', source: 'ocsp', reason: 'OCSP response has no valid thisUpdate' };
+    }
+    if (verifiedAt < match.thisUpdate) {
       return { status: 'unknown', source: 'ocsp', reason: 'OCSP thisUpdate in the future' };
     }
-    if (match.nextUpdate && verifiedAt > match.nextUpdate) {
-      return { status: 'unknown', source: 'ocsp', reason: 'OCSP response expired' };
+    const maxAgeMs = options.policy.ocspMaxAgeMs ?? DEFAULT_OCSP_MAX_AGE_MS;
+    let expiresAt: Date;
+    if (match.nextUpdate) {
+      if (Number.isNaN(match.nextUpdate.getTime()) || match.nextUpdate < match.thisUpdate) {
+        return { status: 'unknown', source: 'ocsp', reason: 'OCSP nextUpdate is invalid' };
+      }
+      if (verifiedAt > match.nextUpdate) {
+        return { status: 'unknown', source: 'ocsp', reason: 'OCSP response expired' };
+      }
+      expiresAt = match.nextUpdate;
+    } else {
+      // No nextUpdate: bound the answer's age, and expire it at
+      // thisUpdate + maxAgeMs so a replayed answer is never cached past that.
+      if (verifiedAt.getTime() - match.thisUpdate.getTime() > maxAgeMs) {
+        return {
+          status: 'unknown',
+          source: 'ocsp',
+          reason: 'OCSP response without nextUpdate is older than ocspMaxAgeMs',
+        };
+      }
+      expiresAt = new Date(match.thisUpdate.getTime() + maxAgeMs);
     }
-    return {
-      status: match.status,
-      source: 'ocsp',
-      reason: `OCSP status ${match.status}`,
-      ...(match.nextUpdate ? { expiresAt: match.nextUpdate } : {}),
-    };
+    return { status: match.status, source: 'ocsp', reason: `OCSP status ${match.status}`, expiresAt };
   } catch {
     return null;
   }
@@ -658,26 +789,49 @@ async function tryCrl(
     if (!verifySignature(crl.signatureAlgorithmOid, crl.tbsRaw, crl.signature, issuer.publicKey)) {
       return { status: 'unknown', source: 'crl', reason: 'CRL signature not verifiable with issuer key' };
     }
+    // Coverage: reject CRLs the constrained profile cannot interpret, rather than
+    // treating absence from them as non-revocation. [RFC5280] §5.2.4, §6.3.3.
+    for (const ext of crl.extensions) {
+      if (ext.oid === CRL_DELTA_INDICATOR) {
+        return { status: 'unknown', source: 'crl', reason: 'delta CRLs are not supported' };
+      }
+      if (ext.oid === CRL_ISSUING_DISTRIBUTION_POINT) {
+        return { status: 'unknown', source: 'crl', reason: 'scoped or indirect CRLs are not supported' };
+      }
+      if (ext.critical) {
+        return { status: 'unknown', source: 'crl', reason: `unsupported critical CRL extension ${ext.oid}` };
+      }
+    }
+    // The CRL must be issued by this certificate's issuer (full Name, not CN).
+    if (Buffer.compare(crl.issuerDer, subjectNameDer(Buffer.from(issuer.raw))) !== 0) {
+      return { status: 'unknown', source: 'crl', reason: 'CRL issuer does not match the certificate issuer' };
+    }
+    // The issuer must be permitted to sign CRLs when it asserts Key Usage.
+    const issuerExtensions = readCertificateExtensions(Buffer.from(issuer.raw));
+    if (
+      issuerExtensions.ok &&
+      issuerExtensions.extensions.keyUsage &&
+      !issuerExtensions.extensions.keyUsage.includes('cRLSign')
+    ) {
+      return { status: 'unknown', source: 'crl', reason: 'CRL issuer lacks cRLSign' };
+    }
     const verifiedAt = options.now();
-    if (verifiedAt < crl.thisUpdate)
+    if (Number.isNaN(crl.thisUpdate.getTime())) {
+      return { status: 'unknown', source: 'crl', reason: 'CRL has no valid thisUpdate' };
+    }
+    if (verifiedAt < crl.thisUpdate) {
       return { status: 'unknown', source: 'crl', reason: 'CRL thisUpdate in the future' };
-    if (crl.nextUpdate && verifiedAt > crl.nextUpdate) {
+    }
+    if (!crl.nextUpdate) {
+      return { status: 'unknown', source: 'crl', reason: 'CRL has no nextUpdate' };
+    }
+    if (verifiedAt > crl.nextUpdate) {
       return { status: 'unknown', source: 'crl', reason: 'CRL expired' };
     }
     if (crl.revoked.has(cert.serialNumber.toLowerCase())) {
-      return {
-        status: 'revoked',
-        source: 'crl',
-        reason: 'serial revoked in CRL',
-        ...(crl.nextUpdate ? { expiresAt: crl.nextUpdate } : {}),
-      };
+      return { status: 'revoked', source: 'crl', reason: 'serial revoked in CRL', expiresAt: crl.nextUpdate };
     }
-    return {
-      status: 'good',
-      source: 'crl',
-      reason: 'serial absent from CRL',
-      ...(crl.nextUpdate ? { expiresAt: crl.nextUpdate } : {}),
-    };
+    return { status: 'good', source: 'crl', reason: 'serial absent from CRL', expiresAt: crl.nextUpdate };
   } catch {
     return null;
   }

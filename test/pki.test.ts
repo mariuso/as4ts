@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { constants, sign as cryptoSign } from 'node:crypto';
+import { constants, createHash, sign as cryptoSign, X509Certificate } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { buildCertificatePath } from '../src/pki/chain.js';
@@ -10,6 +10,7 @@ import {
   children,
   derBitString,
   derContext,
+  derInteger,
   derNull,
   derOctetString,
   derOid,
@@ -18,7 +19,7 @@ import {
   tlv,
 } from '../src/pki/asn1.js';
 import { parseCertificate } from '../src/util.js';
-import { defaultRevocationPolicy } from '../src/certificate-validator.js';
+import { defaultRevocationPolicy, RevocationCache } from '../src/certificate-validator.js';
 import { createTestPki, createDelegatedResponder, type TestCert } from './helpers/pki.js';
 
 const DAY = 24 * 3600 * 1000;
@@ -259,6 +260,204 @@ test('bounds the revocation response body and treats an oversized body as no ans
   assert.equal(answer.status, 'unknown');
 });
 
+function ocspFetch(ocsp: Buffer): typeof fetch {
+  return (async (input: RequestInfo | URL) =>
+    String(input).includes('ocsp')
+      ? new Response(new Uint8Array(ocsp), { status: 200 })
+      : new Response('', { status: 404 })) as unknown as typeof fetch;
+}
+
+function crlFetch(crl: Buffer): typeof fetch {
+  return (async (input: RequestInfo | URL) =>
+    String(input).includes('crl')
+      ? new Response(new Uint8Array(crl), { status: 200 })
+      : new Response('', { status: 404 })) as unknown as typeof fetch;
+}
+
+function receiverCertId(pki: ReturnType<typeof createTestPki>): Buffer {
+  return certIdFromRequest(buildOcspRequest(parseCertificate(pki.receiver.certPem), pki.intermediate.cert));
+}
+
+test('rejects an OCSP answer whose correctly-tagged nextUpdate has passed', async () => {
+  const pki = createTestPki();
+  const responder = createDelegatedResponder(pki);
+  const now = new Date();
+  const ocsp = buildOcspResponse({
+    responder,
+    certId: receiverCertId(pki),
+    thisUpdate: new Date(now.getTime() - 2 * 3600_000),
+    nextUpdate: new Date(now.getTime() - 3600_000),
+  });
+  const answer = await checkRevocation(
+    parseCertificate(pki.receiver.certPem),
+    pki.intermediate.cert,
+    { ocsp: ['http://ocsp.example/'], crl: [] },
+    {
+      policy: defaultRevocationPolicy({ ocsp: true, crl: true, timeoutMs: 2000, maxCacheMs: 1000 }),
+      now: () => now,
+      fetchImpl: ocspFetch(ocsp),
+    },
+  );
+  assert.equal(answer.status, 'unknown', answer.reason);
+});
+
+test('rejects an OCSP answer with no thisUpdate', async () => {
+  const pki = createTestPki();
+  const responder = createDelegatedResponder(pki);
+  const now = new Date();
+  const ocsp = buildOcspResponse({
+    responder,
+    certId: receiverCertId(pki),
+    thisUpdate: null,
+    nextUpdate: new Date(now.getTime() + 3600_000),
+  });
+  const answer = await checkRevocation(
+    parseCertificate(pki.receiver.certPem),
+    pki.intermediate.cert,
+    { ocsp: ['http://ocsp.example/'], crl: [] },
+    {
+      policy: defaultRevocationPolicy({ ocsp: true, crl: true, timeoutMs: 2000, maxCacheMs: 1000 }),
+      now: () => now,
+      fetchImpl: ocspFetch(ocsp),
+    },
+  );
+  assert.equal(answer.status, 'unknown', answer.reason);
+});
+
+test('rejects an OCSP answer whose ResponderID does not match the signer', async () => {
+  const pki = createTestPki();
+  const responder = createDelegatedResponder(pki);
+  const now = new Date();
+  const ocsp = buildOcspResponse({
+    responder,
+    certId: receiverCertId(pki),
+    thisUpdate: new Date(now.getTime() - 60_000),
+    nextUpdate: new Date(now.getTime() + 3600_000),
+    responderId: createHash('sha1').update('not the responder key').digest(),
+  });
+  const answer = await checkRevocation(
+    parseCertificate(pki.receiver.certPem),
+    pki.intermediate.cert,
+    { ocsp: ['http://ocsp.example/'], crl: [] },
+    {
+      policy: defaultRevocationPolicy({ ocsp: true, crl: true, timeoutMs: 2000, maxCacheMs: 1000 }),
+      now: () => now,
+      fetchImpl: ocspFetch(ocsp),
+    },
+  );
+  assert.notEqual(answer.status, 'good');
+});
+
+test('bounds an OCSP answer without nextUpdate by ocspMaxAgeMs', async () => {
+  const pki = createTestPki();
+  const responder = createDelegatedResponder(pki);
+  const now = new Date();
+  const maxAgeMs = 3600_000;
+  const thisUpdate = new Date(Math.floor((now.getTime() - 60_000) / 1000) * 1000); // whole seconds only
+
+  const recent = buildOcspResponse({ responder, certId: receiverCertId(pki), thisUpdate, nextUpdate: null });
+  const accepted = await checkRevocation(
+    parseCertificate(pki.receiver.certPem),
+    pki.intermediate.cert,
+    { ocsp: ['http://ocsp.example/'], crl: [] },
+    {
+      policy: defaultRevocationPolicy({
+        ocsp: true,
+        crl: true,
+        timeoutMs: 2000,
+        maxCacheMs: 1000,
+        ocspMaxAgeMs: maxAgeMs,
+      }),
+      now: () => now,
+      fetchImpl: ocspFetch(recent),
+    },
+  );
+  assert.equal(accepted.status, 'good');
+  assert.equal(accepted.expiresAt?.getTime(), thisUpdate.getTime() + maxAgeMs);
+
+  const stale = buildOcspResponse({
+    responder,
+    certId: receiverCertId(pki),
+    thisUpdate: new Date(now.getTime() - 2 * maxAgeMs),
+    nextUpdate: null,
+  });
+  const rejected = await checkRevocation(
+    parseCertificate(pki.receiver.certPem),
+    pki.intermediate.cert,
+    { ocsp: ['http://ocsp.example/'], crl: [] },
+    {
+      policy: defaultRevocationPolicy({
+        ocsp: true,
+        crl: true,
+        timeoutMs: 2000,
+        maxCacheMs: 1000,
+        ocspMaxAgeMs: maxAgeMs,
+      }),
+      now: () => now,
+      fetchImpl: ocspFetch(stale),
+    },
+  );
+  assert.equal(rejected.status, 'unknown', rejected.reason);
+});
+
+test('does not serve a cached OCSP answer past its effective expiry', async () => {
+  const pki = createTestPki();
+  const responder = createDelegatedResponder(pki);
+  const maxAgeMs = 3600_000;
+  const thisUpdate = new Date(Date.now() - 60_000);
+  let nowMs = Date.now();
+  const ocsp = buildOcspResponse({ responder, certId: receiverCertId(pki), thisUpdate, nextUpdate: null });
+  const options = {
+    policy: defaultRevocationPolicy({
+      ocsp: true,
+      crl: true,
+      timeoutMs: 2000,
+      maxCacheMs: 10 * maxAgeMs,
+      ocspMaxAgeMs: maxAgeMs,
+    }),
+    now: () => new Date(nowMs),
+    fetchImpl: ocspFetch(ocsp),
+    cache: new RevocationCache(),
+  };
+  const first = await checkRevocation(
+    parseCertificate(pki.receiver.certPem),
+    pki.intermediate.cert,
+    { ocsp: ['http://ocsp.example/'], crl: [] },
+    options,
+  );
+  assert.equal(first.status, 'good');
+
+  nowMs = thisUpdate.getTime() + maxAgeMs + 1000;
+  const second = await checkRevocation(
+    parseCertificate(pki.receiver.certPem),
+    pki.intermediate.cert,
+    { ocsp: ['http://ocsp.example/'], crl: [] },
+    options,
+  );
+  assert.equal(second.status, 'unknown', second.reason);
+});
+
+test('rejects a delta CRL instead of treating absence from it as non-revocation', async () => {
+  const pki = createTestPki();
+  const now = new Date();
+  const delta = pki.makeCrl([], {
+    thisUpdate: new Date(now.getTime() - 60_000),
+    nextUpdate: new Date(now.getTime() + 7 * 24 * 3600 * 1000),
+    extensions: [{ oid: '2.5.29.27', critical: true, der: derInteger(Buffer.from([1])) }],
+  });
+  const answer = await checkRevocation(
+    parseCertificate(pki.receiver.certPem),
+    pki.intermediate.cert,
+    { ocsp: [], crl: ['http://crl.example/root.crl'] },
+    {
+      policy: defaultRevocationPolicy({ ocsp: false, crl: true, timeoutMs: 2000, maxCacheMs: 1000 }),
+      now: () => now,
+      fetchImpl: crlFetch(delta),
+    },
+  );
+  assert.notEqual(answer.status, 'good');
+});
+
 function certIdFromRequest(requestDer: Buffer): Buffer {
   const tbsRequest = children(parseDer(requestDer).node)[0]!;
   const requestList = children(tbsRequest)[0]!;
@@ -280,24 +479,37 @@ function generalizedTime(date: Date): Buffer {
   return tlv(0x18, Buffer.from(text, 'latin1'));
 }
 
+function responderKeyHash(cert: X509Certificate): Buffer {
+  const tbs = children(parseDer(Buffer.from(cert.raw)).node)[0]!;
+  const list = children(tbs);
+  let i = 0;
+  if (list[i] && list[i]!.cls === 2 && list[i]!.tag === 0) i += 1; // version
+  i += 5; // serial, signature, issuer, validity, subject
+  const spki = list[i]!;
+  const bitString = children(spki)[1]!;
+  return createHash('sha1').update(bitString.value.subarray(1)).digest();
+}
+
 function buildOcspResponse(input: {
   readonly responder: TestCert;
   /** Raw CertID TLV to echo in the SingleResponse (from buildOcspRequest). */
   readonly certId: Buffer;
-  readonly thisUpdate: Date;
-  readonly nextUpdate: Date;
+  /** `null` omits thisUpdate entirely (a malformed response). */
+  readonly thisUpdate?: Date | null;
+  /** `null` omits nextUpdate entirely. */
+  readonly nextUpdate?: Date | null;
+  /** Override the byKey ResponderID bytes (identity-mismatch tests). */
+  readonly responderId?: Buffer;
 }): Buffer {
+  const singleParts: Buffer[] = [input.certId, derContext(0, Buffer.alloc(0))];
+  if (input.thisUpdate !== null) singleParts.push(generalizedTime(input.thisUpdate ?? new Date()));
+  if (input.nextUpdate !== null && input.nextUpdate !== undefined) {
+    singleParts.push(derContext(0, generalizedTime(input.nextUpdate), true));
+  }
   const tbs = derSequence(
-    derContext(2, Buffer.alloc(20)),
+    derContext(2, input.responderId ?? responderKeyHash(input.responder.cert)),
     generalizedTime(new Date()),
-    derSequence(
-      derSequence(
-        input.certId,
-        derContext(0, Buffer.alloc(0)),
-        generalizedTime(input.thisUpdate),
-        derContext(0, generalizedTime(input.nextUpdate), true),
-      ),
-    ),
+    derSequence(derSequence(...singleParts)),
   );
   const sigAlg = derSequence(derOid('1.2.840.113549.1.1.11'), derNull());
   const signature = cryptoSign('sha256', tbs, { key: input.responder.keyObject, padding: constants.RSA_PKCS1_PADDING });
