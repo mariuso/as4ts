@@ -1,5 +1,4 @@
-import { randomBytes, sign as cryptoSign, constants, createPrivateKey, X509Certificate } from 'node:crypto';
-import forge from 'node-forge';
+import { randomBytes, sign as cryptoSign, constants } from 'node:crypto';
 import {
   ALGO_EXC_C14N,
   ALGO_RSA_SHA256,
@@ -15,7 +14,7 @@ import {
 import { canonicalize, canonicalizeDigest } from '../../src/xml/c14n.js';
 import { parseXml, serializeXml } from '../../src/xml/nodes.js';
 import { parseSignal, type ParsedSignal } from '../../src/xml/signal.js';
-import type { TestCert } from './pki.js';
+import { createSelfSignedCert, type TestCert } from './pki.js';
 
 export interface ReceiptReference {
   readonly uri: string;
@@ -180,32 +179,5 @@ export function buildSignedReceipt(options: ReceiptBuildOptions): { xml: string;
 
 /** A completely unrelated self-signed certificate, for the untrusted-signer test. */
 export function unrelatedSelfSigned(): TestCert {
-  return selfSignedCert('POP999999');
-}
-
-function selfSignedCert(commonName: string): TestCert {
-  const keys = forge.pki.rsa.generateKeyPair(2048);
-  const cert = forge.pki.createCertificate();
-  cert.publicKey = keys.publicKey;
-  cert.serialNumber = randomBytes(8).toString('hex');
-  cert.validity.notBefore = new Date(Date.now() - 60_000);
-  cert.validity.notAfter = new Date(Date.now() + 365 * 24 * 3600 * 1000);
-  const attrs = [{ name: 'commonName', value: commonName }];
-  cert.setSubject(attrs);
-  cert.setIssuer(attrs);
-  cert.setExtensions([
-    { name: 'basicConstraints', cA: false, critical: true },
-    { name: 'keyUsage', critical: true, digitalSignature: true },
-  ]);
-  cert.sign(keys.privateKey, forge.md.sha256.create());
-  const certPem = forge.pki.certificateToPem(cert);
-  const keyPem = forge.pki.privateKeyToPem(keys.privateKey);
-  return {
-    certPem,
-    keyPem,
-    keyObject: createPrivateKey(keyPem),
-    cert: new X509Certificate(certPem),
-    commonName,
-    serialHex: cert.serialNumber,
-  };
+  return createSelfSignedCert('POP999999');
 }

@@ -30,13 +30,9 @@ Runtime dependencies are `@xmldom/xmldom` and `xml-crypto` (only its low-level
 `ExclusiveCanonicalization`, never `SignedXml`). `npm audit --omit=dev` is clean
 and runs in CI.
 
-`npm audit` (including dev dependencies) reports one advisory:
-`node-forge` — GHSA-86w9-cpqp-85rv, high, no fix available. node-forge is a
-**dev-only** dependency used to generate the test PKI/CRL/OCSP fixtures and to
-parse PKCS#12 in `examples/`. The advisory concerns RSA PKCS#1 v1.5 signature
-_verification_ with extra nested `DigestAlgorithm` elements; this project never
-calls node-forge's verification code — it only generates and signs fixtures — and
-node-forge is not part of the published package.
+`npm audit` including dev dependencies is also clean. The test PKI/CRL/OCSP
+fixtures and the example's PKCS#12 parsing use `pkijs`/`asn1js`, which carry no
+known advisories.
 
 ## Scope
 

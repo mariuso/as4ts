@@ -318,21 +318,12 @@ Runtime (two, pinned with caret ranges):
 | `@xmldom/xmldom` | `^0.8.15` | XML parse/serialise for the SOAP envelope and signals.                                                                                          |
 | `xml-crypto`     | `^6.3.3`  | **Only** the low-level `ExclusiveCanonicalization` class. Its high-level `SignedXml` has had signature-bypass advisories; **we do not use it.** |
 
-Dev/test only (not shipped): `node-forge` (test PKI/CRL/OCSP fixtures and PKCS#12
-parsing in the example), `typescript`, `tsx`, `eslint`, `prettier` and the Node
-type packages.
+Dev/test only (not shipped): `pkijs` + `asn1js` (test PKI/CRL/OCSP fixtures and
+PKCS#12 parsing in the example), `typescript`, `tsx`, `eslint`, `prettier` and
+the Node type packages.
 
-`npm audit` reports one **dev-only** advisory: `node-forge`
-([GHSA-86w9-cpqp-85rv](https://github.com/advisories/GHSA-86w9-cpqp-85rv), RSA
-PKCS#1 v1.5 signature _verification_ accepts extra nested `DigestAlgorithm`
-elements; no fix available). It is not shipped (the package contains only
-`dist/`, whose runtime deps are `@xmldom/xmldom` and `xml-crypto`) and the
-flagged code path is never reached: this project only uses node-forge to
-_generate_ test certificates/CRLs and to _parse_ PKCS#12, never to verify a
-signature. `npm run audit` (`npm audit --omit=dev`) is clean, and CI runs it.
-
-If you want a zero-advisory development tree, node-forge can be replaced by
-`@peculiar/x509` (certificates, CRLs) plus a PKCS#12 library for the example.
+`npm audit` is clean, including dev dependencies: the test PKI and the example's
+PKCS#12 parsing use `pkijs`/`asn1js`, so there is no dev-only advisory to accept.
 
 ---
 

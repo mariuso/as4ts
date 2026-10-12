@@ -1,8 +1,15 @@
-import { createPrivateKey, randomBytes, sign as cryptoSign, createPublicKey, constants } from 'node:crypto';
-import type { KeyObject, X509Certificate } from 'node:crypto';
-import { X509Certificate as X509 } from 'node:crypto';
-import forge from 'node-forge';
-import { derBitString, derInteger, derNull, derOid, derSequence, tlv } from '../../src/pki/asn1.js';
+import {
+  createPublicKey,
+  randomBytes,
+  sign as cryptoSign,
+  constants,
+  generateKeyPairSync,
+  X509Certificate,
+} from 'node:crypto';
+import type { KeyObject } from 'node:crypto';
+import * as asn1js from 'asn1js';
+import * as pkijs from 'pkijs';
+import { derBitString, derContext, derInteger, derNull, derOid, derSequence, tlv } from '../../src/pki/asn1.js';
 
 export interface TestCert {
   readonly certPem: string;
@@ -29,133 +36,238 @@ export interface TestPkiOptions {
   readonly now?: Date;
 }
 
+const RSA_SHA256_WITH_RSA = '1.2.840.113549.1.1.11';
+const OID = { CN: '2.5.4.3', O: '2.5.4.10', C: '2.5.4.6' } as const;
+const EKU = {
+  clientAuth: '1.3.6.1.5.5.7.3.2',
+  serverAuth: '1.3.6.1.5.5.7.3.1',
+  ocspSigning: '1.3.6.1.5.5.7.3.9',
+} as const;
+
 const VALIDITY_START_OFFSET_MS = 60 * 1000;
 const LEAF_DAYS = 365;
 const CA_DAYS = 3650;
 
-function toKey(certPem: string, keyPem: string, commonName: string, serialHex: string): TestCert {
-  return {
-    certPem,
-    keyPem,
-    keyObject: createPrivateKey(keyPem),
-    cert: new X509(certPem),
-    commonName,
-    serialHex,
-  };
+type RdnAttrs = ReadonlyArray<readonly [string, string]>;
+
+function toArrayBuffer(buf: Buffer): ArrayBuffer {
+  return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
 }
 
-function randomSerial(): string {
+function pemEncode(der: Buffer, label: string): string {
+  return `-----BEGIN ${label}-----\n${der
+    .toString('base64')
+    .replace(/(.{64})/g, '$1\n')
+    .trim()}\n-----END ${label}-----`;
+}
+
+function randomSerial(): { hex: string; der: ArrayBuffer } {
   const bytes = randomBytes(8);
   bytes[0] = bytes[0]! & 0x7f || 1;
-  return bytes.toString('hex');
+  return { hex: bytes.toString('hex'), der: toArrayBuffer(bytes) };
 }
 
-function nowOffset(base: Date, days: number, extraMs = 0): Date {
-  return new Date(base.getTime() + days * 24 * 3600 * 1000 + extraMs);
+function nowOffset(base: Date, days: number): Date {
+  return new Date(base.getTime() + days * 24 * 3600 * 1000);
 }
 
-function createRoot(now: Date): { certPem: string; keyPem: string; commonName: string; serialHex: string } {
-  const keys = forge.pki.rsa.generateKeyPair(2048);
-  const cert = forge.pki.createCertificate();
-  cert.publicKey = keys.publicKey;
-  const serialHex = randomSerial();
-  cert.serialNumber = serialHex;
-  cert.validity.notBefore = new Date(now.getTime() - VALIDITY_START_OFFSET_MS);
-  cert.validity.notAfter = nowOffset(now, CA_DAYS);
-  const attrs = [
-    { name: 'commonName', value: 'AS4 Sender Test Root CA' },
-    { name: 'organizationName', value: 'AS4 Sender Test' },
-    { name: 'countryName', value: 'NO' },
-  ];
-  cert.setSubject(attrs);
-  cert.setIssuer(attrs);
-  cert.setExtensions([
-    { name: 'basicConstraints', cA: true, pathLenConstraint: 1, critical: true },
-    { name: 'keyUsage', critical: true, keyCertSign: true, cRLSign: true },
-    { name: 'subjectKeyIdentifier' },
-  ]);
-  cert.sign(keys.privateKey, forge.md.sha256.create());
+interface KeyMaterial {
+  readonly keyObject: KeyObject;
+  readonly keyPem: string;
+  readonly spkiDer: Buffer;
+}
+
+function newKey(): KeyMaterial {
+  const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
   return {
-    certPem: forge.pki.certificateToPem(cert),
-    keyPem: forge.pki.privateKeyToPem(keys.privateKey),
-    commonName: 'AS4 Sender Test Root CA',
-    serialHex,
+    keyObject: privateKey,
+    keyPem: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
+    spkiDer: publicKey.export({ type: 'spki', format: 'der' }),
   };
 }
 
-function createIntermediate(
-  now: Date,
-  rootPem: string,
-  rootKeyPem: string,
-): { certPem: string; keyPem: string; commonName: string; serialHex: string } {
-  const keys = forge.pki.rsa.generateKeyPair(2048);
-  const cert = forge.pki.createCertificate();
-  cert.publicKey = keys.publicKey;
-  const serialHex = randomSerial();
-  cert.serialNumber = serialHex;
-  cert.validity.notBefore = new Date(now.getTime() - VALIDITY_START_OFFSET_MS);
-  cert.validity.notAfter = nowOffset(now, CA_DAYS);
-  cert.setSubject([
-    { name: 'commonName', value: 'AS4 Sender Test AP CA' },
-    { name: 'organizationName', value: 'AS4 Sender Test' },
-    { name: 'countryName', value: 'NO' },
-  ]);
-  const rootCert = forge.pki.certificateFromPem(rootPem);
-  cert.setIssuer(rootCert.subject.attributes);
-  cert.setExtensions([
-    { name: 'basicConstraints', cA: true, pathLenConstraint: 0, critical: true },
-    { name: 'keyUsage', critical: true, keyCertSign: true, cRLSign: true },
-    { name: 'subjectKeyIdentifier' },
-    { name: 'authorityKeyIdentifier', keyIdentifier: true },
-  ]);
-  cert.sign(forge.pki.privateKeyFromPem(rootKeyPem), forge.md.sha256.create());
+function rdn(attrs: RdnAttrs): pkijs.RelativeDistinguishedNames {
+  // One RelativeDistinguishedName (SET) per attribute, so the rendered subject
+  // has "CN=..\nO=..\nC=.." rather than a single multi-valued RDN. pkijs's own
+  // RelativeDistinguishedNames packs everything into one SET, so build the Name
+  // ASN.1 ourselves; Certificate.encodeTBS only calls `.toSchema()` on it.
+  const node = new asn1js.Sequence({
+    value: attrs.map(
+      ([oid, text]) =>
+        new asn1js.Set({
+          value: [
+            new asn1js.Sequence({
+              value: [new asn1js.ObjectIdentifier({ value: oid }), new asn1js.Utf8String({ value: text })],
+            }),
+          ],
+        }),
+    ),
+  });
+  return { toSchema: () => node, toJSON: () => ({}) } as unknown as pkijs.RelativeDistinguishedNames;
+}
+
+function extension(extnID: string, critical: boolean, der: Buffer): pkijs.Extension {
+  return new pkijs.Extension({ extnID, critical, extnValue: toArrayBuffer(der) });
+}
+
+function basicConstraints(cA: boolean, pathLen?: number): Buffer {
+  const params: pkijs.BasicConstraintsParameters = { cA };
+  if (pathLen !== undefined) params.pathLenConstraint = pathLen;
+  return Buffer.from(new pkijs.BasicConstraints(params).toSchema().toBER(false));
+}
+
+function keyUsage(bytes: readonly number[], unusedBits: number): Buffer {
+  return derBitString(Buffer.from(bytes), unusedBits);
+}
+
+function extKeyUsage(...oids: readonly string[]): Buffer {
+  return Buffer.from(new pkijs.ExtKeyUsage({ keyPurposes: [...oids] }).toSchema().toBER(false));
+}
+
+function subjectAltName(name: string): Buffer {
+  return Buffer.from(
+    new pkijs.GeneralNames({ names: [new pkijs.GeneralName({ type: 2, value: name })] }).toSchema().toBER(false),
+  );
+}
+
+function crlDistributionPoints(url: string): Buffer {
+  const uri = tlv(0x86, Buffer.from(url, 'latin1'));
+  return derSequence(derSequence(derContext(0, derContext(0, uri, true), true)));
+}
+
+interface MakeCertParams {
+  readonly subject: RdnAttrs;
+  readonly issuer: RdnAttrs;
+  readonly issuerKey: KeyObject;
+  readonly subjectSpkiDer: Buffer;
+  readonly notBefore: Date;
+  readonly notAfter: Date;
+  readonly serial: { hex: string; der: ArrayBuffer };
+  readonly extensions: readonly pkijs.Extension[];
+}
+
+function makeCertificate(p: MakeCertParams): { certPem: string; serialHex: string } {
+  const cert = new pkijs.Certificate();
+  cert.version = 2;
+  cert.serialNumber = new asn1js.Integer({ valueHex: p.serial.der });
+  cert.issuer = rdn(p.issuer);
+  cert.subject = rdn(p.subject);
+  cert.notBefore = new pkijs.Time({ type: 0, value: p.notBefore });
+  cert.notAfter = new pkijs.Time({ type: 0, value: p.notAfter });
+  cert.subjectPublicKeyInfo = pkijs.PublicKeyInfo.fromBER(toArrayBuffer(p.subjectSpkiDer));
+  cert.extensions = [...p.extensions];
+  const algorithm = new pkijs.AlgorithmIdentifier({
+    algorithmId: RSA_SHA256_WITH_RSA,
+    algorithmParams: new asn1js.Null(),
+  });
+  cert.signature = algorithm;
+  cert.signatureAlgorithm = algorithm;
+  const tbs = Buffer.from(cert.encodeTBS().toBER(false));
+  const signature = cryptoSign('sha256', tbs, { key: p.issuerKey, padding: constants.RSA_PKCS1_PADDING });
+  cert.signatureValue = new asn1js.BitString({ valueHex: toArrayBuffer(signature) });
+  const der = Buffer.from(cert.toSchema(true).toBER(false));
+  return { certPem: pemEncode(der, 'CERTIFICATE'), serialHex: new X509Certificate(der).serialNumber.toLowerCase() };
+}
+
+function toKey(certPem: string, key: KeyMaterial, commonName: string): TestCert {
+  const cert = new X509Certificate(certPem);
   return {
-    certPem: forge.pki.certificateToPem(cert),
-    keyPem: forge.pki.privateKeyToPem(keys.privateKey),
-    commonName: 'AS4 Sender Test AP CA',
-    serialHex,
+    certPem,
+    keyPem: key.keyPem,
+    keyObject: key.keyObject,
+    cert,
+    commonName,
+    serialHex: cert.serialNumber.toLowerCase(),
   };
+}
+
+function createRoot(now: Date): { cert: TestCert; key: KeyMaterial } {
+  const key = newKey();
+  const serial = randomSerial();
+  const subject = [
+    [OID.CN, 'AS4 Sender Test Root CA'],
+    [OID.O, 'AS4 Sender Test'],
+    [OID.C, 'NO'],
+  ] as const;
+  const { certPem } = makeCertificate({
+    subject,
+    issuer: subject,
+    issuerKey: key.keyObject,
+    subjectSpkiDer: key.spkiDer,
+    notBefore: new Date(now.getTime() - VALIDITY_START_OFFSET_MS),
+    notAfter: nowOffset(now, CA_DAYS),
+    serial,
+    extensions: [
+      extension('2.5.29.19', true, basicConstraints(true, 1)),
+      extension('2.5.29.15', true, keyUsage([0x06], 1)),
+    ],
+  });
+  return { cert: toKey(certPem, key, 'AS4 Sender Test Root CA'), key };
+}
+
+function createIntermediate(now: Date, root: TestCert): { cert: TestCert; key: KeyMaterial } {
+  const key = newKey();
+  const subject = [
+    [OID.CN, 'AS4 Sender Test AP CA'],
+    [OID.O, 'AS4 Sender Test'],
+    [OID.C, 'NO'],
+  ] as const;
+  const { certPem } = makeCertificate({
+    subject,
+    issuer: rdnAttrs(root.cert),
+    issuerKey: root.keyObject,
+    subjectSpkiDer: key.spkiDer,
+    notBefore: new Date(now.getTime() - VALIDITY_START_OFFSET_MS),
+    notAfter: nowOffset(now, CA_DAYS),
+    serial: randomSerial(),
+    extensions: [
+      extension('2.5.29.19', true, basicConstraints(true, 0)),
+      extension('2.5.29.15', true, keyUsage([0x06], 1)),
+    ],
+  });
+  return { cert: toKey(certPem, key, 'AS4 Sender Test AP CA'), key };
 }
 
 function createLeaf(
   now: Date,
-  caPem: string,
-  caKeyPem: string,
+  ca: TestCert,
   commonName: string,
   crlUrl?: string,
-): { certPem: string; keyPem: string; commonName: string; serialHex: string } {
-  const keys = forge.pki.rsa.generateKeyPair(2048);
-  const cert = forge.pki.createCertificate();
-  cert.publicKey = keys.publicKey;
-  const serialHex = randomSerial();
-  cert.serialNumber = serialHex;
-  cert.validity.notBefore = new Date(now.getTime() - VALIDITY_START_OFFSET_MS);
-  cert.validity.notAfter = nowOffset(now, LEAF_DAYS);
-  cert.setSubject([
-    { name: 'commonName', value: commonName },
-    { name: 'organizationName', value: 'AS4 Sender Test' },
-    { name: 'countryName', value: 'NO' },
-  ]);
-  const caCert = forge.pki.certificateFromPem(caPem);
-  cert.setIssuer(caCert.subject.attributes);
-  const extensions: Parameters<forge.pki.Certificate['setExtensions']>[0] = [
-    { name: 'basicConstraints', cA: false, critical: true },
-    { name: 'keyUsage', critical: true, digitalSignature: true, keyEncipherment: true },
-    { name: 'extKeyUsage', clientAuth: true },
-    { name: 'subjectKeyIdentifier' },
-    { name: 'authorityKeyIdentifier', keyIdentifier: true },
+): { cert: TestCert; key: KeyMaterial } {
+  const key = newKey();
+  const subject = [
+    [OID.CN, commonName],
+    [OID.O, 'AS4 Sender Test'],
+    [OID.C, 'NO'],
+  ] as const;
+  const extensions = [
+    extension('2.5.29.19', true, basicConstraints(false)),
+    extension('2.5.29.15', true, keyUsage([0xa0], 5)),
+    extension('2.5.29.37', false, extKeyUsage(EKU.clientAuth)),
   ];
-  if (crlUrl) {
-    extensions.push({ name: 'cRLDistributionPoints', altNames: [{ type: 6, value: crlUrl }] });
+  if (crlUrl) extensions.push(extension('2.5.29.31', false, crlDistributionPoints(crlUrl)));
+  const { certPem } = makeCertificate({
+    subject,
+    issuer: rdnAttrs(ca.cert),
+    issuerKey: ca.keyObject,
+    subjectSpkiDer: key.spkiDer,
+    notBefore: new Date(now.getTime() - VALIDITY_START_OFFSET_MS),
+    notAfter: nowOffset(now, LEAF_DAYS),
+    serial: randomSerial(),
+    extensions,
+  });
+  return { cert: toKey(certPem, key, commonName), key };
+}
+
+function rdnAttrs(cert: X509Certificate): RdnAttrs {
+  // Rebuild the RDN from the certificate's parsed subject so the issuer bytes match.
+  const attrs: Array<readonly [string, string]> = [];
+  for (const line of cert.subject.split('\n')) {
+    const [key, ...rest] = line.split('=');
+    const oid = key?.trim() === 'CN' ? OID.CN : key?.trim() === 'O' ? OID.O : OID.C;
+    attrs.push([oid, rest.join('=').trim()]);
   }
-  cert.setExtensions(extensions);
-  cert.sign(forge.pki.privateKeyFromPem(caKeyPem), forge.md.sha256.create());
-  return {
-    certPem: forge.pki.certificateToPem(cert),
-    keyPem: forge.pki.privateKeyToPem(keys.privateKey),
-    commonName,
-    serialHex,
-  };
+  return attrs;
 }
 
 /**
@@ -163,59 +275,48 @@ function createLeaf(
  * carrying the id-kp-OCSPSigning extended key usage.
  */
 export function createDelegatedResponder(pki: TestPki, now = new Date()): TestCert {
-  const keys = forge.pki.rsa.generateKeyPair(2048);
-  const cert = forge.pki.createCertificate();
-  cert.publicKey = keys.publicKey;
-  const serialHex = randomSerial();
-  cert.serialNumber = serialHex;
-  cert.validity.notBefore = new Date(now.getTime() - VALIDITY_START_OFFSET_MS);
-  cert.validity.notAfter = nowOffset(now, LEAF_DAYS);
-  cert.setSubject([
-    { name: 'commonName', value: 'AS4 Test OCSP Responder' },
-    { name: 'organizationName', value: 'AS4 Sender Test' },
-    { name: 'countryName', value: 'NO' },
-  ]);
-  cert.setIssuer(forge.pki.certificateFromPem(pki.intermediate.certPem).subject.attributes);
-  // node-forge has no ocspSigning flag; build the id-kp-OCSPSigning EKU directly.
-  const ocspSigningOid = forge.asn1.oidToDer('1.3.6.1.5.5.7.3.9');
-  const ekuValue = forge.asn1
-    .toDer(
-      forge.asn1.create(forge.asn1.Class.UNIVERSAL, forge.asn1.Type.SEQUENCE, true, [
-        forge.asn1.create(forge.asn1.Class.UNIVERSAL, forge.asn1.Type.OID, false, ocspSigningOid.getBytes()),
-      ]),
-    )
-    .getBytes();
-  cert.setExtensions([
-    { name: 'basicConstraints', cA: false, critical: true },
-    { name: 'keyUsage', critical: true, digitalSignature: true },
-    { id: '2.5.29.37', value: ekuValue },
-    { name: 'subjectKeyIdentifier' },
-    { name: 'authorityKeyIdentifier', keyIdentifier: true },
-  ]);
-  cert.sign(forge.pki.privateKeyFromPem(pki.intermediate.keyPem), forge.md.sha256.create());
-  const certPem = forge.pki.certificateToPem(cert);
-  return toKey(certPem, forge.pki.privateKeyToPem(keys.privateKey), 'AS4 Test OCSP Responder', serialHex);
+  const key = newKey();
+  const subject = [
+    [OID.CN, 'AS4 Test OCSP Responder'],
+    [OID.O, 'AS4 Sender Test'],
+    [OID.C, 'NO'],
+  ] as const;
+  const { certPem } = makeCertificate({
+    subject,
+    issuer: rdnAttrs(pki.intermediate.cert),
+    issuerKey: pki.intermediate.keyObject,
+    subjectSpkiDer: key.spkiDer,
+    notBefore: new Date(now.getTime() - VALIDITY_START_OFFSET_MS),
+    notAfter: nowOffset(now, LEAF_DAYS),
+    serial: randomSerial(),
+    extensions: [
+      extension('2.5.29.19', true, basicConstraints(false)),
+      extension('2.5.29.15', true, keyUsage([0x80], 7)),
+      extension('2.5.29.37', false, extKeyUsage(EKU.ocspSigning)),
+    ],
+  });
+  return toKey(certPem, key, 'AS4 Test OCSP Responder');
 }
 
 export function createTestPki(options: TestPkiOptions = {}): TestPki {
   const now = options.now ?? new Date();
   const root = createRoot(now);
-  const intermediate = createIntermediate(now, root.certPem, root.keyPem);
-  const sender = createLeaf(now, intermediate.certPem, intermediate.keyPem, 'POP000001', options.crlUrl);
-  const receiver = createLeaf(now, intermediate.certPem, intermediate.keyPem, 'POP000002', options.crlUrl);
-  const revoked = createLeaf(now, intermediate.certPem, intermediate.keyPem, 'POP000003', options.crlUrl);
+  const intermediate = createIntermediate(now, root.cert);
+  const sender = createLeaf(now, intermediate.cert, 'POP000001', options.crlUrl);
+  const receiver = createLeaf(now, intermediate.cert, 'POP000002', options.crlUrl);
+  const revoked = createLeaf(now, intermediate.cert, 'POP000003', options.crlUrl);
 
   const makeCrl = (
-    revokedSerialHexes: readonly string[] = [revoked.serialHex],
+    revokedSerialHexes: readonly string[] = [revoked.cert.serialHex],
     opts: { thisUpdate?: Date; nextUpdate?: Date } = {},
-  ): Buffer => buildCrl(intermediate, revokedSerialHexes, opts, now);
+  ): Buffer => buildCrl(intermediate.cert.cert, intermediate.key.keyObject, revokedSerialHexes, opts, now);
 
   return {
-    root: toKey(root.certPem, root.keyPem, root.commonName, root.serialHex),
-    intermediate: toKey(intermediate.certPem, intermediate.keyPem, intermediate.commonName, intermediate.serialHex),
-    sender: toKey(sender.certPem, sender.keyPem, sender.commonName, sender.serialHex),
-    receiver: toKey(receiver.certPem, receiver.keyPem, receiver.commonName, receiver.serialHex),
-    revoked: toKey(revoked.certPem, revoked.keyPem, revoked.commonName, revoked.serialHex),
+    root: root.cert,
+    intermediate: intermediate.cert,
+    sender: sender.cert,
+    receiver: receiver.cert,
+    revoked: revoked.cert,
     makeCrl,
   };
 }
@@ -234,17 +335,15 @@ function utcTime(date: Date): Buffer {
 }
 
 function buildCrl(
-  issuer: { certPem: string; keyPem: string },
+  issuerCert: X509Certificate,
+  issuerKey: KeyObject,
   revokedSerials: readonly string[],
   opts: { thisUpdate?: Date; nextUpdate?: Date },
   now: Date,
 ): Buffer {
-  const issuerCert = forge.pki.certificateFromPem(issuer.certPem);
-  const issuerName = Buffer.from(
-    forge.asn1.toDer(forge.pki.distinguishedNameToAsn1(issuerCert.subject)).getBytes(),
-    'binary',
-  );
-  const signatureAlgorithm = derSequence(derOid('1.2.840.113549.1.1.11'), derNull());
+  const parsed = pkijs.Certificate.fromBER(Buffer.from(issuerCert.raw));
+  const issuerName = Buffer.from(parsed.subject.toSchema().toBER(false));
+  const signatureAlgorithm = derSequence(derOid(RSA_SHA256_WITH_RSA), derNull());
   const entries = revokedSerials.map((hex) => derSequence(derInteger(Buffer.from(hex, 'hex')), utcTime(now)));
   const tbs = derSequence(
     derInteger(Buffer.from([1])),
@@ -254,43 +353,61 @@ function buildCrl(
     utcTime(opts.nextUpdate ?? new Date(now.getTime() + 7 * 24 * 3600 * 1000)),
     derSequence(...entries),
   );
-  const signature = cryptoSign('sha256', tbs, {
-    key: createPrivateKey(issuer.keyPem),
-    padding: constants.RSA_PKCS1_PADDING,
-  });
+  const signature = cryptoSign('sha256', tbs, { key: issuerKey, padding: constants.RSA_PKCS1_PADDING });
   return derSequence(tbs, signatureAlgorithm, derBitString(signature));
 }
 
 /** A self-signed test TLS server certificate, used as its own trust anchor. */
 export function createTlsServerCert(now = new Date()): { keyPem: string; certPem: string; caPem: string } {
-  const keys = forge.pki.rsa.generateKeyPair(2048);
-  const cert = forge.pki.createCertificate();
-  cert.publicKey = keys.publicKey;
-  cert.serialNumber = randomSerial();
-  cert.validity.notBefore = new Date(now.getTime() - VALIDITY_START_OFFSET_MS);
-  cert.validity.notAfter = nowOffset(now, LEAF_DAYS);
-  const attrs = [
-    { name: 'commonName', value: 'localhost' },
-    { name: 'organizationName', value: 'AS4 Sender Test' },
-  ];
-  cert.setSubject(attrs);
-  cert.setIssuer(attrs);
-  cert.setExtensions([
-    { name: 'basicConstraints', cA: true, critical: true },
-    { name: 'keyUsage', critical: true, digitalSignature: true, keyEncipherment: true, keyCertSign: true },
-    { name: 'extKeyUsage', serverAuth: true },
-    { name: 'subjectAltName', altNames: [{ type: 2, value: 'localhost' }] },
-    { name: 'subjectKeyIdentifier' },
-  ]);
-  cert.sign(keys.privateKey, forge.md.sha256.create());
-  const certPem = forge.pki.certificateToPem(cert);
-  return {
-    keyPem: forge.pki.privateKeyToPem(keys.privateKey),
-    certPem,
-    caPem: certPem,
-  };
+  const key = newKey();
+  const subject = [
+    [OID.CN, 'localhost'],
+    [OID.O, 'AS4 Sender Test'],
+  ] as const;
+  const { certPem } = makeCertificate({
+    subject,
+    issuer: subject,
+    issuerKey: key.keyObject,
+    subjectSpkiDer: key.spkiDer,
+    notBefore: new Date(now.getTime() - VALIDITY_START_OFFSET_MS),
+    notAfter: nowOffset(now, LEAF_DAYS),
+    serial: randomSerial(),
+    extensions: [
+      extension('2.5.29.19', true, basicConstraints(true)),
+      extension('2.5.29.15', true, keyUsage([0xa4], 2)),
+      extension('2.5.29.37', false, extKeyUsage(EKU.serverAuth)),
+      extension('2.5.29.17', false, subjectAltName('localhost')),
+    ],
+  });
+  return { keyPem: key.keyPem, certPem, caPem: certPem };
+}
+
+/** A self-signed end-entity certificate: used for unrelated/rogue signer tests. */
+export function createSelfSignedCert(commonName: string, now = new Date()): TestCert {
+  const key = newKey();
+  const subject = [[OID.CN, commonName]] as const;
+  const { certPem } = makeCertificate({
+    subject,
+    issuer: subject,
+    issuerKey: key.keyObject,
+    subjectSpkiDer: key.spkiDer,
+    notBefore: new Date(now.getTime() - VALIDITY_START_OFFSET_MS),
+    notAfter: nowOffset(now, LEAF_DAYS),
+    serial: randomSerial(),
+    extensions: [
+      extension('2.5.29.19', true, basicConstraints(false)),
+      extension('2.5.29.15', true, keyUsage([0x80], 7)),
+    ],
+  });
+  return toKey(certPem, key, commonName);
 }
 
 export function publicKeyPem(certPem: string): string {
-  return createPublicKey(new X509(certPem).publicKey).export({ type: 'spki', format: 'pem' }).toString();
+  return createPublicKey(new X509Certificate(certPem).publicKey).export({ type: 'spki', format: 'pem' }).toString();
+}
+
+// Kept for callers that only need a fresh PEM key pair (e.g. fixtures).
+export function generateKeyPem(): { keyObject: KeyObject; keyPem: string; spkiDer: Buffer } {
+  const key = newKey();
+  return { keyObject: key.keyObject, keyPem: key.keyPem, spkiDer: key.spkiDer };
 }

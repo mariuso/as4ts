@@ -11,32 +11,19 @@ import { createPrivateKey } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import forge from 'node-forge';
 import { signerFromKey } from '../../src/index.js';
 import { buildEnvelope } from '../../src/xml/envelope.js';
 import { buildMultipartBody } from '../../src/multipart.js';
 import { peppolProfile } from '../../src/profile.js';
 import { AS4_COMPRESSION_TYPE } from '../../src/constants.js';
 import { fixedEntropy } from '../helpers/entropy.js';
+import { createSelfSignedCert } from '../helpers/pki.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
 function selfSigned(commonName: string): { certPem: string; keyPem: string } {
-  const keys = forge.pki.rsa.generateKeyPair(2048);
-  const cert = forge.pki.createCertificate();
-  cert.publicKey = keys.publicKey;
-  cert.serialNumber = '01';
-  cert.validity.notBefore = new Date('2026-01-01T00:00:00Z');
-  cert.validity.notAfter = new Date('2036-01-01T00:00:00Z');
-  const attrs = [{ name: 'commonName', value: commonName }];
-  cert.setSubject(attrs);
-  cert.setIssuer(attrs);
-  cert.setExtensions([
-    { name: 'basicConstraints', cA: false, critical: true },
-    { name: 'keyUsage', critical: true, digitalSignature: true, keyEncipherment: true },
-  ]);
-  cert.sign(keys.privateKey, forge.md.sha256.create());
-  return { certPem: forge.pki.certificateToPem(cert), keyPem: forge.pki.privateKeyToPem(keys.privateKey) };
+  const cert = createSelfSignedCert(commonName, new Date('2026-01-01T00:00:00Z'));
+  return { certPem: cert.certPem, keyPem: cert.keyPem };
 }
 
 async function main(): Promise<void> {

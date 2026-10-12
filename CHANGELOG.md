@@ -29,6 +29,10 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `spoolDirectory` (files mode `0600`) and `onEvent`.
 - The message timestamp is taken immediately before the envelope is built; the
   `User-Agent` is derived from the package name and version.
+- **Test/example crypto moved off `node-forge`.** The test PKI/CRL/OCSP fixtures,
+  the golden-fixture generator and the example's PKCS#12 parsing now use
+  `pkijs`/`asn1js`, removing the dev-only `node-forge` advisory. The generated
+  fixtures are unchanged.
 
 ### Added
 

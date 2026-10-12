@@ -134,7 +134,7 @@ function resolvePassphrase(args: Args): string {
   return process.env['AS4_P12_PASSPHRASE'] ?? '';
 }
 
-function resolveSigningMaterial(args: Args): SigningMaterial {
+async function resolveSigningMaterial(args: Args): Promise<SigningMaterial> {
   const p12 = args.flags.get('sender-p12');
   if (p12) {
     return loadSigningMaterialFromP12(p12, resolvePassphrase(args));
@@ -206,7 +206,7 @@ async function main(): Promise<void> {
     }
   })();
 
-  const signing = resolveSigningMaterial(args);
+  const signing = await resolveSigningMaterial(args);
   const bundled = bundledTrust(env);
   const roots = args.flags.has('trust-roots') ? [loadCert(required(args, 'trust-roots'))] : [...bundled.roots];
   const intermediates = args.flags.has('trust-intermediates')
