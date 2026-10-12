@@ -6,6 +6,15 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **The receiving side is reserved.** Receiving is planned but not implemented
+  (see [`docs/receiving.md`](docs/receiving.md)); no `receive*` value or type is
+  exported yet, and `test/package-surface.test.ts` now fails if one appears. A
+  future `receiveAs4` can therefore be added without a breaking rename. **No
+  exports were renamed**: nothing sender-specific described a direction-neutral
+  thing.
+
 ### Changed
 
 - **Wire format locked.** Every source of randomness and time is injectable
