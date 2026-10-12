@@ -3,17 +3,21 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Node: >=22](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](#10-how-to-run)
 
-A single-shot Peppol AS4 sender in strict TypeScript on Node 22+ (ES modules, no
-framework). It performs **exactly one** AS4 send attempt and reports, as facts,
-what happened. It never retries, never queues, never does SMP/SML lookup, never
-touches the SBDH, never touches a database, and never reads files or environment
-variables for its configuration.
+Peppol AS4 messaging in strict TypeScript on Node 22+ (ES modules, no framework).
 
-The public surface is one function:
+- **Sending is implemented.** `sendAs4` performs **exactly one** AS4 send attempt
+  and reports, as facts, what happened. It never retries, never queues, never
+  touches the SBDH, never touches a database, and never reads files or
+  environment variables for its configuration.
+- **Lookup is implemented as a separate, optional entry point**, `as4ts/lookup`
+  (`lookupParticipant`). The sender never calls it: a caller uses it only when it
+  wants discovery.
+- **Receiving is planned and not implemented** — see
+  [`docs/receiving.md`](docs/receiving.md).
 
 ```ts
-import { sendAs4 } from 'as4ts';
-const result = await sendAs4(input); // SendAs4Result
+import { sendAs4 } from 'as4ts'; // sending
+import { lookupParticipant } from 'as4ts/lookup'; // optional discovery
 ```
 
 Expected failures are **values**, never thrown exceptions.
@@ -52,11 +56,16 @@ It does:
 - Return the outcome as a discriminated union of facts and a pure `classify`
   mapping.
 
+Separately, and never from inside `sendAs4`:
+
+- Resolve a participant with `as4ts/lookup` (`lookupParticipant`): SML and SMP
+  discovery, with the SMP response's XML signature verified.
+
 It deliberately does not:
 
 - Retry, queue, or persist anything.
-- Do SMP/SML discovery, or read trust anchors, keys or configuration from files
-  or the environment. The caller supplies all of that.
+- Do SMP/SML discovery **from inside `sendAs4`**, or read trust anchors, keys or
+  configuration from files or the environment. The caller supplies all of that.
 - Treat a certificate as trusted just because the network reached it: trust is
   the caller's policy, injected as a function.
 - Decide whether to retry: it reports facts, and `classify` maps them.
@@ -137,12 +146,65 @@ const validateCertificate = (input) => validator.validate(input);
 
 The validator owns a long-lived revocation cache. It checks OCSP first, then
 CRL, accepts a delegated OCSP responder (`id-kp-OCSPSigning`), and enforces
-`thisUpdate`/`nextUpdate`.
+`thisUpdate`/`nextUpdate`. `intermediatesByPurpose` optionally restricts the
+intermediate CAs per purpose, so an SMP signer certificate is never accepted as
+an access point certificate or the reverse.
 
-### `SMP lookup is not part of the package`
+### Participant lookup (`as4ts/lookup`)
 
-`examples/smp-lookup.ts` is caller-side tooling **and does not verify the XML
-signature on the SMP response**. Do not treat its output as authenticated.
+`sendAs4` never calls this. It is a separate, optional entry point for callers
+that want discovery.
+
+```ts
+import { lookupParticipant } from 'as4ts/lookup';
+import { createCertificateValidator, defaultRevocationPolicy } from 'as4ts/certificate-validator';
+
+const validator = createCertificateValidator({
+  roots: [rootPem],
+  intermediates: [apCaPem, smpCaPem],
+  intermediatesByPurpose: { 'smp-signer': [smpCaPem] },
+  revocation: defaultRevocationPolicy(),
+});
+
+const result = await lookupParticipant({
+  participant: { scheme: 'iso6523-actorid-upis', value: '0192:222222222' },
+  documentType: { scheme: 'busdox-docid-qns', value: 'urn:oasis:...::Invoice##...::2.1' },
+  process: { scheme: 'cenbii-procid-ubl', value: 'urn:fdc:peppol.eu:2017:poacc:billing:01:1.0' },
+  transportProfile: 'peppol-transport-as4-v2_0', // optional; this is the default
+  sml: 'participant.sml.test.tech.peppol.org', // the SML zone, per environment
+  validateCertificate: (input) => validator.validate(input), // called with purpose 'smp-signer'
+  now: () => new Date(),
+});
+```
+
+It performs **exactly one** discovery and returns facts, never throwing:
+
+| `outcome`           | Carries                                                                                                                                     | Meaning                                                                                 |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `found`             | `endpointUrl`, `receiverCertificate`, `transportProfile`, `smpUrl`, `signerCertificate`, `serviceActivationDate?`, `serviceExpirationDate?` | The endpoint for this document type, process and transport profile, inside its dates.   |
+| `not-registered`    | `detail?`                                                                                                                                   | There is no SML entry for the participant.                                              |
+| `not-supported`     | `detail?`                                                                                                                                   | The participant exists but has no endpoint for this document type, process and profile. |
+| `signature-invalid` | `reason`                                                                                                                                    | The SMP response's signature did not verify, or its signer did not validate.            |
+| `unavailable`       | `reason`, `retryable`                                                                                                                       | DNS or HTTP failed; `retryable` says whether a retry could help.                        |
+
+Behaviour, per the specifications ([SML] v1.3.0, [SMP] v1.4.0, [PFUOI4] v4.4.0):
+
+- **SML.** The DNS name is `<base32(sha256(lowercased value))>.<scheme>.<sml zone>`
+  ([PFUOI4] POLICY 7), queried as a U-NAPTR record with service `Meta:SMP`; only
+  `https` URLs are accepted. The retired CNAME method is not implemented.
+- **SMP.** The service group is fetched for the participant, one matching
+  reference is chosen, and the signed service metadata is fetched; an SMP
+  `Redirect` element is followed **at most once**.
+- **Signature.** The response must carry an enveloped XML signature with exactly
+  the `enveloped-signature` transform, inclusive C14N, RSA-SHA256 and SHA-256, as
+  SMP v1.4.0 §5.5.1 mandates; anything else is `signature-invalid`.
+- **Signer.** The certificate is passed to `validateCertificate` with purpose
+  `smp-signer`.
+- **Endpoint.** Process and transport profile must match exactly; endpoints
+  outside their activation/expiration window (evaluated with `now`) are ignored.
+- `resolveNaptr` and `fetch` are injectable and default to Node's; `signal`,
+  `timeoutMs` and `now` are inputs. There is **no caching and no retry** inside
+  the function; the result carries what a caller needs to cache sensibly.
 
 ---
 
@@ -231,15 +293,20 @@ src/
   multipart.ts             streaming multipart/related body + exact Content-Length
   crypto/                  session-key wrap, streaming payload preparation
   xml/                     DOM helpers, C14N, user message, security, envelope, signal
+  xml/ws-security.ts       direction-neutral WS-Security signature verification
   http/send.ts             one HTTPS POST, TLS 1.2+, verification always on
   pki/                     DER reader, path building, revocation, validation
-  receipt/verify.ts        full receipt verification
+  receipt/verify.ts        receipt-specific rules on top of the shared verifier
+  lookup/                  SML/SMP discovery entry point: lookupParticipant
+docs/
+  receiving.md             design note for the planned receiver (not implemented)
 examples/
   send-one.ts              example: send one real file to one real endpoint
-  smp-lookup.ts            example: SMP lookup (does not verify the SMP signature)
+  smp-lookup.ts            example: SMP/SML lookup via as4ts/lookup
+  record-smp.ts            example: record a real SMP response as a fixture
 test/
   golden.test.ts           byte-identical envelope and multipart fixtures
-  *.test.ts                unit, receipt, PKI, abort, round-trip and memory tests
+  *.test.ts                unit, lookup, receipt, PKI, abort, round-trip and memory tests
 ```
 
 ---
@@ -313,10 +380,10 @@ just dropping the raw signal message into `test/fixtures/captures/`.
 
 Runtime (two, pinned with caret ranges):
 
-| Package          | Range     | Why                                                                                                                                             |
-| ---------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `@xmldom/xmldom` | `^0.8.15` | XML parse/serialise for the SOAP envelope and signals.                                                                                          |
-| `xml-crypto`     | `^6.3.3`  | **Only** the low-level `ExclusiveCanonicalization` class. Its high-level `SignedXml` has had signature-bypass advisories; **we do not use it.** |
+| Package          | Range     | Why                                                                                                                                                                                                          |
+| ---------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `@xmldom/xmldom` | `^0.8.15` | XML parse/serialise for the SOAP envelope and signals.                                                                                                                                                       |
+| `xml-crypto`     | `^6.3.3`  | **Only** the low-level canonicalisation classes (`ExclusiveCanonicalization` for AS4, `C14nCanonicalization` for SMP). Its high-level `SignedXml` has had signature-bypass advisories; **we do not use it.** |
 
 Dev/test only (not shipped): `pkijs` + `asn1js` (test PKI/CRL/OCSP fixtures and
 PKCS#12 parsing in the example), `typescript`, `tsx`, `eslint`, `prettier` and
@@ -347,11 +414,13 @@ agrees with itself; it is not a conformance test against a real access point.
 
 ```bash
 node --import tsx examples/smp-lookup.ts --participant 'iso6523-actorid-upis::0192:222222222' --env test
+node --import tsx examples/record-smp.ts --participant 'iso6523-actorid-upis::0192:222222222' --doc-type '<id>' --process '<id>' --name oxalis
 node --import tsx examples/send-one.ts --help
 ```
 
-`examples/smp-lookup.ts` does not verify the SMP response signature and is not
-part of the package.
+Examples are caller-side tooling, not part of the package. `examples/smp-lookup.ts`
+uses `as4ts/lookup`, so unlike earlier versions it **does** verify the SMP
+response signature before printing the endpoint.
 
 `examples/send-one.ts` takes the sender credentials either as a PKCS#12
 (`--sender-p12` with `--p12-passphrase`, `--p12-passphrase-file` or
@@ -378,12 +447,31 @@ hint to re-export it with a current OpenSSL or to pass `--sender-cert` /
 | [EBbpsig]             | ebBP Signals 2.0                                        | `NonRepudiationInformation`                                                                                                                                            |
 | [RFC5280]             | X.509 PKI                                               | path validation, CRL/OCSP                                                                                                                                              |
 | [RFC1952] / [RFC2822] | GZIP / Internet Message Format                          | compression, `msg-id`                                                                                                                                                  |
+| [SML]                 | Peppol Service Metadata Locator (SML) v1.3.0            | §2.1/§2.1.1 U-NAPTR discovery, §3.1.1 participant DNS name (SHA-256/Base32)                                                                                            |
+| [SMP]                 | Peppol Service Metadata Publishing (SMP) v1.4.0         | §4.3 ServiceInformation/Endpoint, §4.4 Redirect, §5.3 REST URLs, §5.5 signature (inclusive C14N)                                                                       |
+| [PFUOI4]              | Peppol Policy for use of Identifiers v4.4.0             | POLICY 2 casing, POLICY 5 meta scheme, POLICY 7 SML DNS name, POLICY 8 SMP attributes, §5.1 document type schemes, POLICY 28/29 transport profile                      |
 
-### Verification notes
+### Open questions (UNVERIFIED)
+
+Values or behaviours that could not be confirmed against a specification release
+are marked **UNVERIFIED** here.
 
 - **`PartProperties/MimeType` = `application/xml`.** [AS4PROFILE] §3.1 requires
-  the property, but the Peppol AS4 profile does not pin a value for it, so this
-  choice is not confirmed by a Peppol specification.
+  the property, but the Peppol AS4 profile does not pin a value, so this choice
+  is **UNVERIFIED**.
+- **Production SML zone name.** The test zone
+  `participant.sml.test.tech.peppol.org` resolves by DNS. [PFUOI4] v4.4.0 changed
+  POLICY 7's zone name, but the current production zone name could not be
+  confirmed; it is a caller input (`LookupInput.sml`), and `smlZone('prod')` in
+  the example is **UNVERIFIED**.
+- **`peppol-doctype-wildcard` matching.** The lookup implements wildcard matching
+  as a prefix match on the `@`-separated parts (`a@b*` matches `a@b` and
+  `a@b@c`). The exact Customization-ID segmentation of [PFUOI4] §5.1.2 is
+  **UNVERIFIED**.
+- **SMP redirect destination `CertificateUID`.** [SMP] v1.4.0 §5.5.3 says a
+  client _SHOULD_ check the destination SMP's signing certificate against the UID
+  the redirecting SMP claims. That check is **UNVERIFIED** and not implemented;
+  the destination response's signature is still verified.
 
 ---
 
