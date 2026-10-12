@@ -92,17 +92,20 @@ issuer's OCSP responder or CRL, and an answer that cannot be obtained is `unknow
   delegated responder that the issuer signed, carries `id-kp-OCSPSigning` and
   `digitalSignature` (when Key Usage is present), is within its validity window,
   has no unsupported critical extension, and matches the response's `ResponderID`
-  (by name or key hash). The response must carry a `CertID` for this certificate
-  and a valid `thisUpdate`. An answer whose `nextUpdate` has passed, or which has
-  no `nextUpdate` and is older than `ocspMaxAgeMs` (default 24 hours), is
-  `unknown`; an answer without `nextUpdate` is bounded and expires at
-  `thisUpdate + ocspMaxAgeMs`.
+  (by name or key hash). Only response version 1 is accepted, and unrecognized
+  critical extensions at the response and SingleResponse levels are rejected. The
+  response must carry a `CertID` for this certificate and a valid `thisUpdate`; a
+  `nextUpdate` that is present but malformed is `unknown`, not treated as absent.
+  An answer whose `nextUpdate` has passed, or which has no `nextUpdate` and is
+  older than `ocspMaxAgeMs` (default 24 hours), is `unknown`; an answer without
+  `nextUpdate` is bounded and expires at `thisUpdate + ocspMaxAgeMs`.
 - **CRL.** The CRL must be signed by, and issued by, the certificate's issuer
   (compared by full `Name`, not common name), and the issuer must assert
   `cRLSign` when its Key Usage is present. Delta CRLs (`deltaCRLIndicator`),
   scoped or indirect CRLs (`issuingDistributionPoint`), unsupported critical CRL
   extensions, and CRLs without a `nextUpdate` are rejected (`unknown`) rather than
-  treated as "not revoked".
+  treated as "not revoked". Invalid or non-monotonic CRL dates are rejected, and
+  the revocation cache refuses a non-finite expiry.
 - **SHA-1.** Revocation signatures (OCSP and CRL) may use SHA-1 for compatibility
   with deployed responders and CAs, unlike certificate signatures, which are
   SHA-256/384/512 only. This is separate from the SHA-1 used to compute OCSP

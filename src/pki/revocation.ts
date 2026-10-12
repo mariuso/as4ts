@@ -170,7 +170,7 @@ export class RevocationCache {
   get(key: string, now: Date): RevocationAnswer | null {
     const entry = this.entries.get(key);
     if (!entry) return null;
-    if (entry.expiresAt <= now.getTime()) {
+    if (!Number.isFinite(entry.expiresAt) || entry.expiresAt <= now.getTime()) {
       this.entries.delete(key);
       return null;
     }
@@ -181,7 +181,8 @@ export class RevocationCache {
     const cap = now.getTime() + maxCacheMs;
     const stated = answer.expiresAt ? answer.expiresAt.getTime() : cap;
     const expiresAt = Math.min(cap, stated);
-    if (expiresAt <= now.getTime()) return;
+    // Never store an entry that could never expire (a non-finite expiry).
+    if (!Number.isFinite(expiresAt) || expiresAt <= now.getTime()) return;
     this.entries.set(key, { answer, expiresAt });
   }
 }
@@ -381,6 +382,8 @@ interface OcspSingleResponse {
   readonly status: RevocationStatus;
   readonly thisUpdate: Date | null;
   readonly nextUpdate: Date | null;
+  /** Set when a mandatory field is missing/malformed or an extension is unsupported. */
+  readonly unsupported: string | null;
 }
 
 interface ParsedOcsp {
@@ -391,6 +394,8 @@ interface ParsedOcsp {
   readonly certs: readonly Buffer[];
   /** ResponderID carried by the response: byName (subject) or byKey (key hash). */
   readonly responderId: ResponderId | null;
+  /** Set when the response carries a version or extension the profile cannot honour. */
+  readonly unsupported: string | null;
   readonly responses: readonly OcspSingleResponse[];
 }
 
@@ -461,10 +466,32 @@ function parseOcspResponse(der: Buffer): ParsedOcsp {
     for (const cert of children(certsSeq)) certs.push(Buffer.from(cert.raw));
   }
 
-  // ResponseData -> responderID (byName [1] or byKey [2]) and responses.
+  // ResponseData -> version [0], responderID, responses, responseExtensions [1].
   const rdChildren = children(tbsResponseData);
+  let unsupported: string | null = null;
+
+  // version [0] EXPLICIT Version DEFAULT v1: only v1 is supported.
+  const versionNode = rdChildren.find((c) => c.cls === 2 && c.tag === 0);
+  if (versionNode) {
+    let version = -1;
+    try {
+      const inner = parseDer(versionNode.value).node;
+      if (inner.tag === TAG.INTEGER) version = inner.value[0] ?? 0;
+    } catch {
+      version = -1;
+    }
+    if (version !== 0) unsupported = 'OCSP: unsupported or malformed response version';
+  }
+
+  const responsesSeq = rdChildren.find(
+    (c) => c.tag === TAG.SEQUENCE && children(c).some((x) => x.tag === TAG.SEQUENCE),
+  );
+  const responsesIndex = responsesSeq ? rdChildren.indexOf(responsesSeq) : rdChildren.length;
+
+  // responderID (before responses): byName [1] or byKey [2].
   let responderId: ResponderId | null = null;
-  for (const node of rdChildren) {
+  for (let idx = 0; idx < responsesIndex; idx += 1) {
+    const node = rdChildren[idx]!;
     if (node.cls !== 2) continue;
     if (node.tag === 1) {
       responderId = { kind: 'name', value: Buffer.from(node.value) };
@@ -473,22 +500,28 @@ function parseOcspResponse(der: Buffer): ParsedOcsp {
     if (node.tag === 2) {
       let value = Buffer.from(node.value);
       if (node.constructed) {
-        const inner = children(parseDer(node.value).node)[0];
-        if (inner && inner.tag === TAG.OCTET_STRING) value = Buffer.from(inner.value);
+        // [2] EXPLICIT OCTET STRING (normative OCSP module): the inner node is the
+        // OCTET STRING itself, not its content.
+        const inner = parseDer(node.value).node;
+        if (inner.tag === TAG.OCTET_STRING) value = Buffer.from(inner.value);
       }
       responderId = { kind: 'key', value };
       break;
     }
   }
 
+  // responseExtensions [1] (after responses): unrecognized critical ones reject.
+  const responseExtensions = rdChildren.find((c, idx) => idx > responsesIndex && c.cls === 2 && c.tag === 1);
+  if (responseExtensions) {
+    const critical = criticalExtensionOids(responseExtensions);
+    if (critical.length > 0) unsupported = `OCSP: unsupported critical response extension ${critical[0]}`;
+  }
+
   const responses: OcspSingleResponse[] = [];
-  const responsesSeq = rdChildren.find(
-    (c) => c.tag === TAG.SEQUENCE && children(c).some((x) => x.tag === TAG.SEQUENCE),
-  );
   if (responsesSeq) {
     for (const single of children(responsesSeq)) {
       const sc = children(single);
-      if (sc.length < 3) continue; // certID, certStatus and thisUpdate are mandatory
+      if (sc.length < 2) continue; // certID and certStatus are the minimum
       const certId = parseCertId(sc[0]!);
       const certStatus = sc[1];
       let status: RevocationStatus = 'unknown';
@@ -496,6 +529,7 @@ function parseOcspResponse(der: Buffer): ParsedOcsp {
         if (certStatus.tag === OcspCertStatus.Good) status = 'good';
         else if (certStatus.tag === OcspCertStatus.Revoked) status = 'revoked';
       }
+      let singleUnsupported: string | null = null;
       // thisUpdate is a mandatory direct GeneralizedTime/UTCTime.
       let index = 2;
       const thisNode = sc[index];
@@ -503,19 +537,57 @@ function parseOcspResponse(der: Buffer): ParsedOcsp {
       if (thisNode && (thisNode.tag === TAG.GENERALIZED_TIME || thisNode.tag === TAG.UTC_TIME)) {
         thisUpdate = decodeTime(thisNode);
         index += 1;
+      } else {
+        singleUnsupported = 'OCSP: malformed or missing thisUpdate';
       }
-      // nextUpdate is optional and wrapped in [0] EXPLICIT, so its time sits one
-      // level deeper than thisUpdate's; the previous parser missed it entirely.
+      // nextUpdate is optional and wrapped in [0] EXPLICIT. A present-but-malformed
+      // [0] must not be treated as an absent nextUpdate (which would fall back to
+      // the max-age window).
       let nextUpdate: Date | null = null;
       const nextNode = sc[index];
       if (nextNode && nextNode.cls === 2 && nextNode.tag === 0) {
-        const inner = parseDer(nextNode.value).node;
-        if (inner.tag === TAG.GENERALIZED_TIME || inner.tag === TAG.UTC_TIME) nextUpdate = decodeTime(inner);
+        try {
+          const inner = parseDer(nextNode.value).node;
+          if (inner.tag === TAG.GENERALIZED_TIME || inner.tag === TAG.UTC_TIME) nextUpdate = decodeTime(inner);
+          else singleUnsupported = 'OCSP: malformed nextUpdate';
+        } catch {
+          singleUnsupported = 'OCSP: malformed nextUpdate';
+        }
+        index += 1;
       }
-      responses.push({ certId, status, thisUpdate, nextUpdate });
+      // singleExtensions [1]: unrecognized critical ones reject.
+      const singleExt = sc[index];
+      if (singleExt && singleExt.cls === 2 && singleExt.tag === 1) {
+        const critical = criticalExtensionOids(singleExt);
+        if (critical.length > 0) singleUnsupported = `OCSP: unsupported critical single extension ${critical[0]}`;
+      }
+      responses.push({ certId, status, thisUpdate, nextUpdate, unsupported: singleUnsupported });
     }
   }
-  return { tbsRaw: tbsResponseData.raw, signature, signatureAlgorithmOid: sigAlgOid, certs, responderId, responses };
+  return {
+    tbsRaw: tbsResponseData.raw,
+    signature,
+    signatureAlgorithmOid: sigAlgOid,
+    certs,
+    responderId,
+    unsupported,
+    responses,
+  };
+}
+
+/** OIDs of critical extensions inside an explicit Extensions wrapper. */
+function criticalExtensionOids(wrapper: DerNode): string[] {
+  const oids: string[] = [];
+  const seq = parseDer(wrapper.value).node;
+  for (const ext of children(seq)) {
+    const parts = children(ext);
+    const oidNode = parts[0];
+    if (!oidNode || oidNode.tag !== TAG.OID) continue;
+    const booleanNode = parts.find((n) => n.tag === TAG.BOOLEAN);
+    const critical = booleanNode ? booleanNode.value[0] !== 0 : false;
+    if (critical) oids.push(decodeOid(oidNode.value));
+  }
+  return oids;
 }
 
 const OID_OCSP_SIGNING = '1.3.6.1.5.5.7.3.9';
@@ -720,6 +792,9 @@ async function tryOcsp(
     );
     if (!bytes) return null;
     const parsed = parseOcspResponse(bytes);
+    if (parsed.unsupported) {
+      return { status: 'unknown', source: 'ocsp', reason: parsed.unsupported };
+    }
     // Accept the response if it is signed by the issuing CA, or by a delegated
     // responder certificate (id-kp-OCSPSigning) that the issuing CA signed.
     // If neither verifies we return null so the caller falls back to the CRL.
@@ -734,6 +809,9 @@ async function tryOcsp(
     const expected = expectedCertId(cert, issuer);
     const match = parsed.responses.find((r) => r.certId && certIdMatches(r.certId, expected));
     if (!match) return null;
+    if (match.unsupported) {
+      return { status: 'unknown', source: 'ocsp', reason: match.unsupported };
+    }
     if (!match.thisUpdate || Number.isNaN(match.thisUpdate.getTime())) {
       return { status: 'unknown', source: 'ocsp', reason: 'OCSP response has no valid thisUpdate' };
     }
@@ -824,6 +902,12 @@ async function tryCrl(
     }
     if (!crl.nextUpdate) {
       return { status: 'unknown', source: 'crl', reason: 'CRL has no nextUpdate' };
+    }
+    if (Number.isNaN(crl.nextUpdate.getTime())) {
+      return { status: 'unknown', source: 'crl', reason: 'CRL has no valid nextUpdate' };
+    }
+    if (crl.nextUpdate < crl.thisUpdate) {
+      return { status: 'unknown', source: 'crl', reason: 'CRL nextUpdate precedes thisUpdate' };
     }
     if (verifiedAt > crl.nextUpdate) {
       return { status: 'unknown', source: 'crl', reason: 'CRL expired' };

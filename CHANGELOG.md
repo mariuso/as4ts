@@ -95,6 +95,20 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **OCSP `nextUpdate` presence was conflated with absence.** A `[0] EXPLICIT`
+  `nextUpdate` that was present but not a valid time was treated as absent and fell
+  through to the max-age window; it is now rejected as `unknown`. Unsupported OCSP
+  response versions and unrecognized critical extensions at the response and
+  SingleResponse levels are rejected as well.
+- **A delegated responder's `byKey` identifier was decoded incorrectly.** The
+  parser treated the inner OCTET STRING's hash bytes as ASN.1, so a
+  correctly-encoded `[2] EXPLICIT` ResponderID was rejected. It now unwraps the
+  OCTET STRING directly; the test fixture emits the normative explicit encoding,
+  and `byName` and `byKey` are both covered.
+- **An invalid CRL `nextUpdate` could create a cache entry that never expired.**
+  Invalid or non-monotonic CRL dates are rejected, and `RevocationCache` now
+  refuses a non-finite expiry, so a malformed `expiresAt` can no longer be served
+  indefinitely.
 - **OCSP `nextUpdate` was never parsed, and `thisUpdate` was optional.** OCSP
   encodes `nextUpdate` inside `[0] EXPLICIT`, but the parser looked for two direct
   time fields, so a correctly-encoded expired `nextUpdate` was ignored and an

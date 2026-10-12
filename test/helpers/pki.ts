@@ -32,6 +32,7 @@ export interface TestPki {
     opts?: {
       thisUpdate?: Date;
       nextUpdate?: Date;
+      nextUpdateDer?: Buffer;
       extensions?: readonly { readonly oid: string; readonly critical: boolean; readonly der: Buffer }[];
     },
   ): Buffer;
@@ -324,6 +325,7 @@ export function createTestPki(options: TestPkiOptions = {}): TestPki {
     opts: {
       thisUpdate?: Date;
       nextUpdate?: Date;
+      nextUpdateDer?: Buffer;
       extensions?: readonly { readonly oid: string; readonly critical: boolean; readonly der: Buffer }[];
     } = {},
   ): Buffer => buildCrl(intermediate.cert.cert, intermediate.key.keyObject, revokedSerialHexes, opts, now);
@@ -358,6 +360,8 @@ function buildCrl(
   opts: {
     thisUpdate?: Date;
     nextUpdate?: Date;
+    /** Raw nextUpdate TLV, overriding `nextUpdate` (malformed-timestamp tests). */
+    nextUpdateDer?: Buffer;
     extensions?: readonly { readonly oid: string; readonly critical: boolean; readonly der: Buffer }[];
   },
   now: Date,
@@ -384,7 +388,7 @@ function buildCrl(
     signatureAlgorithm,
     issuerName,
     utcTime(opts.thisUpdate ?? new Date(now.getTime() - 60_000)),
-    utcTime(opts.nextUpdate ?? new Date(now.getTime() + 7 * 24 * 3600 * 1000)),
+    opts.nextUpdateDer ?? utcTime(opts.nextUpdate ?? new Date(now.getTime() + 7 * 24 * 3600 * 1000)),
     derSequence(...entries),
     ...(crlExtensions ? [crlExtensions] : []),
   );
