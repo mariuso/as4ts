@@ -162,3 +162,134 @@ test('honours cancellation while reading the body', async () => {
     (err) => err instanceof MimeFault && err.reason === 'aborted',
   );
 });
+
+/** A body iterator the test drives by hand, to stall a read and observe cleanup. */
+function manualStream(): {
+  body: AsyncIterable<Uint8Array>;
+  push: (chunk: Buffer) => void;
+  wasReturned: () => boolean;
+} {
+  const queue: Buffer[] = [];
+  let pending: ((result: IteratorResult<Uint8Array>) => void) | null = null;
+  let finished = false;
+  let returned = false;
+  const body: AsyncIterable<Uint8Array> = {
+    [Symbol.asyncIterator]() {
+      return {
+        next(): Promise<IteratorResult<Uint8Array>> {
+          const queued = queue.shift();
+          if (queued) return Promise.resolve({ value: queued, done: false });
+          if (finished) return Promise.resolve({ value: undefined, done: true });
+          return new Promise((resolve) => {
+            pending = resolve;
+          });
+        },
+        return(): Promise<IteratorResult<Uint8Array>> {
+          returned = true;
+          finished = true;
+          pending?.({ value: undefined, done: true });
+          pending = null;
+          return Promise.resolve({ value: undefined, done: true });
+        },
+      };
+    },
+  };
+  return {
+    body,
+    push: (chunk: Buffer) => {
+      if (pending) {
+        const resolve = pending;
+        pending = null;
+        resolve({ value: chunk, done: false });
+      } else {
+        queue.push(chunk);
+      }
+    },
+    wasReturned: () => returned,
+  };
+}
+
+test('cancellation interrupts a stalled read before the first chunk', async () => {
+  const stream = manualStream();
+  const controller = new AbortController();
+  const pending = parseMultipartRelated({
+    contentType: CT,
+    body: stream.body,
+    limits: LIMITS,
+    signal: controller.signal,
+  });
+  setTimeout(() => controller.abort(), 10);
+  await assert.rejects(pending, (err) => err instanceof MimeFault && err.reason === 'aborted');
+  assert.ok(stream.wasReturned(), 'the source is cleaned up on abort');
+});
+
+test('cancellation interrupts a read stalled between chunks', async () => {
+  const stream = manualStream();
+  const controller = new AbortController();
+  const pending = parseMultipartRelated({
+    contentType: CT,
+    body: stream.body,
+    limits: LIMITS,
+    signal: controller.signal,
+  });
+  stream.push(Buffer.from(`--${BOUNDARY}\r\nContent-Type: application/soap+xml\r\n\r\n<a/>`, 'latin1'));
+  setTimeout(() => controller.abort(), 10);
+  await assert.rejects(pending, (err) => err instanceof MimeFault && err.reason === 'aborted');
+  assert.ok(stream.wasReturned(), 'the source is cleaned up on abort');
+});
+
+test('rejects an ambiguous root (two SOAP parts)', async () => {
+  const body = multipart([
+    { headers: { 'Content-Type': 'application/soap+xml' }, body: SOAP },
+    { headers: { 'Content-Type': 'application/soap+xml' }, body: SOAP },
+  ]);
+  const parsed = await parse(body);
+  assert.throws(
+    () => selectSoapPart(parsed),
+    (err) => err instanceof MimeFault && err.reason === 'mime.ambiguous-root',
+  );
+});
+
+test('rejects a start parameter that does not name a SOAP part', async () => {
+  const body = multipart([
+    { headers: { 'Content-Type': 'application/soap+xml', 'Content-ID': '<soap@x>' }, body: SOAP },
+    { headers: { 'Content-Type': 'application/octet-stream', 'Content-ID': '<att@x>' }, body: 'x' },
+  ]);
+  const parsed = await parseMultipartRelated({
+    contentType: `multipart/related; boundary="${BOUNDARY}"; start="<att@x>"`,
+    body: slices(body, 10),
+    limits: LIMITS,
+  });
+  assert.throws(
+    () => selectSoapPart(parsed),
+    (err) => err instanceof MimeFault && err.reason === 'mime.no-soap-part',
+  );
+});
+
+test('rejects a duplicate header within a part', async () => {
+  const body = Buffer.from(
+    `--${BOUNDARY}\r\nContent-Type: application/soap+xml\r\nContent-Type: text/plain\r\n\r\n<a/>\r\n--${BOUNDARY}--\r\n`,
+    'latin1',
+  );
+  await assert.rejects(parse(body), (err) => err instanceof MimeFault && err.reason === 'mime.duplicate-header');
+});
+
+test('does not accept a mis-named boundary parameter', async () => {
+  await assert.rejects(
+    parseMultipartRelated({
+      contentType: `multipart/related; notboundary="${BOUNDARY}"`,
+      body: slices(WELL_FORMED, 10),
+      limits: LIMITS,
+    }),
+    (err) => err instanceof MimeFault && err.reason === 'mime.boundary-invalid',
+  );
+});
+
+test('stops at the first closing delimiter and ignores the epilogue', async () => {
+  const withEpilogue = Buffer.concat([
+    WELL_FORMED,
+    Buffer.from(`\r\n--${BOUNDARY}\r\nContent-Type: text/plain\r\n\r\nignored`, 'latin1'),
+  ]);
+  const parsed = await parse(withEpilogue);
+  assert.equal(parsed.parts.length, 2);
+});

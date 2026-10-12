@@ -78,7 +78,7 @@ test('accepts a well-formed attachment reference and reports its validated facts
   if (result.ok) {
     const attachment = result.signature.references.find((r) => r.uri === 'cid:attachment@example');
     assert.ok(attachment);
-    assert.deepEqual(attachment.transforms, [SWA_TRANSFORM_SIGNATURE]);
+    assert.deepEqual(attachment.transforms, [{ algorithm: SWA_TRANSFORM_SIGNATURE, inclusivePrefixes: [] }]);
     assert.equal(attachment.digestMethod, ALGO_SHA256);
   }
 });

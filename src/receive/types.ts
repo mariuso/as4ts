@@ -1,6 +1,6 @@
 import type { Readable } from 'node:stream';
 import type { Profile, ScopedId, Signer, ValidateCertificate } from '../types.js';
-import type { SignedReference } from '../xml/ws-security.js';
+import type { VerifiedReference } from '../xml/ws-security.js';
 
 /**
  * Receiving contracts (Phase 1). These are internal until the `as4ts/receive`
@@ -54,7 +54,9 @@ export type InboundFailureReason =
   | 'mime.header-too-large'
   | 'mime.part-too-large'
   | 'mime.malformed'
+  | 'mime.duplicate-header'
   | 'mime.no-soap-part'
+  | 'mime.ambiguous-root'
   | 'mime.duplicate-content-id'
   // xml
   | 'xml.malformed'
@@ -160,8 +162,12 @@ export interface OpenAs4MessageInput {
   readonly contentType: string | undefined;
   /** The complete request body, already transfer-decoded by the caller. */
   readonly body: AsyncIterable<Uint8Array>;
-  /** The key holder that unwraps the inbound session key. */
-  readonly keyHolder: InboundKeyHolder;
+  /**
+   * The key holder(s) that can unwrap the inbound session key. A bounded
+   * collection supports certificate rollover; `open` reports which credential it
+   * used.
+   */
+  readonly keyHolder: InboundKeyHolder | readonly InboundKeyHolder[];
   /** Required. Validates the sender certificate (purpose `message-signer`). */
   readonly validateCertificate: ValidateCertificate;
   /** Required. Our own AP identity, to bind the message's `To` party. */
@@ -193,8 +199,8 @@ export interface PayloadHandle {
 export interface EvidenceHandle {
   /** The original SOAP envelope bytes exactly as received. */
   readonly envelopeBytes: Uint8Array;
-  /** Every reference the signature covered, as validated. */
-  readonly signedReferences: readonly SignedReference[];
+  /** Every reference the signature covered, as fully validated (transform parameters included). */
+  readonly signedReferences: readonly VerifiedReference[];
   readonly signerCertificate: string;
   dispose(): Promise<void>;
 }
@@ -203,7 +209,8 @@ export interface EvidenceHandle {
  * Plain, serialisable context for `respondAs4Message` and for recovery. It is
  * deliberately not an opaque in-memory token: a caller that committed the
  * document but crashed before responding can persist this and rebuild the
- * response.
+ * response. It carries the complete verified references — digest algorithm,
+ * ordered transforms and their parameters — not just URI and digest.
  */
 export interface ReceiptContext {
   readonly messageId: string;
@@ -211,7 +218,7 @@ export interface ReceiptContext {
   readonly receiverId: string;
   readonly timestamp: string;
   /** The verified references to echo in the receipt's NonRepudiationInformation. */
-  readonly signedReferences: readonly SignedReference[];
+  readonly signedReferences: readonly VerifiedReference[];
 }
 
 export interface OpenSuccess {
@@ -227,6 +234,8 @@ export interface OpenSuccess {
   readonly mpc?: string;
   readonly compressionType?: string;
   readonly signerCertificate: string;
+  /** The credential (AP certificate) that actually unwrapped the session key. */
+  readonly credentialCertificate: string;
   readonly payload: PayloadHandle;
   readonly evidence: EvidenceHandle;
   readonly receipt: ReceiptContext;
@@ -243,18 +252,13 @@ export interface EbmsErrorSpec {
 }
 
 /**
- * The caller's explicit decision. A receipt is produced only for the two
- * committed outcomes; anything else requires an error. The package cannot prove
- * the caller committed anything — this decision is the caller's obligation.
+ * The caller's explicit decision for an accepted message. A receipt is produced
+ * only for these two outcomes. The package cannot prove the caller committed
+ * anything — this decision is the caller's obligation.
  */
-export type AcceptanceDecision =
-  | { readonly kind: 'committed' }
-  | { readonly kind: 'already-committed' }
-  | { readonly kind: 'rejected'; readonly error: EbmsErrorSpec };
+export type AcceptanceDecision = 'committed' | 'already-committed';
 
-export interface RespondAs4MessageInput {
-  readonly receipt: ReceiptContext;
-  readonly decision: AcceptanceDecision;
+interface RespondCommon {
   /** Signs the receipt or error signal. */
   readonly signer: Signer;
   readonly profile?: Profile;
@@ -263,6 +267,26 @@ export interface RespondAs4MessageInput {
   readonly signal?: AbortSignal;
   readonly onEvent?: OnInboundEvent;
 }
+
+/** Build a signed receipt for a message that was durably accepted. */
+export interface AcceptResponseInput extends RespondCommon {
+  readonly kind: 'accepted';
+  readonly receipt: ReceiptContext;
+  readonly decision: AcceptanceDecision;
+}
+
+/**
+ * Build a signed ebMS error signal. It needs only the correlation recovered
+ * before the failure — not receipt facts — so a caller answering an
+ * `InboundFailure` never has to fabricate successful-verification evidence.
+ */
+export interface RejectResponseInput extends RespondCommon {
+  readonly kind: 'rejected';
+  readonly correlation: InboundCorrelation;
+  readonly error: EbmsErrorSpec;
+}
+
+export type RespondAs4MessageInput = AcceptResponseInput | RejectResponseInput;
 
 export interface RespondSuccess {
   readonly ok: true;

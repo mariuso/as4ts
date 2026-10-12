@@ -29,8 +29,15 @@ export interface SignedReference {
 export interface VerifiedReference extends SignedReference {
   /** The validated `ds:DigestMethod/@Algorithm`. */
   readonly digestMethod: string;
-  /** The validated transform algorithm URIs, in document order. */
-  readonly transforms: readonly string[];
+  /** The validated transforms, in document order, with their parameters. */
+  readonly transforms: readonly VerifiedTransform[];
+}
+
+/** One validated transform on a reference, including its parameters. */
+export interface VerifiedTransform {
+  readonly algorithm: string;
+  /** `InclusiveNamespaces/@PrefixList` entries declared on the transform. */
+  readonly inclusivePrefixes: readonly string[];
 }
 
 /** The facts a verified WS-Security signature yields. Direction-neutral. */
@@ -203,11 +210,14 @@ function verifyReferences(doc: Document, signedInfo: Element): ReferencesVerific
       return fail('bad-signature', 'unexpected digest method');
     }
 
-    const transforms = elementsByLocalName(reference, DS_NS, 'Transform').map((t) => attrOf(t, 'Algorithm') ?? '');
+    const transforms: VerifiedTransform[] = elementsByLocalName(reference, DS_NS, 'Transform').map((t) => ({
+      algorithm: attrOf(t, 'Algorithm') ?? '',
+      inclusivePrefixes: transformInclusivePrefixes(t),
+    }));
     const verified: VerifiedReference = { uri, digest, digestMethod, transforms };
 
     if (uri.startsWith('cid:')) {
-      if (transforms.length !== 1 || transforms[0] !== SWA_TRANSFORM_SIGNATURE) {
+      if (transforms.length !== 1 || transforms[0]?.algorithm !== SWA_TRANSFORM_SIGNATURE) {
         return fail('bad-signature', `unsupported attachment transform for ${uri}`);
       }
       declared.push(verified);
@@ -215,7 +225,7 @@ function verifyReferences(doc: Document, signedInfo: Element): ReferencesVerific
     }
 
     if (!uri.startsWith('#')) return fail('malformed', `unsupported reference ${uri}`);
-    if (transforms.length !== 1 || transforms[0] !== ALGO_EXC_C14N) {
+    if (transforms.length !== 1 || transforms[0]?.algorithm !== ALGO_EXC_C14N) {
       return fail('bad-signature', `unsupported transform for ${uri}`);
     }
 
@@ -223,7 +233,7 @@ function verifyReferences(doc: Document, signedInfo: Element): ReferencesVerific
     if (resolved.matches > 1) return fail('malformed', `duplicate id ${uri}`);
     if (!resolved.element) return fail('malformed', `unresolved reference ${uri}`);
 
-    const prefixes = referenceInclusivePrefixes(reference);
+    const prefixes = transforms[0].inclusivePrefixes;
     materializeInclusiveNamespaces(resolved.element, prefixes);
     const actual = prefixes.length
       ? createHash('sha256').update(canonicalize(resolved.element, prefixes), 'utf8').digest('base64')
@@ -287,9 +297,7 @@ function inclusivePrefixList(c14nMethod: Element | null): string[] {
   return list ? list.split(/\s+/).filter(Boolean) : [];
 }
 
-function referenceInclusivePrefixes(reference: Element): string[] {
-  const transform = elementsByLocalName(reference, DS_NS, 'Transform')[0];
-  if (!transform) return [];
+function transformInclusivePrefixes(transform: Element): string[] {
   const inc = firstByLocalName(transform, ALGO_EXC_C14N, 'InclusiveNamespaces');
   const list = attrOf(inc, 'PrefixList');
   return list ? list.split(/\s+/).filter(Boolean) : [];
