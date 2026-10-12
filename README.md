@@ -18,10 +18,11 @@ const result = await sendAs4(input); // SendAs4Result
 
 Expected failures are **values**, never thrown exceptions.
 
-> **Not certified.** This library has interoperated with Oxalis-NG and phase4 on
-> the Peppol test network, but it is **not** a certified Peppol Access Point and
-> carries no conformance statement. Every user must pass the Peppol Testbed with
-> their own certificate before production use. See [Interop status](#8-interop-status).
+> **Not certified.** This library has interoperated with independent access point
+> implementations on the Peppol test network, but it is **not** a certified
+> Peppol Access Point and carries no conformance statement. Every user must pass
+> the Peppol Testbed with their own certificate before production use. See
+> [Interop status](#8-interop-status).
 
 ---
 
@@ -292,27 +293,19 @@ switch (classify(result)) {
 
 ## 8. Interop status
 
-Reached on the Peppol test network: verified receipts (`outcome:
-'receipt-verified'`, `signerMatchesSmPCertificate: true`) from an **Oxalis-NG**
-access point and a **phase4** access point. Two cross-implementation defects were
-found and fixed on the way: the SBDH `BusinessScope/DOCUMENTID` must carry the
-document type identifier **value without the scheme**, and exclusive C14N must
-order namespace declarations by codepoint so an uppercase prefix such as
-WSS4J/phase4's `S12` sorts before `ds`.
-
-This is **not** a conformance or certification claim. Each user must pass the
-Peppol Testbed with their own certificate.
+Receipts from independent access point implementations have been verified on the
+Peppol test network (`outcome: 'receipt-verified'`,
+`signerMatchesSmPCertificate: true`). This is **not** a conformance or
+certification claim; each user must pass the Peppol Testbed with their own
+certificate.
 
 Offline receipt captures from real access points are committed under
 `test/fixtures/captures/` and verified by `test/captures.test.ts`. They were
 produced by this project's own sender against the Peppol test network, so no
 third-party material is involved. Each capture is verified offline against the
 bundled G3 test anchors, at the receipt's own timestamp: signature, exclusive
-C14N, signer chain and signature-to-signal binding. Currently committed: a
-**phase4** receipt (`POP000306`, `9915:helger`) and an **Oxalis-NG** receipt
-(`PNO000063`, `0192:996220567`); these are public Peppol test identities. Adding
-another capture is just dropping the raw signal message into
-`test/fixtures/captures/`.
+C14N, signer chain and signature-to-signal binding. Adding another capture is
+just dropping the raw signal message into `test/fixtures/captures/`.
 
 ---
 
@@ -371,28 +364,7 @@ part of the package.
 
 ---
 
-## 11. Open questions
-
-1. **`PartProperties/MimeType` = `application/xml`.** [AS4PROFILE] §3.1 requires
-   the property but the Peppol profile does not pin a value.
-2. **Receipt kind.** A Non-Repudiation receipt is required; a bare
-   Reception-Awareness receipt (no `NonRepudiationInformation`) is
-   `receipt-unverified`. If real peers return bare receipts, relax this.
-3. **Real offline fixtures.** Our own captures from real access points are
-   committed and verified under the bundled G3 anchors (`test/fixtures/captures/`:
-   phase4 `POP000306` and Oxalis-NG `PNO000063`). A non-WSS4J stack (e.g. Qvalia)
-   would strengthen this further.
-4. **OCSP delegated responders** are implemented and tested against a minted
-   responder, but not against a live DigiCert responder here.
-5. **Content-ID domain.** Derived from the endpoint hostname; cosmetic.
-6. **TLS cipher suites** are Node/OpenSSL defaults. A caller-supplied agent is
-   deliberately not supported (it could disable verification); a deployment that
-   needs to narrow cipher suites would require a curated, verification-preserving
-   option added to the library.
-
----
-
-## 12. Specification references
+## 11. Specification references
 
 | Tag                   | Document                                                | Sections used                                                                                                                                                          |
 | --------------------- | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -410,7 +382,7 @@ part of the package.
 
 ---
 
-## 13. Contributing and licence
+## 12. Contributing and licence
 
 Issues and pull requests are welcome. Before opening a PR, `npm install` and
 then `npm test`, `npm run lint` and `npm run format` must all pass; add tests for
