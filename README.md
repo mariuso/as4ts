@@ -137,6 +137,15 @@ spool file. RSA-OAEP with SHA-256 wraps the session key. The encrypted payload
 then streams into the multipart request, keeping memory use independent of the
 full payload size. Temporary files use mode `0600` inside a `0700` workspace.
 
+**Retries reuse a prepared message.** `prepareAs4` produces an immutable artifact
+— the signed envelope, the encrypted payload, and the signed references — that
+`transmitAs4` can send any number of times. A retry re-sends the exact same bytes
+and verifies the receipt against the original references, so an uncertain outcome
+can be retried without changing the signed message. The artifact lives in a
+directory (`metadata.json` plus the encrypted attachment); persist that directory
+to survive a restart and reload it with `loadPreparedMessage`. `sendAs4` is the
+one-shot convenience over the two calls.
+
 **Receipt acceptance checks the evidence.** RSA-SHA256 signature verification
 must cover the parsed signal. The signer must pass certificate validation and
 match the receiving AP identity; `RefToMessageId` must match the sent message.
@@ -146,12 +155,12 @@ verification and the TLS 1.2 minimum remain enabled for every transmission.
 
 ## API
 
-| Entry point                   | Exports                                                                    | Purpose                                                        |
-| ----------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `as4ts`                       | `sendAs4`, `signerFromKey`, `peppolProfile`                                | Prepare and send one signed, encrypted UserMessage.            |
-| `as4ts/lookup`                | `lookupParticipant` and identifier helpers                                 | Discover an endpoint and verify its signed SMP metadata.       |
-| `as4ts/certificate-validator` | `createCertificateValidator`, `defaultRevocationPolicy`, `RevocationCache` | Apply the supported certificate profile and revocation policy. |
-| `as4ts/classifier`            | `classify`, `classifyEbmsError`, policy tables                             | Map send facts to application decisions.                       |
+| Entry point                   | Exports                                                                                         | Purpose                                                        |
+| ----------------------------- | ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `as4ts`                       | `sendAs4`, `prepareAs4`, `transmitAs4`, `loadPreparedMessage`, `signerFromKey`, `peppolProfile` | Prepare and send one signed, encrypted UserMessage.            |
+| `as4ts/lookup`                | `lookupParticipant` and identifier helpers                                                      | Discover an endpoint and verify its signed SMP metadata.       |
+| `as4ts/certificate-validator` | `createCertificateValidator`, `defaultRevocationPolicy`, `RevocationCache`                      | Apply the supported certificate profile and revocation policy. |
+| `as4ts/classifier`            | `classify`, `classifyEbmsError`, policy tables                                                  | Map send facts to application decisions.                       |
 
 The public types document the full [send input and results](src/types.ts) and
 [lookup input and results](src/lookup/types.ts).
@@ -208,10 +217,10 @@ Current limits:
 - **Receiving is planned.** The [receiving design](docs/receiving.md) separates
   verification from acknowledgement so the application can store a document
   durably before issuing its receipt. There is no receiving API yet.
-- **Durable retransmission is not implemented.** Each send builds a fresh
-  envelope. Reusing a message ID alone does not preserve the original signed
-  references; a replayable outbound artifact is still needed for reliable
-  AS4 retries.
+- **Durable retransmission is caller-driven.** `prepareAs4` + `transmitAs4`
+  re-send an identical artifact, and the directory it writes can be persisted and
+  reloaded with `loadPreparedMessage`. Persistence, retention and retry policy
+  remain the application's responsibility.
 - **Revocation has stated limits.** Delta and scoped/indirect CRLs are rejected
   rather than followed, a CRL must carry a `nextUpdate`, and a delegated OCSP
   responder's own revocation is not checked. See

@@ -54,6 +54,14 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Replayable outbound messages: `prepareAs4` and `transmitAs4`.** `prepareAs4`
+  validates the receiver certificate, spools the encrypted payload, and signs the
+  envelope, producing an immutable `PreparedMessage` artifact (`metadata.json` plus
+  the encrypted attachment). `transmitAs4` performs one attempt against it without
+  rebuilding or re-signing anything, so a retry re-sends byte-identical content and
+  verifies the receipt against the original signed references.
+  `loadPreparedMessage` reloads a persisted artifact (for example after a restart).
+  `sendAs4` is unchanged as the one-shot convenience over the two.
 - **`as4ts/lookup`.** `lookupParticipant(input)` performs exactly one SML/SMP
   discovery and returns a union of facts (`found`, `not-registered`,
   `not-supported`, `signature-invalid`, `unavailable`). It derives the SML DNS

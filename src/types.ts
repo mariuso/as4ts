@@ -1,4 +1,5 @@
 import type { Readable } from 'node:stream';
+import type { SignedReference } from './xml/ws-security.js';
 
 /** A participant identifier: a scheme and a value, e.g. iso6523-actorid-upis / 0192:123456789. */
 export interface ParticipantId {
@@ -291,3 +292,77 @@ export type SendAs4Result =
   | NoSignalResult
   | TransportFailureResult
   | NotSentResult;
+
+/** Everything needed to prepare one immutable outbound message. */
+export interface PrepareAs4Input {
+  /** Complete SBDH+business document, exactly as it must arrive. Opaque bytes. */
+  readonly payload: Readable;
+  /** AE endpoint URL from the receiver's SMP entry. */
+  readonly endpointUrl: string;
+  /** AS4 transport profile from the receiver's SMP entry. */
+  readonly transportProfile: string;
+  readonly receiverCertificate: string;
+  readonly senderParticipant: ParticipantId;
+  readonly receiverParticipant: ParticipantId;
+  readonly documentType: ScopedId;
+  readonly process: ScopedId;
+  /** Message id supplied by the caller. Reuse it when retrying an `unknown` outcome. */
+  readonly as4MessageId: string;
+  readonly signer: Signer;
+  /** Required. Validates the receiver certificate before anything is spooled. */
+  readonly validateCertificate: ValidateCertificate;
+  readonly profile?: Profile;
+  /** Aborting stops spooling and signing and removes the scratch files. */
+  readonly signal?: AbortSignal;
+  /** Directory in which the artifact directory is created. Defaults to the OS temp directory. */
+  readonly artifactDirectory?: string;
+  readonly onEvent?: OnEvent;
+  readonly now: () => Date;
+}
+
+export type PrepareAs4Result =
+  | { readonly outcome: 'prepared'; readonly message: PreparedMessage }
+  | { readonly outcome: 'not-prepared'; readonly reason: NotSentReason; readonly detail?: string };
+
+/**
+ * An immutable, replayable outbound message. Transmitting it again re-sends the
+ * exact same signed envelope and ciphertext, so a retry keeps the signed
+ * references a receiver already acknowledged. Persist `directory` to survive a
+ * restart and reload it with `loadPreparedMessage`.
+ */
+export interface PreparedMessage {
+  readonly as4MessageId: string;
+  readonly sentAt: string;
+  readonly endpointUrl: string;
+  readonly transportProfile: string;
+  readonly receiverCertificateCommonName: string;
+  /** The receiver certificate (PEM) the message was encrypted to. */
+  readonly receiverCertificate: string;
+  readonly documentType: ScopedId;
+  readonly process: ScopedId;
+  /** The exact signed SOAP envelope. */
+  readonly soapXml: string;
+  /** `cid:` href of the encrypted attachment. */
+  readonly attachmentHref: string;
+  readonly boundary: string;
+  readonly soapContentId: string;
+  readonly attachmentByteLength: number;
+  /** The references the signature covers; reuse them verbatim to verify the receipt. */
+  readonly signedReferences: readonly SignedReference[];
+  /** Directory holding `metadata.json` and the encrypted attachment. */
+  readonly directory: string;
+  /** Read the encrypted attachment (repeatable). */
+  readAttachment(): Readable;
+  /** Remove the artifact from disk. */
+  dispose(): Promise<void>;
+}
+
+export interface TransmitAs4Input {
+  readonly message: PreparedMessage;
+  /** Required. Validates the receipt signer before a receipt is accepted. */
+  readonly validateCertificate: ValidateCertificate;
+  readonly http: HttpOptions;
+  readonly signal?: AbortSignal;
+  readonly onEvent?: OnEvent;
+  readonly now: () => Date;
+}

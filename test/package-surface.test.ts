@@ -18,7 +18,14 @@ const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
 
 test('the sender entry point exports a stable surface', async () => {
   const module = await import('../src/index.js');
-  assert.deepEqual(Object.keys(module).sort(), ['peppolProfile', 'sendAs4', 'signerFromKey']);
+  assert.deepEqual(Object.keys(module).sort(), [
+    'loadPreparedMessage',
+    'peppolProfile',
+    'prepareAs4',
+    'sendAs4',
+    'signerFromKey',
+    'transmitAs4',
+  ]);
 });
 
 test('the certificate-validator entry point exports a stable surface', async () => {

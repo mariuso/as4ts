@@ -71,16 +71,21 @@ export interface FakeReceiverOptions {
       }
     | { kind: 'receipt-tampered' }
     | { kind: 'drop' }
+    /** Accept and record the first request, then drop the response; later requests answer normally. */
+    | { kind: 'drop-first' }
     | { kind: 'hang' };
 }
 
 export async function startFakeReceiver(options: FakeReceiverOptions): Promise<FakeReceiver> {
   const received: ReceivedMessage[] = [];
+  let requests = 0;
   const server: Server = createServer({ cert: options.tlsCertPem, key: options.tlsKeyPem }, (req, res) => {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
     req.on('end', () => {
       const body = Buffer.concat(chunks);
+      requests += 1;
+      const dropFirst = options.mode?.kind === 'drop-first' && requests === 1;
       if (options.mode?.kind === 'drop') {
         req.socket.destroy();
         return;
@@ -105,6 +110,11 @@ export async function startFakeReceiver(options: FakeReceiverOptions): Promise<F
       try {
         const message = processIncoming(body, String(req.headers['content-type'] ?? ''), options.receiver);
         received.push(message);
+        if (dropFirst) {
+          // The receiver accepted and stored the message but its response is lost.
+          req.socket.destroy();
+          return;
+        }
         res.writeHead(200, { 'Content-Type': 'application/soap+xml; charset=UTF-8' });
         res.end(buildReceipt(message, options.receiver, options.mode?.kind === 'receipt-tampered'));
       } catch (err) {

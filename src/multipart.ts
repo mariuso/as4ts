@@ -12,6 +12,10 @@ export interface MultipartInput {
   readonly attachmentByteLength: number;
   /** Test-only, pins the boundary and the SOAP part Content-ID. */
   readonly entropy?: Entropy;
+  /** Reuse a boundary (a replayable artifact must reproduce its exact bytes). */
+  readonly boundary?: string;
+  /** Reuse the SOAP part Content-ID. */
+  readonly soapContentId?: string;
 }
 
 export interface MultipartBody {
@@ -33,8 +37,8 @@ const CRLF = '\r\n';
  */
 export function buildMultipartBody(input: MultipartInput): MultipartBody {
   const entropy = input.entropy ?? defaultEntropy();
-  const boundary = `----=_Part_${hexToken(entropy, 12)}`;
-  const soapContentId = `soap-${hexToken(entropy, 12)}@as4-sender`;
+  const boundary = input.boundary ?? `----=_Part_${hexToken(entropy, 12)}`;
+  const soapContentId = input.soapContentId ?? `soap-${hexToken(entropy, 12)}@as4-sender`;
   const bareCid = input.attachmentHref.replace(/^cid:/, '');
 
   const soapPartHeader =
