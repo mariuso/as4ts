@@ -1,0 +1,3 @@
+# Store files exactly as authored: the golden fixtures are compared byte-for-byte
+# and must not be line-ending normalised.
+* -text
