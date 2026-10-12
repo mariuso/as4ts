@@ -64,10 +64,10 @@ test('transport failures before bytes are retryable, after are unknown', () => {
     receiverCertificateCommonName: '',
     transportProfile: '',
   };
-  assert.equal(classify({ ...base, requestBytesWritten: false, aborted: false }), 'retryable');
-  assert.equal(classify({ ...base, requestBytesWritten: true, aborted: false }), 'unknown');
-  assert.equal(classify({ ...base, requestBytesWritten: false, aborted: true }), 'retryable');
-  assert.equal(classify({ ...base, requestBytesWritten: true, aborted: true }), 'unknown');
+  assert.equal(classify({ ...base, requestMayHaveBeenSent: false, aborted: false }), 'retryable');
+  assert.equal(classify({ ...base, requestMayHaveBeenSent: true, aborted: false }), 'unknown');
+  assert.equal(classify({ ...base, requestMayHaveBeenSent: false, aborted: true }), 'retryable');
+  assert.equal(classify({ ...base, requestMayHaveBeenSent: true, aborted: true }), 'unknown');
 });
 
 test('no-signal 502/504 is unknown (gateway may have forwarded), other 5xx retryable, 4xx fatal', () => {

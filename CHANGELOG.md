@@ -95,6 +95,22 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Local spool failures were reported as `internal.error`.** A filesystem error
+  while creating the workspace or spooling the payload now yields
+  `not-sent`/`spool.failed` (retryable), preserving the fact that no HTTP request
+  had started.
+- **`requestBytesWritten` overstated what it measured.** The transport-failure
+  field is renamed to `requestMayHaveBeenSent`: a conservative fact, true once the
+  connection was established (after which the request may have reached the
+  receiver) and false only when nothing was sent.
+- **Error signal descriptions conflated two things.**
+  `eb:Error/@shortDescription` and the `eb:Description` element are now parsed
+  into distinct `shortDescription` and `description` fields.
+- **Signal parsing accepted shapes it should reject.** The parser now requires a
+  SOAP 1.1 or 1.2 envelope with exactly one Header and Body, a `Messaging` that is
+  a direct child of `Header`, and a single `SignalMessage`/`UserMessage`; a
+  `SignalMessage` mixing a `Receipt` with `Error`s (or carrying more than one
+  `Receipt`) is rejected.
 - **Error signals were not correlated with the message.** Any parsed error became
   `error-signal` and was classified by its code, so a signal naming a different
   message could stop delivery. `error-signal` now carries `refToMessageId` and a

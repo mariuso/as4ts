@@ -20,7 +20,11 @@ export interface SendHttpResult {
   readonly statusText: string;
   readonly headers: Record<string, string>;
   readonly body: Buffer;
-  readonly requestBytesWritten: boolean;
+  /**
+   * Conservative fact: true once the connection was established, after which the
+   * request may have reached the receiver. False only when nothing was sent.
+   */
+  readonly requestMayHaveBeenSent: boolean;
 }
 
 /** Signals are small; refuse to buffer an unbounded response. */
@@ -34,13 +38,13 @@ const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
  *
  * A dedicated no-keep-alive agent is always used (a caller-supplied one is not
  * accepted, since it could disable verification), so `secureConnect` always
- * fires and "request bytes written" is reliable on repeat sends to the same
- * host. Any failure destroys the request so an in-flight upload cannot continue
- * after the result is returned.
+ * fires. The reported "may have been sent" fact is therefore reliable on repeat
+ * sends to the same host. Any failure destroys the request so an in-flight upload
+ * cannot continue after the result is returned.
  *
  * Resolves for any HTTP response (including 4xx/5xx) as long as a full response
- * was read. Rejects with a {@link TransportError} (carrying whether any request
- * byte was written) only when no complete response was obtained.
+ * was read. Rejects with a {@link TransportError} (carrying whether the request
+ * may have been sent) only when no complete response was obtained.
  */
 export function sendHttp(input: SendHttpInput): Promise<SendHttpResult> {
   return new Promise<SendHttpResult>((resolve, reject) => {
@@ -48,7 +52,7 @@ export function sendHttp(input: SendHttpInput): Promise<SendHttpResult> {
     if (url.protocol !== 'https:') {
       reject(
         new TransportError('endpoint is not https', {
-          requestBytesWritten: false,
+          requestMayHaveBeenSent: false,
           responseStarted: false,
           aborted: false,
         }),
@@ -78,8 +82,9 @@ export function sendHttp(input: SendHttpInput): Promise<SendHttpResult> {
       settled = true;
       cleanup();
       const nodeCode = code ?? (err as NodeJS.ErrnoException | undefined)?.code;
-      // HTTP request bytes only reach the server after the TLS handshake.
-      const wroteRequest = connected || responseStarted;
+      // Conservative: once the TLS handshake completed, request bytes may have
+      // reached the server. This can over-report, never under-report.
+      const mayHaveSent = connected || responseStarted;
       try {
         req?.destroy();
       } catch {
@@ -93,7 +98,7 @@ export function sendHttp(input: SendHttpInput): Promise<SendHttpResult> {
       reject(
         new TransportError(err instanceof Error ? err.message : String(err), {
           ...(nodeCode ? { code: nodeCode } : {}),
-          requestBytesWritten: wroteRequest,
+          requestMayHaveBeenSent: mayHaveSent,
           responseStarted,
           aborted,
         }),
@@ -164,7 +169,7 @@ export function sendHttp(input: SendHttpInput): Promise<SendHttpResult> {
           statusText: res.statusMessage ?? '',
           headers,
           body: Buffer.concat(chunks),
-          requestBytesWritten: connected,
+          requestMayHaveBeenSent: connected,
         });
       });
     });

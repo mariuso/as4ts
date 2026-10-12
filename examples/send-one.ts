@@ -292,7 +292,7 @@ function report(result: SendAs4Result, outDir: string | undefined): void {
   if (result.outcome === 'no-signal') console.log(`http:           ${result.status} (bodyEmpty=${result.bodyEmpty})`);
   if (result.outcome === 'transport-failure')
     console.log(
-      `transport:      ${result.errorCode ?? '(none)'} (requestBytesWritten=${result.requestBytesWritten}, aborted=${result.aborted})`,
+      `transport:      ${result.errorCode ?? '(none)'} (requestMayHaveBeenSent=${result.requestMayHaveBeenSent}, aborted=${result.aborted})`,
     );
   if (result.outcome === 'receipt-verified') {
     console.log(`receipt at:     ${result.receipt.timestamp}`);

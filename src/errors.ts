@@ -16,7 +16,13 @@ export class SenderFault extends Error {
 export interface TransportFailureInfo {
   /** Node error code when available. */
   readonly code?: string;
-  readonly requestBytesWritten: boolean;
+  /**
+   * Conservative fact: true once the connection was established, after which
+   * request bytes may have reached the receiver. It can be true even when no
+   * body byte was flushed, but is false only when the request definitely was not
+   * sent.
+   */
+  readonly requestMayHaveBeenSent: boolean;
   readonly responseStarted: boolean;
   /** True when the attempt was stopped by the caller's AbortSignal. */
   readonly aborted: boolean;

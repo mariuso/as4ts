@@ -144,14 +144,15 @@ test('signal: parses ebMS error and multipart responses, rejects non-signals', (
   const errorXml = Buffer.from(
     `<env:Envelope xmlns:env="${SOAP_ENV_NS}" xmlns:eb="${EBMS_NS}"><env:Header><eb:Messaging><eb:SignalMessage>` +
       `<eb:MessageInfo><eb:MessageId>e@x</eb:MessageId></eb:MessageInfo>` +
-      `<eb:Error errorCode="EBMS:0004" severity="failure" category="Content"><eb:Description>not serviced</eb:Description></eb:Error>` +
+      `<eb:Error errorCode="EBMS:0004" severity="failure" category="Content" shortDescription="short text"><eb:Description>not serviced</eb:Description></eb:Error>` +
       `</eb:SignalMessage></eb:Messaging></env:Header><env:Body/></env:Envelope>`,
     'utf8',
   );
   const signal = parseSignal(errorXml);
   assert.equal(signal?.kind, 'error');
   assert.equal(signal?.errors[0]?.code, 'EBMS:0004');
-  assert.equal(signal?.errors[0]?.shortDescription, 'not serviced');
+  assert.equal(signal?.errors[0]?.shortDescription, 'short text');
+  assert.equal(signal?.errors[0]?.description, 'not serviced');
 
   assert.equal(parseSignal(Buffer.from('<html>not soap</html>')), null);
   assert.equal(parseSignal(Buffer.from('x')), null);

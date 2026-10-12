@@ -1,11 +1,14 @@
-import { EBMS_NS, WSU_NS } from '../constants.js';
-import { attrOf, elementsByLocalName, firstByLocalName, parseXml, textOf } from './nodes.js';
+import { EBMS_NS, SOAP_11_NS, SOAP_ENV_NS, WSU_NS } from '../constants.js';
+import { attrOf, firstByLocalName, parseXml, textOf } from './nodes.js';
 
 export interface ParsedEbmsError {
   readonly code: string;
   readonly severity: string;
   readonly category: string | null;
+  /** `eb:Error/@shortDescription`, when present. */
   readonly shortDescription: string | null;
+  /** The human-readable `eb:Description` child text, when present. */
+  readonly description: string | null;
   readonly detail: string | null;
 }
 
@@ -82,7 +85,11 @@ function extractFromMultipart(contentType: string, body: Buffer): Buffer | null 
  * Parse a received signal message. This is pure parsing; it makes no trust
  * decision — but it is strict about shape, because a response with more than one
  * eb:Messaging or SignalMessage is exactly the shape a forged-receipt attack
- * takes. A response that is not a single, unambiguous signal returns null.
+ * takes, and reading facts from elements outside the expected structure is how
+ * such an attack succeeds. The envelope must be SOAP 1.1 or 1.2 with exactly one
+ * Header and Body; Messaging must be a direct child of Header; SignalMessage or
+ * UserMessage a direct child of Messaging. A response that is not a single,
+ * unambiguous signal returns null.
  */
 export function parseSignal(envelopeBytes: Buffer): ParsedSignal | null {
   let document: Document;
@@ -93,39 +100,43 @@ export function parseSignal(envelopeBytes: Buffer): ParsedSignal | null {
   }
   const envelope = document.documentElement;
   if (!envelope || envelope.localName !== 'Envelope') return null;
+  const soapNs = envelope.namespaceURI;
+  if (!soapNs || !SUPPORTED_SOAP_NAMESPACES.has(soapNs)) return null;
 
-  const messagingElements = elementsByLocalName(document, EBMS_NS, 'Messaging');
+  const headers = directChildren(envelope, soapNs, 'Header');
+  const bodies = directChildren(envelope, soapNs, 'Body');
+  if (headers.length !== 1 || bodies.length !== 1) return null;
+
+  const messagingElements = directChildren(headers[0]!, EBMS_NS, 'Messaging');
   if (messagingElements.length !== 1) return null;
   const messagingElement = messagingElements[0]!;
 
-  const signalMessages = elementsByLocalName(messagingElement, EBMS_NS, 'SignalMessage');
-  const userMessages = elementsByLocalName(messagingElement, EBMS_NS, 'UserMessage');
+  const signalMessages = directChildren(messagingElement, EBMS_NS, 'SignalMessage');
+  const userMessages = directChildren(messagingElement, EBMS_NS, 'UserMessage');
   if (signalMessages.length + userMessages.length !== 1) return null;
   const signalMessage = signalMessages[0] ?? null;
   const userMessage = userMessages[0] ?? null;
   const signalElement: Element = signalMessage ?? userMessage!;
 
-  // A SignalMessage carries at most one Receipt or one Error (multiple Error
-  // elements within one message are allowed, but not a sibling Receipt).
-  if (signalMessage) {
-    const receipts = elementsByLocalName(signalMessage, EBMS_NS, 'Receipt');
-    if (receipts.length > 1) return null;
-  }
+  const errorElements = directChildren(signalElement, EBMS_NS, 'Error');
+  const receipts = directChildren(signalElement, EBMS_NS, 'Receipt');
+  // A SignalMessage carries either a single Receipt or one or more Errors, never
+  // both and never more than one Receipt.
+  if (receipts.length > 1) return null;
+  if (receipts.length === 1 && errorElements.length > 0) return null;
 
-  const messageInfo = firstByLocalName(signalElement, EBMS_NS, 'MessageInfo');
-  const errorElements = elementsByLocalName(signalElement, EBMS_NS, 'Error');
+  const messageInfo = directChildren(signalElement, EBMS_NS, 'MessageInfo')[0] ?? null;
   const errors: ParsedEbmsError[] = errorElements.map((e) => ({
     code: attrOf(e, 'errorCode') ?? attrOf(e, 'code') ?? '',
     severity: attrOf(e, 'severity') ?? '',
     category: attrOf(e, 'category'),
-    shortDescription: textOf(firstByLocalName(e, EBMS_NS, 'Description')),
+    shortDescription: attrOf(e, 'shortDescription'),
+    description: textOf(firstByLocalName(e, EBMS_NS, 'Description')),
     detail: textOf(firstByLocalName(e, EBMS_NS, 'ErrorDetail')),
   }));
 
-  const hasReceipt = firstByLocalName(signalElement, EBMS_NS, 'Receipt') !== null;
-
   let kind: ParsedSignal['kind'];
-  if (hasReceipt && errors.length === 0) kind = 'receipt';
+  if (receipts.length === 1) kind = 'receipt';
   else if (errors.length > 0) kind = 'error';
   else if (userMessage) kind = 'user-message';
   else kind = 'unrecognized';
@@ -144,4 +155,20 @@ export function parseSignal(envelopeBytes: Buffer): ParsedSignal | null {
     timestamp: textOf(firstByLocalName(messageInfo, EBMS_NS, 'Timestamp')),
     errors,
   };
+}
+
+/** SOAP versions whose envelopes this parser accepts. */
+const SUPPORTED_SOAP_NAMESPACES: ReadonlySet<string> = new Set([SOAP_ENV_NS, SOAP_11_NS]);
+
+/** Direct element children with the given namespace and local name. */
+function directChildren(node: Node, ns: string, localName: string): Element[] {
+  const out: Element[] = [];
+  const children = node.childNodes;
+  for (let i = 0; i < children.length; i += 1) {
+    const child = children.item(i);
+    if (!child || child.nodeType !== 1) continue;
+    const element = child as Element;
+    if (element.namespaceURI === ns && element.localName === localName) out.push(element);
+  }
+  return out;
 }

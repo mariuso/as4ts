@@ -32,7 +32,7 @@ test('rejects an untrusted TLS server certificate: verification cannot be disabl
     // No pinned CA: the receiver's self-signed certificate must be refused.
     const result = await sendAs4(baseInput(pki, receiver.url, null));
     assert.equal(result.outcome, 'transport-failure');
-    if (result.outcome === 'transport-failure') assert.equal(result.requestBytesWritten, false);
+    if (result.outcome === 'transport-failure') assert.equal(result.requestMayHaveBeenSent, false);
   } finally {
     await receiver.close();
   }
@@ -62,7 +62,7 @@ test('transport-failure: DNS failure, nothing sent, retryable', async () => {
   assert.equal(result.outcome, 'transport-failure');
   if (result.outcome === 'transport-failure') {
     assert.equal(result.errorCode, 'ENOTFOUND');
-    assert.equal(result.requestBytesWritten, false);
+    assert.equal(result.requestMayHaveBeenSent, false);
     assert.equal(result.aborted, false);
   }
   assert.equal(classify(result), 'retryable');
@@ -232,7 +232,7 @@ test('transport-failure: connection dropped after request bytes were written', a
   try {
     const result = await sendAs4(baseInput(pki, receiver.url, tls.caPem));
     assert.equal(result.outcome, 'transport-failure');
-    if (result.outcome === 'transport-failure') assert.equal(result.requestBytesWritten, true);
+    if (result.outcome === 'transport-failure') assert.equal(result.requestMayHaveBeenSent, true);
     assert.equal(classify(result), 'unknown');
   } finally {
     await receiver.close();
@@ -329,7 +329,7 @@ test('classify is pure and total over the fact union', () => {
       sentAt: '',
       receiverCertificateCommonName: '',
       transportProfile: '',
-      requestBytesWritten: false,
+      requestMayHaveBeenSent: false,
       aborted: false,
     },
     {

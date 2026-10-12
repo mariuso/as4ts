@@ -67,6 +67,7 @@ export async function sendAs4Internal(
   if (abort?.aborted) return notSent('aborted');
 
   let workspace: TempWorkspace | null = null;
+  let transmissionStarted = false;
   try {
     // [CEF] §3.2.2 before anything else: the receiver certificate must validate.
     const receiverValidation = await timed(onEvent, 'validate-receiver', () =>
@@ -137,6 +138,7 @@ export async function sendAs4Internal(
       entropy,
     });
 
+    transmissionStarted = true;
     const response = await timed(onEvent, 'http', () =>
       sendHttp({
         endpointUrl: input.endpointUrl,
@@ -164,7 +166,7 @@ export async function sendAs4Internal(
         ...base(),
         outcome: 'transport-failure',
         ...(err.info.code ? { errorCode: err.info.code } : {}),
-        requestBytesWritten: err.info.requestBytesWritten,
+        requestMayHaveBeenSent: err.info.requestMayHaveBeenSent,
         aborted: err.info.aborted,
       };
     }
@@ -172,6 +174,10 @@ export async function sendAs4Internal(
       return notSent(mapSenderFault(err.reason), err.message);
     }
     if (isAbortError(err)) return notSent('aborted', 'aborted while spooling the payload');
+    // A filesystem failure while preparing the payload (creating the workspace or
+    // spooling ciphertext) is deliberate and safe to retry: no HTTP request has
+    // started at this point.
+    if (!transmissionStarted && isFileSystemError(err)) return notSent('spool.failed', safeMessage(err));
     return notSent('internal.error', safeMessage(err));
   } finally {
     if (workspace) await cleanupWorkspace(workspace, onEvent);
@@ -270,6 +276,7 @@ function toErrorEvidence(signal: ParsedSignal): EbmsErrorEvidence[] {
     code: error.code,
     severity: error.severity,
     ...(error.shortDescription ? { shortDescription: error.shortDescription } : {}),
+    ...(error.description ? { description: error.description } : {}),
     ...(error.detail ? { detail: error.detail } : {}),
     raw: signal.raw,
   }));
@@ -305,6 +312,34 @@ function mapSenderFault(reason: string): NotSentReason {
 function isAbortError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   return err.name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ABORT_ERR';
+}
+
+/** Filesystem errno codes that mean a local spool/preparation failure. */
+const FILE_SYSTEM_ERROR_CODES: ReadonlySet<string> = new Set([
+  'EACCES',
+  'EPERM',
+  'EROFS',
+  'ENOSPC',
+  'EDQUOT',
+  'EIO',
+  'EMFILE',
+  'ENFILE',
+  'EEXIST',
+  'ENOENT',
+  'ENOTDIR',
+  'EISDIR',
+  'ELOOP',
+  'ENAMETOOLONG',
+  'EBUSY',
+  'ENODEV',
+  'ENXIO',
+]);
+
+/** True when the error is a local filesystem failure, not a network/protocol one. */
+function isFileSystemError(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  const code = (err as NodeJS.ErrnoException).code;
+  return typeof code === 'string' && FILE_SYSTEM_ERROR_CODES.has(code);
 }
 
 async function timed<T>(onEvent: SendAs4Input['onEvent'], phase: SendPhase, fn: () => Promise<T>): Promise<T> {

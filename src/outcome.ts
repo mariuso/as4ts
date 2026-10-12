@@ -258,11 +258,11 @@ export function classify(result: SendAs4Result, table: ClassifyTable = DEFAULT_C
     case 'no-signal':
       return classifyNoSignal(result.status);
     case 'transport-failure':
-      // Bytes written decide: anything after the first request byte may have
-      // reached the receiver (including an abort mid-upload or while waiting
-      // for the receipt), so it is unknown. Only a failure with nothing written
-      // is safe to retry.
-      return result.requestBytesWritten ? 'unknown' : 'retryable';
+      // The request may have reached the receiver once the connection was
+      // established (including an abort mid-upload or while waiting for the
+      // receipt), so it is unknown. Only a failure known not to have sent
+      // anything is safe to retry.
+      return result.requestMayHaveBeenSent ? 'unknown' : 'retryable';
     case 'not-sent':
       return table.notSent[result.reason];
   }

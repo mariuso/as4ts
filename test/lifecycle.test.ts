@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -143,5 +144,20 @@ test('a spool cleanup failure does not replace an error signal', async () => {
   } finally {
     const dir = leaked();
     if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('a spool I/O failure is reported as spool.failed and nothing is sent', async () => {
+  const receiver = await startFakeReceiver({ receiver: pki.receiver, tlsCertPem: tls.certPem, tlsKeyPem: tls.keyPem });
+  try {
+    // A spool directory whose parent does not exist makes mkdtemp fail with ENOENT.
+    const missing = join(tmpdir(), `as4-does-not-exist-${randomUUID()}`);
+    const result = await sendAs4(baseInput(pki, receiver.url, tls.caPem, { spoolDirectory: missing }));
+    assert.equal(result.outcome, 'not-sent');
+    if (result.outcome === 'not-sent') assert.equal(result.reason, 'spool.failed');
+    assert.equal(classify(result), 'retryable');
+    assert.equal(receiver.received.length, 0, 'no request may be sent after a local spool failure');
+  } finally {
+    await receiver.close();
   }
 });

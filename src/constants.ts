@@ -9,6 +9,9 @@
 // SOAP 1.2. [SOAP12] §2.
 export const SOAP_ENV_NS = 'http://www.w3.org/2003/05/soap-envelope';
 
+// SOAP 1.1 envelope namespace, accepted on inbound signals for interoperability.
+export const SOAP_11_NS = 'http://schemas.xmlsoap.org/soap/envelope/';
+
 // ebMS 3.0 core. [EBMS3CORE] §2.2.
 export const EBMS_NS = 'http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/';
 export const EBMS_ROLE_INITIATOR = `${EBMS_NS}initiator`;

@@ -176,8 +176,10 @@ export interface EbmsErrorEvidence {
   readonly code: string;
   /** e.g. failure. */
   readonly severity: string;
-  /** Human readable description, when present. */
+  /** `eb:Error/@shortDescription`, when present. */
   readonly shortDescription?: string;
+  /** The human-readable `eb:Description` element text, when present. */
+  readonly description?: string;
   /** eb:ErrorDetail text, when present (often the receiver's real reason). */
   readonly detail?: string;
   /** The raw signal message bytes exactly as received. */
@@ -262,8 +264,11 @@ export interface TransportFailureResult extends ResultBase {
   readonly outcome: 'transport-failure';
   /** Node error code, e.g. ENOTFOUND, ECONNREFUSED, ECONNRESET. */
   readonly errorCode?: string;
-  /** True once any request body byte was written to the socket. */
-  readonly requestBytesWritten: boolean;
+  /**
+   * Conservative fact: true once the connection was established, after which the
+   * request may have reached the receiver. Safe to retry only when this is false.
+   */
+  readonly requestMayHaveBeenSent: boolean;
   /** True when the attempt was stopped by the caller's AbortSignal. */
   readonly aborted: boolean;
 }
