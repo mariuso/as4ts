@@ -23,12 +23,17 @@ test('several errors: the most severe class wins', () => {
     receiverCertificateCommonName: '',
     transportProfile: '',
     raw: new Uint8Array(),
+    refToMessageId: 'a@b',
+    correlation: 'matches' as const,
     errors: [
       { code: 'EBMS:0005', severity: 'failure', raw: new Uint8Array() },
       { code: 'EBMS:0001', severity: 'failure', raw: new Uint8Array() },
     ],
   };
   assert.equal(classify(result), 'fatal');
+  // An error that references a different message does not establish a result.
+  assert.equal(classify({ ...result, correlation: 'mismatched' }), 'unknown');
+  assert.equal(classify({ ...result, correlation: 'absent' }), 'fatal');
 });
 
 test('not-sent caused by a local I/O failure is retryable', () => {

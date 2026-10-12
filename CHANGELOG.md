@@ -95,6 +95,17 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Error signals were not correlated with the message.** Any parsed error became
+  `error-signal` and was classified by its code, so a signal naming a different
+  message could stop delivery. `error-signal` now carries `refToMessageId` and a
+  `correlation` fact (`matches` / `absent` / `mismatched`); a `mismatched` signal
+  is classified `unknown` and cannot establish rejection.
+- **A spool cleanup failure could override the send result.** The `finally` block
+  awaited cleanup unguarded, so an `rm` failure replaced an already-computed
+  outcome (including `receipt-verified`) with a rejection. Cleanup failure is now
+  reported through a `cleanup` event on `onEvent` and never changes the result,
+  and the workspace marks itself cleaned only after removal succeeds so a failed
+  cleanup can be retried.
 - **Certificate path validation missed constraints.** The constrained validator
   now decodes Basic Constraints and Key Usage from DER (Node's `keyUsage`
   accessor exposes Extended Key Usage OIDs, which caused a false rejection of any

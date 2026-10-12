@@ -90,17 +90,27 @@ export interface CertificateValidationInput {
 export type ValidateCertificate = (input: CertificateValidationInput) => Promise<CertificateValidation>;
 
 /** Phases reported to `onEvent`. Observe only. */
-export type SendPhase = 'validate-receiver' | 'prepare-payload' | 'sign' | 'http' | 'verify-receipt';
+export type SendPhase =
+  | 'validate-receiver'
+  | 'prepare-payload'
+  | 'sign'
+  | 'http'
+  | 'verify-receipt'
+  /** Emitted only when spool cleanup fails, after the result is already decided. */
+  | 'cleanup';
 
 export interface SendEvent {
   readonly phase: SendPhase;
   readonly durationMs: number;
+  /** Present on a `cleanup` event: the secret-free reason cleanup failed. */
+  readonly error?: string;
 }
 
 /**
- * Observation hook. Called once per phase with the phase name and duration.
- * Exceptions are swallowed by the sender. It never receives payload bytes, keys
- * or certificates' private parts.
+ * Observation hook. Called once per phase with the phase name and duration,
+ * except that a `cleanup` event is emitted only when spool cleanup fails (and
+ * carries an `error`). Exceptions are swallowed by the sender. It never receives
+ * payload bytes, keys or certificates' private parts.
  */
 export type OnEvent = (event: SendEvent) => void;
 
@@ -223,7 +233,24 @@ export interface ErrorSignalResult extends ResultBase {
   /** All ebMS errors carried by the signal, in document order. */
   readonly errors: readonly EbmsErrorEvidence[];
   readonly raw: Uint8Array;
+  /** `RefToMessageId` carried by the signal, when present. */
+  readonly refToMessageId: string | null;
+  /** How that reference relates to the message we sent. See {@link ErrorCorrelation}. */
+  readonly correlation: ErrorCorrelation;
 }
+
+/**
+ * How an error signal's `RefToMessageId` relates to the message we sent. Only a
+ * `matches` or `absent` reference lets the signal's errors establish a result for
+ * our message; a `mismatched` one does not.
+ */
+export type ErrorCorrelation =
+  /** The signal references the message we sent. */
+  | 'matches'
+  /** The signal carries no reference; the receiver may not have recovered it. */
+  | 'absent'
+  /** The signal references a different message. */
+  | 'mismatched';
 
 export interface NoSignalResult extends ResultBase {
   readonly outcome: 'no-signal';

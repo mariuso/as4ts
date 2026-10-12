@@ -9,13 +9,14 @@ import { buildMultipartBody } from './multipart.js';
 import { sendHttp } from './http/send.js';
 import { extractSoapEnvelope, parseSignal, type ParsedSignal } from './xml/signal.js';
 import { verifyReceipt, type SignedReference } from './receipt/verify.js';
-import { createTempWorkspace, type TempWorkspace } from './temp-file.js';
+import { createTempWorkspace, type TempWorkspace, type TempWorkspaceOptions } from './temp-file.js';
 import { commonNameOf, isValidMessageId, parseCertificate, safeMessage } from './util.js';
 import { peppolProfile } from './profile.js';
 import type {
   CertificateValidation,
   CertificateValidationInput,
   EbmsErrorEvidence,
+  ErrorCorrelation,
   NotSentReason,
   SendAs4Input,
   SendAs4Result,
@@ -30,7 +31,11 @@ import type {
  * encryption). `sendAs4` in index.ts calls this with the cryptographic RNG;
  * tests reach it through `src/internal.ts`.
  */
-export async function sendAs4Internal(input: SendAs4Input, entropy: Entropy): Promise<SendAs4Result> {
+export async function sendAs4Internal(
+  input: SendAs4Input,
+  entropy: Entropy,
+  createWorkspace: (options: TempWorkspaceOptions) => Promise<TempWorkspace> = createTempWorkspace,
+): Promise<SendAs4Result> {
   const profile = input.profile ?? peppolProfile;
   const abort = input.signal;
   const onEvent = input.onEvent;
@@ -79,7 +84,7 @@ export async function sendAs4Internal(input: SendAs4Input, entropy: Entropy): Pr
     }
     if (abort?.aborted) return notSent('aborted');
 
-    workspace = await createTempWorkspace({
+    workspace = await createWorkspace({
       ...(input.spoolDirectory ? { directory: input.spoolDirectory } : {}),
     });
 
@@ -169,7 +174,7 @@ export async function sendAs4Internal(input: SendAs4Input, entropy: Entropy): Pr
     if (isAbortError(err)) return notSent('aborted', 'aborted while spooling the payload');
     return notSent('internal.error', safeMessage(err));
   } finally {
-    if (workspace) await workspace.cleanup();
+    if (workspace) await cleanupWorkspace(workspace, onEvent);
   }
 }
 
@@ -199,11 +204,16 @@ async function classifyResponse(args: ClassifyArgs): Promise<SendAs4Result> {
     const signal = parseSignal(soap);
     if (signal) {
       if (signal.kind === 'error') {
+        const refToMessageId = signal.refToMessageId;
+        const correlation: ErrorCorrelation =
+          refToMessageId === null ? 'absent' : refToMessageId === args.input.as4MessageId ? 'matches' : 'mismatched';
         return {
           ...args.base(),
           outcome: 'error-signal',
           errors: toErrorEvidence(signal),
           raw: signal.raw,
+          refToMessageId,
+          correlation,
         };
       }
       if (signal.kind === 'receipt') {
@@ -313,6 +323,21 @@ function emit(onEvent: SendAs4Input['onEvent'], event: SendEvent): void {
     onEvent(event);
   } catch {
     // observe only
+  }
+}
+
+/**
+ * Remove the spool workspace without letting a cleanup failure mask an
+ * already-computed result. If removal fails the workspace is left on disk, and a
+ * `cleanup` event carries a secret-free reason so the caller can retry later; the
+ * send's own outcome is unaffected either way.
+ */
+async function cleanupWorkspace(workspace: TempWorkspace, onEvent: SendAs4Input['onEvent']): Promise<void> {
+  const start = performance.now();
+  try {
+    await workspace.cleanup();
+  } catch (err) {
+    emit(onEvent, { phase: 'cleanup', durationMs: performance.now() - start, error: safeMessage(err) });
   }
 }
 

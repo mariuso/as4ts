@@ -158,19 +158,21 @@ The public types document the full [send input and results](src/types.ts) and
 
 ### Send results
 
-| Outcome              | Evidence                                                                                               |
-| -------------------- | ------------------------------------------------------------------------------------------------------ |
-| `receipt-verified`   | Verified receipt, signer certificate, timestamp, and message reference.                                |
-| `receipt-unverified` | Raw receipt and verification failure reason.                                                           |
-| `error-signal`       | All parsed ebMS errors and the raw signal.                                                             |
-| `no-signal`          | HTTP status and whether the response body was empty.                                                   |
-| `transport-failure`  | Transport error, cancellation state, and an indication that the request may have reached the receiver. |
-| `not-sent`           | Local failure reason and optional detail.                                                              |
+| Outcome              | Evidence                                                                                                     |
+| -------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `receipt-verified`   | Verified receipt, signer certificate, timestamp, and message reference.                                      |
+| `receipt-unverified` | Raw receipt and verification failure reason.                                                                 |
+| `error-signal`       | All parsed ebMS errors, the raw signal, and the signal's `RefToMessageId` correlation with the sent message. |
+| `no-signal`          | HTTP status and whether the response body was empty.                                                         |
+| `transport-failure`  | Transport error, cancellation state, and an indication that the request may have reached the receiver.       |
+| `not-sent`           | Local failure reason and optional detail.                                                                    |
 
 An HTTP success status alone does not establish receipt of the document.
 `classify` returns `accepted` only for a verified receipt, and `unknown` when a
-receipt cannot be verified. See the [classification table](src/outcome.ts) for
-HTTP, ebMS, and local failure handling.
+receipt cannot be verified. An error signal is classified by its codes unless it
+names a different message (`mismatched`), in which case it is `unknown`: it cannot
+establish a result for our message. See the [classification table](src/outcome.ts)
+for HTTP, ebMS, and local failure handling.
 
 ### Discovery
 
@@ -210,10 +212,12 @@ Current limits:
   envelope. Reusing a message ID alone does not preserve the original signed
   references; a replayable outbound artifact is still needed for reliable
   AS4 retries.
-- **Delivery lifecycle work remains.** Error signals are not yet checked for
-  message correlation, and a spool cleanup failure can override a send result.
-  The [sending review](docs/sending-review.md) records these findings and proposed
-  regression tests; its earlier security findings describe the reviewed snapshot.
+- **Signal and outcome details remain.** Error signals are now correlated with the
+  sent message (`matches` / `absent` / `mismatched`), and spool cleanup can no
+  longer override a result. Some factual details still need tightening — for
+  example `requestBytesWritten` semantics and mapping local spool I/O failures to
+  `spool.failed`. The [sending review](docs/sending-review.md) records these; its
+  earlier security findings describe the reviewed snapshot.
 - **Discovery has open compatibility questions.** Wildcard document-type
   matching needs further specification validation, and SMP redirect
   `CertificateUID` matching is not implemented. Supply the correct SML zone

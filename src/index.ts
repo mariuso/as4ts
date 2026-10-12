@@ -10,6 +10,7 @@ export type {
   CertificateValidation,
   CertificateValidationInput,
   EbmsErrorEvidence,
+  ErrorCorrelation,
   ErrorSignalResult,
   HttpOptions,
   NoSignalResult,

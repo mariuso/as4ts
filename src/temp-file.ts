@@ -29,8 +29,10 @@ export async function createTempWorkspace(options: TempWorkspaceOptions = {}): P
     path: (name: string) => join(dir, name),
     async cleanup() {
       if (cleaned) return;
-      cleaned = true;
+      // Mark as cleaned only after removal succeeds, so a failed cleanup can be
+      // retried rather than silently reporting success.
       await rm(dir, { recursive: true, force: true });
+      cleaned = true;
     },
   };
 }

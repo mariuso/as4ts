@@ -66,6 +66,8 @@ export interface FakeReceiverOptions {
         severity?: string;
         detail?: string;
         extraCodes?: readonly string[];
+        /** Value for the error signal's RefToMessageId; omit for absent. */
+        refToMessageId?: string;
       }
     | { kind: 'receipt-tampered' }
     | { kind: 'drop' }
@@ -95,7 +97,9 @@ export async function startFakeReceiver(options: FakeReceiverOptions): Promise<F
       if (options.mode?.kind === 'error') {
         res.writeHead(options.mode.status, { 'Content-Type': 'application/soap+xml; charset=UTF-8' });
         const codes = [options.mode.code, ...(options.mode.extraCodes ?? [])];
-        res.end(buildErrorSignal(codes, options.mode.severity ?? 'failure', options.mode.detail));
+        res.end(
+          buildErrorSignal(codes, options.mode.severity ?? 'failure', options.mode.detail, options.mode.refToMessageId),
+        );
         return;
       }
       try {
@@ -247,7 +251,12 @@ function extractSignerPem(envelope: Document, signature: Element): string | null
   return `-----BEGIN CERTIFICATE-----\n${(b64.match(/.{1,64}/g) ?? []).join('\n')}\n-----END CERTIFICATE-----`;
 }
 
-function buildErrorSignal(codes: readonly string[], severity: string, detail?: string): string {
+function buildErrorSignal(
+  codes: readonly string[],
+  severity: string,
+  detail?: string,
+  refToMessageId?: string,
+): string {
   const doc = parseXml(`<x/>`);
   const eb = (local: string, attrs: Record<string, string> = {}, text?: string): Element => {
     const node = doc.createElementNS(EBMS_NS, `eb:${local}`);
@@ -263,6 +272,7 @@ function buildErrorSignal(codes: readonly string[], severity: string, detail?: s
   const messageInfo = eb('MessageInfo');
   messageInfo.appendChild(eb('Timestamp', {}, new Date().toISOString()));
   messageInfo.appendChild(eb('MessageId', {}, `${randomBytes(16).toString('hex')}@receiver.test`));
+  if (refToMessageId) messageInfo.appendChild(eb('RefToMessageId', {}, refToMessageId));
   signalMessage.appendChild(messageInfo);
   for (const code of codes) {
     const error = eb('Error', { errorCode: code, severity, category: 'Communication' });

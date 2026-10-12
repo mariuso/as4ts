@@ -243,6 +243,9 @@ export function classify(result: SendAs4Result, table: ClassifyTable = DEFAULT_C
     case 'receipt-unverified':
       return 'unknown';
     case 'error-signal': {
+      // An error that names a different message does not establish anything
+      // about ours, so it must not stop delivery attempts.
+      if (result.correlation === 'mismatched') return 'unknown';
       let worst: OutcomeClass = 'retryable';
       for (const error of result.errors) {
         worst = moreSevere(
