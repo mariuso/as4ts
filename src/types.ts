@@ -47,8 +47,12 @@ export interface Profile {
 export interface Signer {
   /** The signer's X.509 certificate (PEM). */
   readonly certificate: string;
-  /** Sign `data` with RSA PKCS#1 v1.5 and SHA-256. */
-  sign(data: Uint8Array): Promise<Uint8Array>;
+  /**
+   * Sign `data` with RSA PKCS#1 v1.5 and SHA-256. When `signal` is provided and
+   * already aborted, the operation is abandoned; a key holder backed by a remote
+   * service (HSM/KMS) should propagate it to cancel that request.
+   */
+  sign(data: Uint8Array, signal?: AbortSignal): Promise<Uint8Array>;
 }
 
 /** What a certificate is being validated for. */

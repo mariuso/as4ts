@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EBMS_NS, SOAP_11_NS, SOAP_ENV_NS } from '../src/constants.js';
-import { parseSignal } from '../src/xml/signal.js';
+import { extractSoapEnvelope, parseSignal } from '../src/xml/signal.js';
 
 /**
  * The signal parser must be strict about SOAP structure: it reads facts only
@@ -78,4 +78,35 @@ test('keeps the shortDescription attribute and the Description element distinct'
   );
   assert.equal(withChild?.errors[0]?.shortDescription, null);
   assert.equal(withChild?.errors[0]?.description, 'child text');
+});
+
+test('rejects a document type declaration', () => {
+  const withDoctype = Buffer.from(
+    `<!DOCTYPE env:Envelope []><env:Envelope xmlns:env="${SOAP_ENV_NS}" xmlns:eb="${EBMS_NS}">` +
+      `<env:Header>${RECEIPT}</env:Header><env:Body/></env:Envelope>`,
+    'utf8',
+  );
+  assert.equal(parseSignal(withDoctype), null);
+});
+
+test('rejects an element tree beyond the depth budget', () => {
+  const deep = '<eb:X>'.repeat(70) + '</eb:X>'.repeat(70);
+  const header = `<eb:Messaging><eb:SignalMessage>${MESSAGE_INFO}<eb:Receipt/>${deep}</eb:SignalMessage></eb:Messaging>`;
+  assert.equal(parseSignal(envelope(header)), null);
+});
+
+test('bounds MIME part count and per-part header size', () => {
+  const boundary = 'b';
+  const manyParts = Array.from(
+    { length: 40 },
+    () => `--${boundary}\r\nContent-Type: application/octet-stream\r\n\r\nx`,
+  ).join('\r\n');
+  const tooMany = Buffer.from(`${manyParts}\r\n--${boundary}--\r\n`, 'utf8');
+  assert.equal(extractSoapEnvelope(`multipart/related; boundary="${boundary}"`, tooMany), null);
+
+  const oversizedHeader = Buffer.from(
+    `--${boundary}\r\nContent-Type: application/soap+xml\r\nX-Big: ${'a'.repeat(20 * 1024)}\r\n\r\n<env:Envelope/>\r\n--${boundary}--\r\n`,
+    'utf8',
+  );
+  assert.equal(extractSoapEnvelope(`multipart/related; boundary="${boundary}"`, oversizedHeader), null);
 });

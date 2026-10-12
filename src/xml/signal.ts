@@ -1,6 +1,12 @@
 import { EBMS_NS, SOAP_11_NS, SOAP_ENV_NS, WSU_NS } from '../constants.js';
 import { attrOf, firstByLocalName, parseXml, textOf } from './nodes.js';
 
+/** Bounds applied to a response before it is trusted. */
+const MAX_MIME_PARTS = 32;
+const MAX_MIME_HEADER_BYTES = 16 * 1024;
+const MAX_SIGNAL_ELEMENTS = 20_000;
+const MAX_SIGNAL_DEPTH = 64;
+
 export interface ParsedEbmsError {
   readonly code: string;
   readonly severity: string;
@@ -56,6 +62,7 @@ function extractFromMultipart(contentType: string, body: Buffer): Buffer | null 
     from = idx + marker.byteLength;
   }
   if (positions.length < 2) return null;
+  if (positions.length > MAX_MIME_PARTS + 1) return null;
 
   const parts: Buffer[] = [];
   for (let i = 0; i < positions.length; i += 1) {
@@ -68,6 +75,7 @@ function extractFromMultipart(contentType: string, body: Buffer): Buffer | null 
     const headerEnd = part.indexOf('\r\n\r\n');
     const sepLen = 4;
     if (headerEnd < 0) continue;
+    if (headerEnd > MAX_MIME_HEADER_BYTES) return null;
     const headerText = part.subarray(0, headerEnd).toString('latin1');
     let content = part.subarray(headerEnd + sepLen);
     if (content.length >= 2 && content[content.length - 2] === 0x0d && content[content.length - 1] === 0x0a) {
@@ -92,6 +100,7 @@ function extractFromMultipart(contentType: string, body: Buffer): Buffer | null 
  * unambiguous signal returns null.
  */
 export function parseSignal(envelopeBytes: Buffer): ParsedSignal | null {
+  if (hasDoctype(envelopeBytes)) return null;
   let document: Document;
   try {
     document = parseXml(envelopeBytes);
@@ -100,6 +109,7 @@ export function parseSignal(envelopeBytes: Buffer): ParsedSignal | null {
   }
   const envelope = document.documentElement;
   if (!envelope || envelope.localName !== 'Envelope') return null;
+  if (!withinBudget(envelope)) return null;
   const soapNs = envelope.namespaceURI;
   if (!soapNs || !SUPPORTED_SOAP_NAMESPACES.has(soapNs)) return null;
 
@@ -171,4 +181,26 @@ function directChildren(node: Node, ns: string, localName: string): Element[] {
     if (element.namespaceURI === ns && element.localName === localName) out.push(element);
   }
   return out;
+}
+
+/** An XML document type declaration is rejected: it only enables entity tricks. */
+function hasDoctype(bytes: Buffer): boolean {
+  return bytes.indexOf('<!DOCTYPE') !== -1 || bytes.indexOf('<!doctype') !== -1;
+}
+
+/** A structural budget, so a hostile response cannot force unbounded DOM work. */
+function withinBudget(root: Element): boolean {
+  let elements = 0;
+  const stack: Array<{ node: Node; depth: number }> = [{ node: root, depth: 1 }];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    elements += 1;
+    if (elements > MAX_SIGNAL_ELEMENTS || current.depth > MAX_SIGNAL_DEPTH) return false;
+    const children = current.node.childNodes;
+    for (let i = 0; i < children.length; i += 1) {
+      const child = children.item(i);
+      if (child && child.nodeType === 1) stack.push({ node: child, depth: current.depth + 1 });
+    }
+  }
+  return true;
 }

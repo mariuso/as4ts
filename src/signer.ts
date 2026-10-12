@@ -14,11 +14,21 @@ export function signerFromKey(keyObject: KeyObject, certificatePem: string): Sig
   if (keyObject.asymmetricKeyType !== 'rsa') throw new Error('signerFromKey: key must be an RSA key');
   return {
     certificate: certificatePem,
-    async sign(data: Uint8Array): Promise<Uint8Array> {
-      return cryptoSign('sha256', Buffer.from(data), {
+    async sign(data: Uint8Array, signal?: AbortSignal): Promise<Uint8Array> {
+      if (signal?.aborted) throw abortError();
+      const signature = cryptoSign('sha256', Buffer.from(data), {
         key: keyObject,
         padding: constants.RSA_PKCS1_PADDING,
       });
+      if (signal?.aborted) throw abortError();
+      return signature;
     },
   };
+}
+
+function abortError(): Error {
+  const error = new Error('signing aborted');
+  error.name = 'AbortError';
+  (error as NodeJS.ErrnoException).code = 'ABORT_ERR';
+  return error;
 }

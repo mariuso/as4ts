@@ -101,6 +101,9 @@ export async function sendAs4Internal(
       }),
     );
 
+    // Stop starting new phases once the caller has cancelled.
+    if (abort?.aborted) return notSent('aborted');
+
     // §7: the message timestamp is taken immediately before the envelope is
     // built, after certificate validation and payload spooling.
     sentAt = input.now().toISOString();
@@ -127,6 +130,7 @@ export async function sendAs4Internal(
         wrappedKey,
         attachmentDigestBase64: payload.compressedDigestBase64,
         entropy,
+        ...(abort ? { signal: abort } : {}),
       }),
     );
 

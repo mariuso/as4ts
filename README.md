@@ -212,10 +212,11 @@ Current limits:
   envelope. Reusing a message ID alone does not preserve the original signed
   references; a replayable outbound artifact is still needed for reliable
   AS4 retries.
-- **Some resource limits remain.** Sender-side XML depth/node and MIME
-  part/header budgets are not explicit, and the signer interface carries no
-  cancellation. The [sending review](docs/sending-review.md) records these; its
-  earlier security findings describe the reviewed snapshot.
+- **Certificate revocation policy needs a dedicated review.** CRL scope, delegated
+  responder authorization, freshness and cache policy are implemented but have not
+  been reviewed to the same depth as the rest of the PKI path. The
+  [sending review](docs/sending-review.md) records this; its earlier security
+  findings describe the reviewed snapshot.
 - **Discovery has open compatibility questions.** Wildcard document-type
   matching needs further specification validation, and SMP redirect
   `CertificateUID` matching is not implemented. Supply the correct SML zone

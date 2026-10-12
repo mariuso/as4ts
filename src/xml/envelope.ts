@@ -13,6 +13,8 @@ export interface BuildEnvelopeParams {
   readonly wrappedKey: Buffer;
   /** Base64 SHA-256 of the gzipped payload (SwA signed digest). */
   readonly attachmentDigestBase64: string;
+  /** Aborting abandons signing (propagated to the signer). */
+  readonly signal?: AbortSignal;
   /** Test-only, pins every XML id. */
   readonly entropy?: Entropy;
 }
@@ -98,6 +100,7 @@ export async function buildEnvelope(p: BuildEnvelopeParams): Promise<BuiltEnvelo
       references,
     },
     p.signer,
+    p.signal,
   );
 
   return { xml: serializeXml(doc), messagingId, bodyId, encryptedDataId, encryptedKeyId, bodyDigest, messagingDigest };

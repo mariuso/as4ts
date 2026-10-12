@@ -95,6 +95,13 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The signer could not be cancelled.** `Signer.sign` now accepts an optional
+  `AbortSignal`; the sender passes its own signal to the signer and stops starting
+  new phases once the caller aborts. `signerFromKey` refuses to sign when the
+  signal is already aborted.
+- **Response parsing had no explicit XML/MIME budgets.** The signal parser now
+  rejects a document type declaration, enforces element-count and depth budgets,
+  and bounds the MIME part count and per-part header size.
 - **Local spool failures were reported as `internal.error`.** A filesystem error
   while creating the workspace or spooling the payload now yields
   `not-sent`/`spool.failed` (retryable), preserving the fact that no HTTP request

@@ -138,6 +138,7 @@ export async function addSignature(
   security: Element,
   p: SignatureParams,
   signer: Signer,
+  signal?: AbortSignal,
 ): Promise<void> {
   append(security, binarySecurityToken(doc, p.signingTokenId, signer.certificate));
 
@@ -164,7 +165,7 @@ export async function addSignature(
     append(signedInfo, reference);
   }
 
-  const signatureValue = await signSignedInfo(signedInfo, signer);
+  const signatureValue = await signSignedInfo(signedInfo, signer, signal);
   append(signature, signedInfo);
   append(signature, element(doc, 'ds', 'SignatureValue', {}, signatureValue));
 
@@ -180,9 +181,9 @@ export async function addSignature(
  * the signer's certificate. Throws `SenderFault` when the signature does not
  * verify.
  */
-export async function signSignedInfo(signedInfo: Element, signer: Signer): Promise<string> {
+export async function signSignedInfo(signedInfo: Element, signer: Signer, signal?: AbortSignal): Promise<string> {
   const canonical = canonicalize(signedInfo);
-  const signature = await signer.sign(Buffer.from(canonical, 'utf8'));
+  const signature = await signer.sign(Buffer.from(canonical, 'utf8'), signal);
   if (!verifySignedInfoSignature(signedInfo, signature, signer.certificate)) {
     throw new SenderFault('signature.mismatch', 'the produced signature does not verify with the signer certificate');
   }

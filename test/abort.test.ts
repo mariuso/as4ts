@@ -4,7 +4,7 @@ import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Readable } from 'node:stream';
-import { sendAs4, type ValidateCertificate } from '../src/index.js';
+import { sendAs4, signerFromKey, type ValidateCertificate } from '../src/index.js';
 import { createTestPki, createTlsServerCert } from './helpers/pki.js';
 import { startFakeReceiver } from './helpers/fake-receiver.js';
 import { baseInput } from './helpers/input.js';
@@ -169,4 +169,81 @@ test('abort during receipt verification: still reported as receipt-unverified wi
       await receiver.close();
     }
   });
+});
+
+test('the sender passes its abort signal to the signer', async () => {
+  const pki = createTestPki();
+  const tls = createTlsServerCert();
+  const receiver = await startFakeReceiver({ receiver: pki.receiver, tlsCertPem: tls.certPem, tlsKeyPem: tls.keyPem });
+  const base = signerFromKey(pki.sender.keyObject, pki.sender.certPem);
+  let sawSignal = false;
+  try {
+    const result = await sendAs4(
+      baseInput(pki, receiver.url, tls.caPem, {
+        signal: new AbortController().signal,
+        signer: {
+          certificate: base.certificate,
+          async sign(data, signal) {
+            sawSignal = signal !== undefined;
+            return base.sign(data, signal);
+          },
+        },
+      }),
+    );
+    assert.equal(result.outcome, 'receipt-verified');
+    assert.equal(sawSignal, true);
+  } finally {
+    await receiver.close();
+  }
+});
+
+test('abort while the signer runs: reported as aborted and nothing is sent', async () => {
+  await withSpoolDir(async (dir) => {
+    const pki = createTestPki();
+    const tls = createTlsServerCert();
+    const receiver = await startFakeReceiver({
+      receiver: pki.receiver,
+      tlsCertPem: tls.certPem,
+      tlsKeyPem: tls.keyPem,
+    });
+    const controller = new AbortController();
+    const base = signerFromKey(pki.sender.keyObject, pki.sender.certPem);
+    try {
+      const result = await sendAs4(
+        baseInput(pki, receiver.url, tls.caPem, {
+          signal: controller.signal,
+          spoolDirectory: dir,
+          signer: {
+            certificate: base.certificate,
+            sign: (_data, signal) =>
+              new Promise((_resolve, reject) => {
+                const fail = (): void => {
+                  const err = new Error('aborted');
+                  err.name = 'AbortError';
+                  reject(err);
+                };
+                if (signal?.aborted) {
+                  fail();
+                  return;
+                }
+                signal?.addEventListener('abort', fail, { once: true });
+                setTimeout(() => controller.abort(), 5);
+              }),
+          },
+        }),
+      );
+      assert.equal(result.outcome, 'not-sent');
+      if (result.outcome === 'not-sent') assert.equal(result.reason, 'aborted');
+      assert.equal(receiver.received.length, 0, 'an aborted signer must not start the HTTP request');
+      assert.deepEqual(await readdir(dir), []);
+    } finally {
+      await receiver.close();
+    }
+  });
+});
+
+test('signerFromKey refuses to sign once the signal is aborted', async () => {
+  const pki = createTestPki();
+  const signer = signerFromKey(pki.sender.keyObject, pki.sender.certPem);
+  await assert.rejects(() => signer.sign(new Uint8Array([1, 2, 3]), AbortSignal.abort()), /abort/i);
 });
