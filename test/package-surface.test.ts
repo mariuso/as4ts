@@ -37,8 +37,20 @@ test('the classifier entry point exports a stable surface', async () => {
   ]);
 });
 
-test('there are exactly three entry points', () => {
-  assert.deepEqual(Object.keys(pkg.exports).sort(), ['.', './certificate-validator', './classifier']);
+test('there are exactly four entry points', () => {
+  assert.deepEqual(Object.keys(pkg.exports).sort(), ['.', './certificate-validator', './classifier', './lookup']);
+});
+
+test('the lookup entry point exports a stable surface', async () => {
+  const module = await import('../src/lookup/index.js');
+  assert.deepEqual(Object.keys(module).sort(), [
+    'PEPPOL_TRANSPORT_PROFILE',
+    'documentTypeMatches',
+    'lookupParticipant',
+    'participantDnsName',
+    'participantHash',
+    'participantSegment',
+  ]);
 });
 
 test('package identity matches the User-Agent constants', () => {
@@ -63,6 +75,7 @@ test('no entry point exports a receive* value', async () => {
     import('../src/index.js'),
     import('../src/certificate-validator.js'),
     import('../src/classifier.js'),
+    import('../src/lookup/index.js'),
   ]);
   for (const module of modules) {
     const offenders = Object.keys(module).filter((name) => /^receive/i.test(name));

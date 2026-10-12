@@ -13,7 +13,7 @@
  *     --trust-roots peppol-test-root.pem \
  *     --sender-participant-scheme iso6523-actorid-upis --sender-participant-value 0192:111111111 \
  *     --receiver-participant-scheme iso6523-actorid-upis --receiver-participant-value 0192:222222222 \
- *     --sml-env test --document-type Invoice-2 \
+ *     --sml-env test \
  *     --out ./evidence
  */
 import { randomUUID, X509Certificate } from 'node:crypto';
@@ -27,9 +27,13 @@ import {
   loadSigningMaterialFromP12,
   type SigningMaterial,
 } from './lib/load-credentials.js';
-import { lookupParticipant, type SmEnv, type SmpServiceInfo } from './lib/smp.js';
-import { bundledTrust } from './lib/trust.js';
+import { lookupParticipant } from '../src/lookup/index.js';
+import { bundledTrust, smlZone, type SmEnv } from './lib/trust.js';
 import { redactArgv, redactMessage } from './lib/redact.js';
+
+const DEFAULT_DOC_TYPE =
+  'urn:oasis:names:specification:ubl:schema:xsd:Invoice-2::Invoice##urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0::2.1';
+const DEFAULT_PROCESS = 'urn:fdc:peppol.eu:2017:poacc:billing:01:1.0';
 
 interface Args {
   readonly flags: Map<string, string>;
@@ -97,7 +101,7 @@ Discovery — resolved from SMP when omitted (needs the receiver participant):
   --doc-type-scheme S / --doc-type-value V
   --process-scheme S / --process-value V
   --sml-env test|prod             SML used for discovery (default test)
-  --document-type SUBSTR          SMP hint to pick between document types, e.g. Invoice-2
+  --sml ZONE                      SML zone, overriding --sml-env
 
 Optional:
   --trust-roots PATH              override the bundled Peppol root (PEM)
@@ -151,35 +155,72 @@ async function main(): Promise<void> {
   // and evidence never carry them.
   process.stderr.write(`command: ${redactArgv(rawArgv)}\n`);
 
-  const participant = `${required(args, 'receiver-participant-scheme')}::${required(args, 'receiver-participant-value')}`;
+  const receiverParticipant = {
+    scheme: required(args, 'receiver-participant-scheme'),
+    value: required(args, 'receiver-participant-value'),
+  };
   const env = (args.flags.get('sml-env') ?? 'test') as SmEnv;
-  const needLookup =
-    !args.flags.has('receiver-cert') ||
-    !args.flags.has('endpoint') ||
-    !args.flags.has('transport-profile') ||
-    !args.flags.has('doc-type-value') ||
-    !args.flags.has('process-value');
-
-  let smp: SmpServiceInfo | null = null;
-  if (needLookup) {
-    const hint = args.flags.get('document-type');
-    process.stderr.write(`resolving ${participant} in the ${env} SML...\n`);
-    smp = await lookupParticipant({ participant, env, ...(hint ? { documentType: hint } : {}) });
-  }
-
-  const endpoint = args.flags.get('endpoint') ?? smp?.endpointUrl ?? fail('no --endpoint and SMP published none');
-  const receiverCertificate = args.flags.has('receiver-cert')
-    ? loadCert(required(args, 'receiver-cert'))
-    : (smp?.certificatePem ?? fail('no --receiver-cert and SMP published none'));
-  const transportProfile = args.flags.get('transport-profile') ?? smp?.transportProfile ?? 'peppol-transport-as4-v2_0';
   const documentType = {
-    scheme: args.flags.get('doc-type-scheme') ?? smp?.documentScheme ?? fail('no document type scheme'),
-    value: args.flags.get('doc-type-value') ?? smp?.documentIdentifier ?? fail('no document type value'),
+    scheme: args.flags.get('doc-type-scheme') ?? 'busdox-docid-qns',
+    value: args.flags.get('doc-type-value') ?? DEFAULT_DOC_TYPE,
   };
   const processId = {
-    scheme: args.flags.get('process-scheme') ?? smp?.processScheme ?? fail('no process scheme'),
-    value: args.flags.get('process-value') ?? smp?.processIdentifier ?? fail('no process value'),
+    scheme: args.flags.get('process-scheme') ?? 'cenbii-procid-ubl',
+    value: args.flags.get('process-value') ?? DEFAULT_PROCESS,
   };
+
+  const bundled = bundledTrust(env);
+  const roots = args.flags.has('trust-roots') ? [loadCert(required(args, 'trust-roots'))] : [...bundled.roots];
+  const intermediates = args.flags.has('trust-intermediates')
+    ? [loadCert(required(args, 'trust-intermediates'))]
+    : [...bundled.intermediates];
+  const revocation = defaultRevocationPolicy({
+    unreachable: (args.flags.get('revocation') as 'strict' | 'soft' | undefined) ?? 'strict',
+  });
+  const validator = createCertificateValidator({
+    roots,
+    intermediates,
+    ...(args.flags.has('trust-intermediates')
+      ? {}
+      : {
+          intermediatesByPurpose: {
+            'receiver-encryption': [...bundled.apIntermediates],
+            'receipt-signer': [...bundled.apIntermediates],
+            'message-signer': [...bundled.apIntermediates],
+            'smp-signer': [...bundled.smpIntermediates],
+          },
+        }),
+    revocation,
+  });
+
+  const needLookup =
+    !args.flags.has('receiver-cert') || !args.flags.has('endpoint') || !args.flags.has('transport-profile');
+  let lookedUp: { endpointUrl: string; receiverCertificate: string; transportProfile: string } | null = null;
+  if (needLookup) {
+    process.stderr.write(
+      `resolving ${receiverParticipant.scheme}::${receiverParticipant.value} in the ${env} SML...\n`,
+    );
+    const result = await lookupParticipant({
+      participant: receiverParticipant,
+      documentType,
+      process: processId,
+      sml: args.flags.get('sml') ?? smlZone(env),
+      validateCertificate: (v) => validator.validate(v),
+      now: () => new Date(),
+    });
+    if (result.outcome !== 'found') {
+      const detail = 'reason' in result ? `: ${result.reason}` : 'detail' in result ? `: ${result.detail ?? ''}` : '';
+      fail(`SMP lookup: ${result.outcome}${detail}`);
+    }
+    lookedUp = result;
+  }
+
+  const endpoint = args.flags.get('endpoint') ?? lookedUp?.endpointUrl ?? fail('no --endpoint and SMP published none');
+  const receiverCertificate = args.flags.has('receiver-cert')
+    ? loadCert(required(args, 'receiver-cert'))
+    : (lookedUp?.receiverCertificate ?? fail('no --receiver-cert and SMP published none'));
+  const transportProfile =
+    args.flags.get('transport-profile') ?? lookedUp?.transportProfile ?? 'peppol-transport-as4-v2_0';
 
   if (args.flags.has('dry-run')) {
     console.log(
@@ -207,15 +248,6 @@ async function main(): Promise<void> {
   })();
 
   const signing = await resolveSigningMaterial(args);
-  const bundled = bundledTrust(env);
-  const roots = args.flags.has('trust-roots') ? [loadCert(required(args, 'trust-roots'))] : [...bundled.roots];
-  const intermediates = args.flags.has('trust-intermediates')
-    ? [loadCert(required(args, 'trust-intermediates'))]
-    : [...bundled.intermediates];
-  const revocation = defaultRevocationPolicy({
-    unreachable: (args.flags.get('revocation') as 'strict' | 'soft' | undefined) ?? 'strict',
-  });
-  const validator = createCertificateValidator({ roots, intermediates, revocation });
 
   const input: SendAs4Input = {
     payload: createReadStream(required(args, 'file')),

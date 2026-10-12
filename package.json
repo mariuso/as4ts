@@ -21,6 +21,10 @@
     "./classifier": {
       "types": "./dist/classifier.d.ts",
       "import": "./dist/classifier.js"
+    },
+    "./lookup": {
+      "types": "./dist/lookup/index.d.ts",
+      "import": "./dist/lookup/index.js"
     }
   },
   "files": [
@@ -36,6 +40,7 @@
     "audit": "npm audit --omit=dev --audit-level=high",
     "examples:send": "node --import tsx examples/send-one.ts",
     "examples:smp": "node --import tsx examples/smp-lookup.ts",
+    "examples:record-smp": "node --import tsx examples/record-smp.ts",
     "selftest": "node --import tsx examples/local-selftest.ts",
     "make-invoice": "node --import tsx examples/make-bis-invoice.ts",
     "trust:update": "node --import tsx examples/update-trust.ts"

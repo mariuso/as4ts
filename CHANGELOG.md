@@ -8,6 +8,15 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`as4ts/lookup`.** `lookupParticipant(input)` performs exactly one SML/SMP
+  discovery and returns a union of facts (`found`, `not-registered`,
+  `not-supported`, `signature-invalid`, `unavailable`). It derives the SML DNS
+  name from the participant identifier, resolves the SMP with a U-NAPTR lookup,
+  fetches the signed service metadata, verifies the SMP's inclusive-C14N
+  enveloped XML signature and validates the signer with purpose `smp-signer`,
+  then selects the endpoint for the process and transport profile within its
+  activation/expiration window. DNS and HTTP are injectable, there is no caching
+  and no retry, and `sendAs4` never calls it.
 - **The receiving side is reserved.** Receiving is planned but not implemented
   (see [`docs/receiving.md`](docs/receiving.md)); no `receive*` value or type is
   exported yet, and `test/package-surface.test.ts` now fails if one appears. A

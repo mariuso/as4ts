@@ -45,8 +45,20 @@ function importSpecifiers(text: string): string[] {
 }
 
 test('xml/, pki/, crypto/ and profile do not import sender-only modules', () => {
+  assertNoSenderOnlyImports(sharedFiles());
+});
+
+test('as4ts/lookup imports nothing from the sender-only modules', () => {
+  const lookupDir = join(src, 'lookup');
+  const files = readdirSync(lookupDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.ts'))
+    .map((entry) => join(lookupDir, entry.name));
+  assertNoSenderOnlyImports(files);
+});
+
+function assertNoSenderOnlyImports(files: readonly string[]): void {
   const violations: string[] = [];
-  for (const file of sharedFiles()) {
+  for (const file of files) {
     const text = readFileSync(file, 'utf8');
     for (const specifier of importSpecifiers(text)) {
       if (!specifier.startsWith('.')) continue;
@@ -60,4 +72,4 @@ test('xml/, pki/, crypto/ and profile do not import sender-only modules', () => 
     }
   }
   assert.deepEqual(violations, [], `shared modules must not import sender-only modules:\n${violations.join('\n')}`);
-});
+}
