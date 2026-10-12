@@ -1,0 +1,70 @@
+{
+  "name": "as4ts",
+  "version": "0.1.0",
+  "description": "A single-shot Peppol AS4 sender. Performs exactly one AS4 send attempt and reports what happened as facts.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./certificate-validator": {
+      "types": "./dist/certificate-validator.d.ts",
+      "import": "./dist/certificate-validator.js"
+    },
+    "./classifier": {
+      "types": "./dist/classifier.d.ts",
+      "import": "./dist/classifier.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "lint": "eslint .",
+    "format": "prettier --check .",
+    "format:write": "prettier --write .",
+    "audit": "npm audit --omit=dev --audit-level=high",
+    "examples:send": "node --import tsx examples/send-one.ts",
+    "examples:smp": "node --import tsx examples/smp-lookup.ts",
+    "selftest": "node --import tsx examples/local-selftest.ts",
+    "make-invoice": "node --import tsx examples/make-bis-invoice.ts",
+    "trust:update": "node --import tsx examples/update-trust.ts"
+  },
+  "dependencies": {
+    "@xmldom/xmldom": "^0.8.15",
+    "xml-crypto": "^6.3.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/node-forge": "^1.3.14",
+    "@typescript-eslint/eslint-plugin": "^8.71.1",
+    "@typescript-eslint/parser": "^8.71.1",
+    "eslint": "^9.39.5",
+    "node-forge": "^1.4.0",
+    "prettier": "^3.9.10",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  },
+  "keywords": [
+    "peppol",
+    "as4",
+    "ebms3",
+    "e-delivery",
+    "edelivery",
+    "ubl",
+    "invoice",
+    "typescript",
+    "sbdh",
+    "messaging"
+  ]
+}
