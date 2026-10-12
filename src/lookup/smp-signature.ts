@@ -1,10 +1,10 @@
 import { constants, createHash, verify as cryptoVerify } from 'node:crypto';
 import { C14nCanonicalization } from 'xml-crypto';
+import type { NamespacePrefix } from 'xml-crypto';
 import { DS_NS } from '../constants.js';
 import { normalizePem, parseCertificate } from '../util.js';
-import { attrOf, elementsByLocalName, firstByLocalName, textOf } from '../xml/nodes.js';
-import { resolveIdUnique } from '../xml/ws-security.js';
-import { ALGO_ENVELOPED_SIGNATURE, ALGO_INCLUSIVE_C14N, ALGO_RSA_SHA256, ALGO_SHA256 } from './constants.js';
+import { attrOf, firstByLocalName, textOf } from '../xml/nodes.js';
+import { ALGO_ENVELOPED_SIGNATURE, ALGO_INCLUSIVE_C14N, ALGO_RSA_SHA256, ALGO_SHA256, SMP_NS } from './constants.js';
 
 /**
  * Inclusive C14N 1.0, which the SMP specification mandates (SMP v1.4.0 §5.5.1,
@@ -25,28 +25,89 @@ const canonicalizer = new C14nCanonicalization();
   return pa === pb ? 0 : pa < pb ? -1 : 1;
 };
 
-/** Inclusive C14N 1.0, as the SMP specification mandates. Exported for the fixture signer. */
+/**
+ * Inclusive C14N of a node, carrying the namespace declarations it inherits from
+ * its ancestors onto the apex. Inclusive C14N requires them (Canonical XML §1);
+ * without them a `ds:SignedInfo` nested under a response root that declares
+ * namespaces canonicalises differently, and real SMP responses fail to verify.
+ * Exported for the fixture signer, which must canonicalise the same way.
+ */
 export function inclusiveCanonicalize(node: Node): string {
-  return canonicalizer.process(node, {});
+  const ancestorNamespaces = node.nodeType === 1 ? findAncestorNsForElement(node as Element) : [];
+  return canonicalizer.process(node, { ancestorNamespaces });
+}
+
+/**
+ * Mirrors xml-crypto's `findAncestorNsForElement`: the namespaces in scope above
+ * `node`, nearest declaration winning, excluding undeclarations and anything the
+ * node declares (or binds) itself.
+ */
+function findAncestorNsForElement(node: Element): NamespacePrefix[] {
+  const collected: NamespacePrefix[] = [];
+  let ancestor: Node | null = node.parentNode;
+  while (ancestor && ancestor.nodeType === 1) {
+    const element = ancestor as Element;
+    for (let i = 0; i < element.attributes.length; i += 1) {
+      const attr = element.attributes.item(i);
+      if (attr && (attr.nodeName === 'xmlns' || attr.nodeName.startsWith('xmlns:'))) {
+        collected.push({ prefix: attr.nodeName.replace(/^xmlns:?/, ''), namespaceURI: attr.nodeValue ?? '' });
+      }
+    }
+    ancestor = element.parentNode;
+  }
+  const nearest: NamespacePrefix[] = [];
+  for (const namespace of collected) {
+    if (!nearest.some((seen) => seen.prefix === namespace.prefix)) nearest.push(namespace);
+  }
+  const own = new Set<string>();
+  for (let i = 0; i < node.attributes.length; i += 1) {
+    const name = node.attributes.item(i)?.nodeName ?? '';
+    if (name === 'xmlns' || name.startsWith('xmlns:')) own.add(name.replace(/^xmlns:?/, ''));
+  }
+  own.add(node.prefix ?? '');
+  return nearest.filter((namespace) => namespace.namespaceURI !== '' && !own.has(namespace.prefix));
 }
 
 export type SmpSignatureVerification =
-  { readonly ok: true; readonly signerCertificatePem: string } | { readonly ok: false; readonly reason: string };
+  | {
+      readonly ok: true;
+      readonly signerCertificatePem: string;
+      /** The document with the signature removed: exactly the nodes the digest covered. */
+      readonly verifiedDocument: Document;
+    }
+  | { readonly ok: false; readonly reason: string };
 
 /**
  * Verify the enveloped XML signature on a Peppol SMP `SignedServiceMetadata`
  * response, per SMP v1.4.0 §5.5.1:
  *
- *  - `ds:Signature` with exactly one `enveloped-signature` transform;
+ *  - exactly one `ds:Signature`, a **direct child of the root**;
+ *  - exactly one `ds:Reference` with an **empty URI** (the signature covers the
+ *    whole document) and exactly the `enveloped-signature` transform;
  *  - inclusive C14N, RSA-SHA256 and SHA-256 only; anything else is rejected;
  *  - the signer certificate in `ds:KeyInfo/ds:X509Data/ds:X509Certificate`.
+ *
+ * It returns the document **with the signature removed**: precisely the nodes
+ * the digest covered. Callers must read facts (the endpoint, the redirect) only
+ * from that document, never from the original, or a forged `ServiceInformation`
+ * hidden inside the signature element — which the digest does not cover — would
+ * be trusted.
  *
  * The certificate is only extracted here; the caller validates it. Nothing is
  * thrown.
  */
 export function verifySmpSignature(document: Document): SmpSignatureVerification {
-  const signature = elementsByLocalName(document, DS_NS, 'Signature')[0] ?? null;
-  if (!signature) return fail('no ds:Signature found');
+  const root = document.documentElement;
+  if (!root) return fail('the response has no document element');
+  if (root.namespaceURI !== SMP_NS || root.localName !== 'SignedServiceMetadata') {
+    return fail('the response root is not smp:SignedServiceMetadata');
+  }
+
+  const signatures = directChildren(root, DS_NS, 'Signature');
+  if (signatures.length !== 1) {
+    return fail('the response must have exactly one ds:Signature, a direct child of the root');
+  }
+  const signature = signatures[0]!;
 
   const signerPem = extractSignerCertificate(signature);
   if (!signerPem) return fail('no ds:X509Certificate in ds:KeyInfo');
@@ -63,26 +124,33 @@ export function verifySmpSignature(document: Document): SmpSignatureVerification
     return fail('SMP signatures must use rsa-sha256 (SMP v1.4.0 §5.5.1)');
   }
 
-  const references = elementsByLocalName(signedInfo, DS_NS, 'Reference');
-  if (references.length === 0) return fail('ds:SignedInfo has no references');
-  for (const reference of references) {
-    const transforms = elementsByLocalName(reference, DS_NS, 'Transform');
-    if (transforms.length !== 1 || attrOf(transforms[0] ?? null, 'Algorithm') !== ALGO_ENVELOPED_SIGNATURE) {
-      return fail('every SMP reference must use exactly the enveloped-signature transform');
-    }
-    const digestMethod = firstByLocalName(reference, DS_NS, 'DigestMethod');
-    if (attrOf(digestMethod, 'Algorithm') !== ALGO_SHA256) {
-      return fail('SMP references must use SHA-256 (SMP v1.4.0 §5.5.1)');
-    }
-    const expected = textOf(firstByLocalName(reference, DS_NS, 'DigestValue'))?.trim();
-    if (!expected) return fail('missing ds:DigestValue');
-
-    const uri = attrOf(reference, 'URI') ?? '';
-    const target = resolveReferenceTarget(document, uri);
-    if (!target.ok) return fail(target.reason);
-    const actual = createHash('sha256').update(inclusiveCanonicalize(target.node), 'utf8').digest('base64');
-    if (actual !== expected) return fail(`digest mismatch for reference ${uri || '(document)'}`);
+  const references = Array.from(signedInfo.getElementsByTagNameNS(DS_NS, 'Reference'));
+  if (references.length !== 1) return fail('the SMP signature must have exactly one ds:Reference');
+  const reference = references[0]!;
+  if ((attrOf(reference, 'URI') ?? '') !== '') {
+    return fail('the SMP signature reference must have an empty URI (it covers the whole document)');
   }
+  const transforms = Array.from(reference.getElementsByTagNameNS(DS_NS, 'Transform'));
+  if (transforms.length !== 1 || attrOf(transforms[0] ?? null, 'Algorithm') !== ALGO_ENVELOPED_SIGNATURE) {
+    return fail('the SMP reference must use exactly the enveloped-signature transform');
+  }
+  const digestMethod = firstByLocalName(reference, DS_NS, 'DigestMethod');
+  if (attrOf(digestMethod, 'Algorithm') !== ALGO_SHA256) {
+    return fail('SMP references must use SHA-256 (SMP v1.4.0 §5.5.1)');
+  }
+  const expected = textOf(firstByLocalName(reference, DS_NS, 'DigestValue'))?.trim();
+  if (!expected) return fail('missing ds:DigestValue');
+
+  // The node-set the reference covers: the whole document with the signature
+  // removed. Everything downstream reads from this document only.
+  const verifiedDocument = document.cloneNode(true) as Document;
+  const verifiedRoot = verifiedDocument.documentElement;
+  if (!verifiedRoot) return fail('the response has no document element');
+  for (const cloned of directChildren(verifiedRoot, DS_NS, 'Signature')) {
+    cloned.parentNode?.removeChild(cloned);
+  }
+  const actual = createHash('sha256').update(inclusiveCanonicalize(verifiedRoot), 'utf8').digest('base64');
+  if (actual !== expected) return fail('digest mismatch for the SMP document');
 
   const signatureValue = textOf(firstByLocalName(signature, DS_NS, 'SignatureValue'))?.trim();
   if (!signatureValue) return fail('no ds:SignatureValue');
@@ -106,34 +174,25 @@ export function verifySmpSignature(document: Document): SmpSignatureVerification
   }
   if (!verified) return fail('ds:SignatureValue does not verify over ds:SignedInfo');
 
-  return { ok: true, signerCertificatePem: signerPem };
+  return { ok: true, signerCertificatePem: signerPem, verifiedDocument };
 }
 
 function fail(reason: string): SmpSignatureVerification {
   return { ok: false, reason };
 }
 
-type TargetResolution = { readonly ok: true; readonly node: Node } | { readonly ok: false; readonly reason: string };
-
-/**
- * The enveloped-signature transform: the referenced node-set is the document
- * with the signature removed. Work on a clone so the original document (whose
- * SignedInfo we still need) is untouched.
- */
-function resolveReferenceTarget(document: Document, uri: string): TargetResolution {
-  const clone = document.cloneNode(true) as Document;
-  const signature = elementsByLocalName(clone, DS_NS, 'Signature')[0] ?? null;
-  if (signature?.parentNode) signature.parentNode.removeChild(signature);
-
-  if (uri === '') {
-    const root = clone.documentElement;
-    return root ? { ok: true, node: root } : { ok: false, reason: 'the response has no document element' };
+function directChildren(element: Element, namespace: string, localName: string): Element[] {
+  const children: Element[] = [];
+  for (let i = 0; i < element.childNodes.length; i += 1) {
+    const child = element.childNodes.item(i);
+    if (child && child.nodeType === 1) {
+      const childElement = child as Element;
+      if (childElement.namespaceURI === namespace && childElement.localName === localName) {
+        children.push(childElement);
+      }
+    }
   }
-  if (!uri.startsWith('#')) return { ok: false, reason: `unsupported reference URI ${uri}` };
-  const resolved = resolveIdUnique(clone, uri.slice(1));
-  if (resolved.matches > 1) return { ok: false, reason: `duplicate id ${uri}` };
-  if (!resolved.element) return { ok: false, reason: `unresolved reference ${uri}` };
-  return { ok: true, node: resolved.element };
+  return children;
 }
 
 function extractSignerCertificate(signature: Element): string | null {

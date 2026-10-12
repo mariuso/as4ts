@@ -352,6 +352,30 @@ test('the validator keeps the SMP CA and the access point CA apart', async () =>
   assert.equal(smpAsReceipt.ok, false);
 });
 
+test('lookupParticipant refuses an oversized SMP response', async () => {
+  const oversized = (async () => {
+    let sent = 0;
+    const chunk = new Uint8Array(1024 * 1024);
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent >= 9) {
+          controller.close();
+          return;
+        }
+        sent += 1;
+        controller.enqueue(chunk);
+      },
+    });
+    return new Response(stream, { status: 200, headers: { 'content-type': 'application/xml' } });
+  }) as unknown as typeof fetch;
+  const result = await lookupParticipant(baseInput({ fetch: oversized }));
+  assert.equal(result.outcome, 'unavailable');
+  if (result.outcome === 'unavailable') {
+    assert.equal(result.retryable, false);
+    assert.match(result.reason, /exceeds/);
+  }
+});
+
 test('lookupParticipant never throws for an expected failure', async () => {
   const results: LookupResult[] = await Promise.all([
     lookupParticipant(

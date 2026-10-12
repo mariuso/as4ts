@@ -95,6 +95,20 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **SMP lookup read facts outside the signature.** A forged `ServiceInformation`
+  hidden inside the (digest-excluded) `ds:Signature` element was read as
+  verified, so a genuine signature over participant A could return an attacker's
+  endpoint and certificate. The verifier now requires exactly one `ds:Signature`
+  that is a direct child of the root and exactly one empty-URI `ds:Reference`,
+  and returns the document **with the signature removed**; only that document is
+  searched for the endpoint and the redirect.
+- **Real SMP responses failed signature verification.** Inclusive C14N must carry
+  the namespace declarations a node inherits from its ancestors; without them the
+  `ds:SignedInfo` of every real SMP response canonicalised differently. The SMP
+  canonicaliser now passes the inherited namespaces, and captured responses from
+  two independent SMP implementations verify.
+- **SMP lookup hardening.** The HTTP response is size-capped; elements are matched
+  in their specification namespace, not by local name in any namespace.
 - **OCSP responses are matched to the request.** The response `CertID` (hash
   algorithm, issuer-name hash, issuer-key hash and serial) must match, so an
   attacker on the plain-HTTP OCSP path can no longer replay another certificate's

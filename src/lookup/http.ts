@@ -16,8 +16,42 @@ export interface HttpGetOptions {
   readonly timeoutMs: number;
 }
 
+/** SMP responses are small; refuse to buffer an unbounded response. */
+const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
 function isAbort(err: unknown): boolean {
   return err instanceof Error && (err.name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ABORT_ERR');
+}
+
+async function readCapped(
+  response: Response,
+  limit: number,
+): Promise<{ readonly ok: true; readonly body: Buffer } | { readonly ok: false; readonly reason: string }> {
+  const stream = response.body;
+  if (!stream) return { ok: true, body: Buffer.alloc(0) };
+  const reader = stream.getReader();
+  const chunks: Buffer[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      size += value.byteLength;
+      if (size > limit) {
+        await reader.cancel();
+        return { ok: false, reason: `response exceeds ${limit} bytes` };
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // the stream was cancelled or already errored
+    }
+  }
+  return { ok: true, body: Buffer.concat(chunks) };
 }
 
 /**
@@ -38,13 +72,14 @@ export async function httpGet(url: string, options: HttpGetOptions): Promise<Htt
       redirect: 'manual',
       signal: controller.signal,
     });
-    const body = Buffer.from(await response.arrayBuffer());
+    const read = await readCapped(response, MAX_RESPONSE_BYTES);
+    if (!read.ok) return { ok: false, reason: `${url}: ${read.reason}`, retryable: false };
     return {
       ok: true,
       response: {
         status: response.status,
         url,
-        body,
+        body: read.body,
         contentType: response.headers.get('content-type'),
         location: response.headers.get('location'),
       },

@@ -77,7 +77,8 @@ export async function lookupParticipant(input: LookupInput): Promise<LookupResul
     const chosen = chooseReference(references, input.documentType, serviceGroupUrl);
     if (!chosen) return { outcome: 'not-supported', detail: 'no SMP reference matches the document type' };
 
-    // 3. SignedServiceMetadata, following an SMP Redirect at most once.
+    // 3. SignedServiceMetadata, following an SMP Redirect at most once. Only
+    // facts from the digest-covered document (signature removed) are read.
     let smpUrl = chosen.url;
     let fetched = await fetchXml(smpUrl, fetchImpl, input.signal, timeoutMs);
     if (!fetched.ok) return fetched.result;
@@ -85,11 +86,11 @@ export async function lookupParticipant(input: LookupInput): Promise<LookupResul
     if (status) return status;
     let document = parse(fetched.response.body);
     if (!document) return { outcome: 'unavailable', reason: `${smpUrl}: response is not XML`, retryable: false };
+    let verified = await verifyAndValidate(document, input, now);
+    if (!verified.ok) return verified.result;
 
-    const redirect = serviceMetadataRedirectHref(document);
+    const redirect = serviceMetadataRedirectHref(verified.verifiedDocument);
     if (redirect) {
-      const redirectSignature = await verifyAndValidate(document, input, now);
-      if (!redirectSignature.ok) return redirectSignature.result;
       smpUrl = new URL(redirect, smpUrl).toString();
       fetched = await fetchXml(smpUrl, fetchImpl, input.signal, timeoutMs);
       if (!fetched.ok) return fetched.result;
@@ -97,17 +98,16 @@ export async function lookupParticipant(input: LookupInput): Promise<LookupResul
       if (status) return status;
       document = parse(fetched.response.body);
       if (!document) return { outcome: 'unavailable', reason: `${smpUrl}: response is not XML`, retryable: false };
-      if (serviceMetadataRedirectHref(document)) {
+      verified = await verifyAndValidate(document, input, now);
+      if (!verified.ok) return verified.result;
+      if (serviceMetadataRedirectHref(verified.verifiedDocument)) {
         return { outcome: 'unavailable', reason: 'SMP redirected more than once', retryable: false };
       }
     }
 
-    // 4. Verify the SMP signature and validate the signer certificate.
-    const verified = await verifyAndValidate(document, input, now);
-    if (!verified.ok) return verified.result;
-
-    // 5. Select the endpoint for the process, transport profile and dates.
-    const selection = selectEndpoint(document, {
+    // 4. Select the endpoint for the process, transport profile and dates, from
+    // the verified document only.
+    const selection = selectEndpoint(verified.verifiedDocument, {
       participant: input.participant,
       documentType: input.documentType,
       process: input.process,
@@ -173,7 +173,8 @@ function parse(body: Buffer): Document | null {
 }
 
 type VerifyResult =
-  { readonly ok: true; readonly signerCertificate: string } | { readonly ok: false; readonly result: LookupResult };
+  | { readonly ok: true; readonly signerCertificate: string; readonly verifiedDocument: Document }
+  | { readonly ok: false; readonly result: LookupResult };
 
 async function verifyAndValidate(document: Document, input: LookupInput, now: Date): Promise<VerifyResult> {
   const signature = verifySmpSignature(document);
@@ -201,5 +202,9 @@ async function verifyAndValidate(document: Document, input: LookupInput, now: Da
       },
     };
   }
-  return { ok: true, signerCertificate: signature.signerCertificatePem };
+  return {
+    ok: true,
+    signerCertificate: signature.signerCertificatePem,
+    verifiedDocument: signature.verifiedDocument,
+  };
 }

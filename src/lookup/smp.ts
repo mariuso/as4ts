@@ -1,6 +1,6 @@
 import type { ParticipantId, ScopedId } from '../types.js';
 import { attrOf, elementsByLocalName, firstByLocalName, textOf } from '../xml/nodes.js';
-import { PEPPOL_DOCTYPE_WILDCARD, SMP_NS } from './constants.js';
+import { IDS_NS, PEPPOL_DOCTYPE_WILDCARD, SMP_NS, WSA_NS } from './constants.js';
 
 /** Build the REST segment for a participant: `<meta scheme>::<value>`. SMP v1.4.0 §5.3.2. */
 export function participantSegment(participant: ParticipantId): string {
@@ -10,15 +10,13 @@ export function participantSegment(participant: ParticipantId): string {
 /** The `ServiceMetadataReference/@href` values of a ServiceGroup document. */
 export function parseServiceGroupReferences(document: Document): string[] {
   return elementsByLocalName(document, SMP_NS, 'ServiceMetadataReference')
-    .concat(elementsByLocalName(document, '*', 'ServiceMetadataReference'))
     .map((element) => element.getAttribute('href'))
     .filter((href): href is string => typeof href === 'string' && href.length > 0);
 }
 
 /** The href of an SMP `ServiceMetadata/Redirect`, if the resource is a redirect. */
 export function serviceMetadataRedirectHref(document: Document): string | null {
-  const redirect = firstByLocalName(document, SMP_NS, 'Redirect') ?? firstByLocalName(document, '*', 'Redirect');
-  return attrOf(redirect, 'href');
+  return attrOf(firstByLocalName(document, SMP_NS, 'Redirect'), 'href');
 }
 
 function safeDecode(value: string): string {
@@ -118,18 +116,17 @@ export interface SelectEndpointInput {
   readonly now: Date;
 }
 
-function firstAny(node: Node | null, localName: string): Element | null {
-  return firstByLocalName(node, '*', localName);
-}
-
 /**
  * Find the endpoint for the requested participant, document type, process and
  * transport profile, respecting the service activation/expiration dates. A
  * missing activation date means "valid since forever"; a missing expiration
  * date means "valid until eternity" (SMP v1.4.0 §4.3).
+ *
+ * Every element is matched in its specification namespace — never by local name
+ * in any namespace — so a look-alike element in a foreign namespace is ignored.
  */
 export function selectEndpoint(document: Document, input: SelectEndpointInput): EndpointSelection {
-  const participantEl = firstAny(document, 'ParticipantIdentifier');
+  const participantEl = firstByLocalName(document, IDS_NS, 'ParticipantIdentifier');
   if (!participantEl) return { found: false, reason: 'SMP response has no ParticipantIdentifier' };
   const gotScheme = attrOf(participantEl, 'scheme') ?? '';
   const gotValue = textOf(participantEl) ?? '';
@@ -137,24 +134,24 @@ export function selectEndpoint(document: Document, input: SelectEndpointInput): 
     return { found: false, reason: 'SMP response is for a different participant' };
   }
 
-  const documentEl = firstAny(document, 'DocumentIdentifier');
+  const documentEl = firstByLocalName(document, IDS_NS, 'DocumentIdentifier');
   const gotDocument: ScopedId = { scheme: attrOf(documentEl, 'scheme') ?? '', value: textOf(documentEl) ?? '' };
   if (!documentTypeMatches(input.documentType, gotDocument)) {
     return { found: false, reason: 'SMP response is for a different document type' };
   }
 
-  for (const process of elementsByLocalName(document, '*', 'Process')) {
-    const identifier = firstAny(process, 'ProcessIdentifier');
+  for (const process of elementsByLocalName(document, SMP_NS, 'Process')) {
+    const identifier = firstByLocalName(process, IDS_NS, 'ProcessIdentifier');
     if ((attrOf(identifier, 'scheme') ?? '') !== input.process.scheme) continue;
     if ((textOf(identifier) ?? '') !== input.process.value) continue;
 
-    for (const endpoint of elementsByLocalName(process, '*', 'Endpoint')) {
+    for (const endpoint of elementsByLocalName(process, SMP_NS, 'Endpoint')) {
       if ((attrOf(endpoint, 'transportProfile') ?? '') !== input.transportProfile) continue;
-      const activation = textOf(firstAny(endpoint, 'ServiceActivationDate'));
-      const expiration = textOf(firstAny(endpoint, 'ServiceExpirationDate'));
+      const activation = textOf(firstByLocalName(endpoint, SMP_NS, 'ServiceActivationDate'));
+      const expiration = textOf(firstByLocalName(endpoint, SMP_NS, 'ServiceExpirationDate'));
       if (!withinWindow(activation, expiration, input.now)) continue;
-      const address = textOf(firstAny(endpoint, 'Address'));
-      const certificateBase64 = textOf(firstAny(endpoint, 'Certificate'))?.replace(/\s+/g, '');
+      const address = textOf(firstByLocalName(endpoint, WSA_NS, 'Address'));
+      const certificateBase64 = textOf(firstByLocalName(endpoint, SMP_NS, 'Certificate'))?.replace(/\s+/g, '');
       if (!address || !certificateBase64) continue;
       return {
         found: true,

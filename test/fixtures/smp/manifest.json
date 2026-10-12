@@ -1,0 +1,26 @@
+[
+  {
+    "name": "helger",
+    "participant": { "scheme": "iso6523-actorid-upis", "value": "9915:helger" },
+    "documentType": {
+      "scheme": "busdox-docid-qns",
+      "value": "urn:oasis:names:specification:ubl:schema:xsd:CreditNote-2::CreditNote##urn:cen.eu:en16931:2017#compliant#urn:xoev-de:kosit:standard:xrechnung_2.1::2.1"
+    },
+    "process": { "scheme": "cenbii-procid-ubl", "value": "urn:fdc:peppol.eu:2017:poacc:billing:01:1.0" },
+    "sml": "participant.sml.test.tech.peppol.org",
+    "smpBase": "https://smp.helger.com",
+    "endpointUrl": "https://www.helger.com/phase4/as4"
+  },
+  {
+    "name": "elma",
+    "participant": { "scheme": "iso6523-actorid-upis", "value": "0192:996220567" },
+    "documentType": {
+      "scheme": "busdox-docid-qns",
+      "value": "urn:oasis:names:specification:ubl:schema:xsd:CreditNote-2::CreditNote##urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0::2.1"
+    },
+    "process": { "scheme": "cenbii-procid-ubl", "value": "urn:fdc:peppol.eu:2017:poacc:billing:01:1.0" },
+    "sml": "participant.sml.test.tech.peppol.org",
+    "smpBase": "https://test-smp.elma-smp.no",
+    "endpointUrl": "https://peppol-ap-stage.maventa.com/as4"
+  }
+]
