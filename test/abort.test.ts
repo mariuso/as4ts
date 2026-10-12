@@ -94,25 +94,24 @@ test('abort during HTTP: stops the request and removes the temp files', async ()
   await withSpoolDir(async (dir) => {
     const pki = createTestPki();
     const tls = createTlsServerCert();
+    const controller = new AbortController();
     const receiver = await startFakeReceiver({
       receiver: pki.receiver,
       tlsCertPem: tls.certPem,
       tlsKeyPem: tls.keyPem,
       mode: { kind: 'hang' },
+      // Abort the moment the receiver has observed the request and is hanging on
+      // the response, so the cancellation is deterministic and mid-flight.
+      onRequest: () => controller.abort(),
     });
     try {
-      const controller = new AbortController();
-      const pending = sendAs4(
+      const result = await sendAs4(
         baseInput(pki, receiver.url, tls.caPem, {
           signal: controller.signal,
           spoolDirectory: dir,
           http: { connectMs: 5_000, totalMs: 30_000, ca: [tls.caPem] },
         }),
       );
-      // Long enough that preparation completes and the request is in flight
-      // against the hanging receiver before the abort fires.
-      setTimeout(() => controller.abort(), 300);
-      const result = await pending;
       assert.equal(result.outcome, 'transport-failure');
       if (result.outcome === 'transport-failure') assert.equal(result.aborted, true);
       assert.deepEqual(await readdir(dir), []);

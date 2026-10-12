@@ -56,6 +56,8 @@ export interface FakeReceiverOptions {
   readonly receiver: TestCert;
   readonly tlsCertPem: string;
   readonly tlsKeyPem: string;
+  /** Called when a request body has been fully received, before any response. */
+  readonly onRequest?: () => void;
   readonly mode?:
     | { kind: 'receipt' }
     | { kind: 'status'; status: number; body?: string }
@@ -84,6 +86,7 @@ export async function startFakeReceiver(options: FakeReceiverOptions): Promise<F
     req.on('data', (c: Buffer) => chunks.push(c));
     req.on('end', () => {
       const body = Buffer.concat(chunks);
+      options.onRequest?.();
       const dropFirst = options.mode?.kind === 'drop-first';
       if (options.mode?.kind === 'drop') {
         req.socket.destroy();
