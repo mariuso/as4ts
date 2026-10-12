@@ -66,6 +66,60 @@ test('rejects a receipt that acknowledges only part of the message', async () =>
   if (!result.ok) assert.equal(result.reason, 'receipt.malformed');
 });
 
+test('rejects an acknowledgement with an unsupported transform', async () => {
+  const result = await check({
+    references: [{ ...refs[0]!, transform: 'http://example.com/evil' }, refs[1]!, refs[2]!],
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'receipt.digest-mismatch');
+});
+
+test('rejects an acknowledgement with more than one transform', async () => {
+  const result = await check({
+    references: [{ ...refs[0]!, transforms: [ALGO_EXC_C14N, ALGO_EXC_C14N] }, refs[1]!, refs[2]!],
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'receipt.digest-mismatch');
+});
+
+test('rejects an acknowledgement with an unsupported digest method', async () => {
+  const result = await check({
+    references: [{ ...refs[0]!, digestMethod: 'http://example.com/evil' }, refs[1]!, refs[2]!],
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'receipt.digest-mismatch');
+});
+
+test('rejects an acknowledgement with altered transform parameters', async () => {
+  const result = await check({
+    references: [{ ...refs[0]!, inclusivePrefixes: ['env'] }, refs[1]!, refs[2]!],
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'receipt.digest-mismatch');
+});
+
+test('rejects a duplicate acknowledgement reference', async () => {
+  const result = await check({ references: [refs[0]!, refs[0]!, refs[1]!, refs[2]!] });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'receipt.malformed');
+});
+
+test('rejects an acknowledgement for a reference we did not sign', async () => {
+  const result = await check({
+    references: [refs[0]!, refs[1]!, refs[2]!, { uri: '#extra', transform: ALGO_EXC_C14N, digest: 'ZZZZ' }],
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'receipt.malformed');
+});
+
+test('rejects a receipt whose own signature references an unresolved element', async () => {
+  const result = await check({
+    extraSignedInfoReferences: [{ uri: '#does-not-exist', transform: ALGO_EXC_C14N, digest: 'AAAA' }],
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'receipt.malformed');
+});
+
 test('rejects a receipt with a broken signature', async () => {
   const result = await check({ breakSignature: true });
   assert.equal(result.ok, false);

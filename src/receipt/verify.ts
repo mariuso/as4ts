@@ -1,4 +1,4 @@
-import { DS_NS, EBBP_SIGNALS_NS } from '../constants.js';
+import { ALGO_EXC_C14N, ALGO_SHA256, DS_NS, EBBP_SIGNALS_NS, SWA_TRANSFORM_SIGNATURE } from '../constants.js';
 import type { ReceiptEvidence, ReceiptFailureReason, ValidateCertificate } from '../types.js';
 import { commonNameOf, normalizePem, parseCertificate, sameCertificate } from '../util.js';
 import { elementsByLocalName, firstByLocalName, attrOf, textOf } from '../xml/nodes.js';
@@ -36,8 +36,9 @@ const fail = (reason: ReceiptFailureReason, detail: string): ReceiptCheck => ({ 
  *  - the signer certificate chains to a Peppol trust anchor, is in date, is not
  *    revoked, and its common name equals the receiver's;
  *  - RefToMessageId equals the message id we sent;
- *  - every NonRepudiationInformation reference inside the signed signal carries a
- *    digest we signed.
+ *  - every NonRepudiationInformation reference inside the signed signal
+ *    acknowledges one of our references with the same digest method, ordered
+ *    transforms and parameters as well as the same digest value, exactly once.
  *
  * Any failure is reported as a value with a reason; the raw bytes are preserved
  * by the caller either way.
@@ -113,7 +114,7 @@ function verifyNonRepudiationInformation(
   const nri = firstByLocalName(signal.signalElement, EBBP_SIGNALS_NS, 'NonRepudiationInformation');
   if (!nri) return { reason: 'receipt.malformed', detail: 'no NonRepudiationInformation in the signed signal' };
 
-  const expected = new Map(signedReferences.map((r) => [r.uri, r.digest]));
+  const expectedDigest = new Map(signedReferences.map((r) => [r.uri, r.digest]));
   const partInfos = elementsByLocalName(nri, EBBP_SIGNALS_NS, 'MessagePartNRInformation');
   if (partInfos.length === 0) return { reason: 'receipt.malformed', detail: 'no MessagePartNRInformation' };
 
@@ -121,12 +122,32 @@ function verifyNonRepudiationInformation(
   for (const partInfo of partInfos) {
     for (const reference of elementsByLocalName(partInfo, DS_NS, 'Reference')) {
       const uri = attrOf(reference, 'URI') ?? '';
-      const digest = textOf(firstByLocalName(reference, DS_NS, 'DigestValue'))?.trim();
-      const want = expected.get(uri);
-      if (!want || !digest || want !== digest) {
-        return { reason: 'receipt.digest-mismatch', detail: `NonRepudiationInformation mismatch for ${uri}` };
+      const want = expectedDigest.get(uri);
+      if (!want) {
+        return {
+          reason: 'receipt.malformed',
+          detail: `NonRepudiationInformation acknowledges an unrequested reference ${uri}`,
+        };
+      }
+      if (seen.has(uri)) {
+        return { reason: 'receipt.malformed', detail: `duplicate acknowledgement reference ${uri}` };
       }
       seen.add(uri);
+
+      // AS4 receipts echo the original reference structure as evidence, so the
+      // acknowledgement must carry the same processing semantics (digest method,
+      // ordered transforms and their parameters), not only the same digest text.
+      if (!sameSemantics(actualSemantics(reference), expectedSemantics(uri))) {
+        return {
+          reason: 'receipt.digest-mismatch',
+          detail: `NonRepudiationInformation reference semantics mismatch for ${uri}`,
+        };
+      }
+
+      const digest = textOf(firstByLocalName(reference, DS_NS, 'DigestValue'))?.trim();
+      if (!digest || digest !== want) {
+        return { reason: 'receipt.digest-mismatch', detail: `NonRepudiationInformation digest mismatch for ${uri}` };
+      }
     }
   }
   if (seen.size === 0) return { reason: 'receipt.malformed', detail: 'NonRepudiationInformation has no references' };
@@ -138,4 +159,60 @@ function verifyNonRepudiationInformation(
     }
   }
   return null;
+}
+
+interface TransformSemantics {
+  readonly algorithm: string;
+  readonly inclusivePrefixes: readonly string[];
+}
+
+interface ReferenceSemantics {
+  readonly digestMethod: string | null;
+  readonly transforms: readonly TransformSemantics[];
+}
+
+/**
+ * The reference semantics the outbound artifact fixes for a URI kind: SOAP parts
+ * are signed with SHA-256 over exclusive C14N, attachments with SHA-256 over the
+ * SwA content-signature transform, and neither reference declares additional
+ * namespace parameters. A receipt that acknowledges one of our references with
+ * anything else is not acknowledging what we signed.
+ */
+function expectedSemantics(uri: string): ReferenceSemantics {
+  return {
+    digestMethod: ALGO_SHA256,
+    transforms: [
+      {
+        algorithm: uri.startsWith('cid:') ? SWA_TRANSFORM_SIGNATURE : ALGO_EXC_C14N,
+        inclusivePrefixes: [],
+      },
+    ],
+  };
+}
+
+function actualSemantics(reference: Element): ReferenceSemantics {
+  const digestMethod = attrOf(firstByLocalName(reference, DS_NS, 'DigestMethod'), 'Algorithm');
+  const transforms = elementsByLocalName(reference, DS_NS, 'Transform').map((transform) => ({
+    algorithm: attrOf(transform, 'Algorithm') ?? '',
+    inclusivePrefixes: inclusivePrefixesOf(transform),
+  }));
+  return { digestMethod, transforms };
+}
+
+function inclusivePrefixesOf(transform: Element): string[] {
+  const inc = firstByLocalName(transform, ALGO_EXC_C14N, 'InclusiveNamespaces');
+  const list = attrOf(inc, 'PrefixList');
+  return list ? list.split(/\s+/).filter(Boolean).sort() : [];
+}
+
+function sameSemantics(a: ReferenceSemantics, b: ReferenceSemantics): boolean {
+  if (a.digestMethod !== b.digestMethod) return false;
+  if (a.transforms.length !== b.transforms.length) return false;
+  return a.transforms.every((transform, index) => {
+    const other = b.transforms[index]!;
+    return (
+      transform.algorithm === other.algorithm &&
+      transform.inclusivePrefixes.join(' ') === other.inclusivePrefixes.join(' ')
+    );
+  });
 }

@@ -229,6 +229,36 @@ test('rejects a replayed OCSP answer issued for a different certificate', async 
   assert.notEqual(answer.source, 'ocsp');
 });
 
+test('bounds the revocation response body and treats an oversized body as no answer', async () => {
+  // Both endpoints return far more than the cap, so neither can produce an
+  // answer. The read must fail rather than buffer an unbounded body.
+  const pki = createTestPki();
+  const huge = new Uint8Array(4096);
+  const fetchImpl = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes('ocsp') || url.includes('crl')) return new Response(huge, { status: 200 });
+    return new Response('', { status: 404 });
+  }) as unknown as typeof fetch;
+
+  const answer = await checkRevocation(
+    parseCertificate(pki.receiver.certPem),
+    pki.intermediate.cert,
+    { ocsp: ['http://ocsp.example/'], crl: ['http://crl.example/root.crl'] },
+    {
+      policy: defaultRevocationPolicy({
+        ocsp: true,
+        crl: true,
+        timeoutMs: 2000,
+        maxResponseBytes: 1024,
+        maxCacheMs: 1000,
+      }),
+      now: () => new Date(),
+      fetchImpl,
+    },
+  );
+  assert.equal(answer.status, 'unknown');
+});
+
 function certIdFromRequest(requestDer: Buffer): Buffer {
   const tbsRequest = children(parseDer(requestDer).node)[0]!;
   const requestList = children(tbsRequest)[0]!;

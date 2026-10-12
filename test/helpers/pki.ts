@@ -144,6 +144,8 @@ interface MakeCertParams {
   readonly notAfter: Date;
   readonly serial: { hex: string; der: ArrayBuffer };
   readonly extensions: readonly pkijs.Extension[];
+  /** Override the certificate's own signature algorithm (negative tests). */
+  readonly signatureAlgorithm?: { readonly oid: string; readonly hash: string };
 }
 
 function makeCertificate(p: MakeCertParams): { certPem: string; serialHex: string } {
@@ -156,14 +158,18 @@ function makeCertificate(p: MakeCertParams): { certPem: string; serialHex: strin
   cert.notAfter = new pkijs.Time({ type: 0, value: p.notAfter });
   cert.subjectPublicKeyInfo = pkijs.PublicKeyInfo.fromBER(toArrayBuffer(p.subjectSpkiDer));
   cert.extensions = [...p.extensions];
+  const signatureAlgorithm = p.signatureAlgorithm ?? { oid: RSA_SHA256_WITH_RSA, hash: 'sha256' };
   const algorithm = new pkijs.AlgorithmIdentifier({
-    algorithmId: RSA_SHA256_WITH_RSA,
+    algorithmId: signatureAlgorithm.oid,
     algorithmParams: new asn1js.Null(),
   });
   cert.signature = algorithm;
   cert.signatureAlgorithm = algorithm;
   const tbs = Buffer.from(cert.encodeTBS().toBER(false));
-  const signature = cryptoSign('sha256', tbs, { key: p.issuerKey, padding: constants.RSA_PKCS1_PADDING });
+  const signature = cryptoSign(signatureAlgorithm.hash, tbs, {
+    key: p.issuerKey,
+    padding: constants.RSA_PKCS1_PADDING,
+  });
   cert.signatureValue = new asn1js.BitString({ valueHex: toArrayBuffer(signature) });
   const der = Buffer.from(cert.toSchema(true).toBER(false));
   return { certPem: pemEncode(der, 'CERTIFICATE'), serialHex: new X509Certificate(der).serialNumber.toLowerCase() };
@@ -400,6 +406,76 @@ export function createSelfSignedCert(commonName: string, now = new Date()): Test
     ],
   });
   return toKey(certPem, key, commonName);
+}
+
+export interface CustomKeyUsage {
+  readonly bytes: readonly number[];
+  readonly unusedBits: number;
+}
+
+export interface CustomCertOptions {
+  readonly commonName: string;
+  readonly isCa: boolean;
+  /** BasicConstraints pathLenConstraint; omit for none. */
+  readonly pathLen?: number;
+  /** Key Usage bits; null omits the extension. Defaults per `isCa`. */
+  readonly keyUsage?: CustomKeyUsage | null;
+  /** Extended Key Usage OIDs; omit for none. */
+  readonly extKeyUsage?: readonly string[];
+  /** Raw additional extensions (unknown critical, duplicates, unsupported path constraints). */
+  readonly extra?: readonly { readonly oid: string; readonly critical: boolean; readonly der: Buffer }[];
+  /** Emit a basicConstraints extension whose extnValue is not a valid SEQUENCE. */
+  readonly malformedBasicConstraints?: boolean;
+  /** Override the certificate's own signature algorithm (negative tests). */
+  readonly signatureAlgorithm?: { readonly oid: string; readonly hash: string };
+}
+
+/**
+ * Build a certificate with an explicit profile, for the constrained-validator
+ * regression tests. Pass `issuer: null` for a self-signed root. This deliberately
+ * allows combinations the production PKI never emits (missing keyCertSign,
+ * unknown critical extensions, malformed extensions, path-length violations).
+ */
+export function createCustomCert(now: Date, issuer: TestCert | null, options: CustomCertOptions): TestCert {
+  const key = newKey();
+  const subject = [
+    [OID.CN, options.commonName],
+    [OID.O, 'AS4 Sender Test'],
+    [OID.C, 'NO'],
+  ] as const;
+
+  const extensions: pkijs.Extension[] = [];
+  if (options.malformedBasicConstraints) {
+    extensions.push(extension('2.5.29.19', true, Buffer.from([0x02, 0x01, 0x00])));
+  } else {
+    extensions.push(extension('2.5.29.19', true, basicConstraints(options.isCa, options.pathLen)));
+  }
+
+  const usage =
+    options.keyUsage === undefined
+      ? options.isCa
+        ? { bytes: [0x06], unusedBits: 1 }
+        : { bytes: [0xa0], unusedBits: 5 }
+      : options.keyUsage;
+  if (usage) extensions.push(extension('2.5.29.15', true, keyUsage(usage.bytes, usage.unusedBits)));
+
+  if (options.extKeyUsage && options.extKeyUsage.length > 0) {
+    extensions.push(extension('2.5.29.37', false, extKeyUsage(...options.extKeyUsage)));
+  }
+  for (const extra of options.extra ?? []) extensions.push(extension(extra.oid, extra.critical, extra.der));
+
+  const { certPem } = makeCertificate({
+    subject,
+    issuer: issuer ? rdnAttrs(issuer.cert) : subject,
+    issuerKey: issuer ? issuer.keyObject : key.keyObject,
+    subjectSpkiDer: key.spkiDer,
+    notBefore: new Date(now.getTime() - VALIDITY_START_OFFSET_MS),
+    notAfter: nowOffset(now, options.isCa ? CA_DAYS : LEAF_DAYS),
+    serial: randomSerial(),
+    extensions,
+    ...(options.signatureAlgorithm ? { signatureAlgorithm: options.signatureAlgorithm } : {}),
+  });
+  return toKey(certPem, key, options.commonName);
 }
 
 export function publicKeyPem(certPem: string): string {

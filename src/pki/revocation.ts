@@ -29,8 +29,10 @@ export interface RevocationPolicy {
   readonly ocsp: boolean;
   /** Fall back to / use CRL. Defaults to true. */
   readonly crl: boolean;
-  /** Network timeout for a revocation fetch, milliseconds. */
+  /** Network timeout for a revocation fetch, milliseconds. Applies to the whole exchange, including the response body. */
   readonly timeoutMs: number;
+  /** Maximum bytes read from an OCSP/CRL response body. Defaults to 1 MiB. */
+  readonly maxResponseBytes?: number;
   /** Maximum cache lifetime for a positive/negative revocation answer, milliseconds. */
   readonly maxCacheMs: number;
 }
@@ -474,24 +476,58 @@ function verifyOcspSignature(parsed: ParsedOcsp, issuer: X509Certificate, now: D
 // Orchestration
 // ---------------------------------------------------------------------------
 
-async function fetchWithTimeout(
+/** Default cap on an OCSP/CRL response body, in bytes. */
+const DEFAULT_MAX_REVOCATION_RESPONSE_BYTES = 1024 * 1024;
+
+/**
+ * Fetch a revocation resource and read at most `maxBytes` of its body while the
+ * deadline and caller cancellation stay active. The previous helper cleared its
+ * timer as soon as the response headers arrived, leaving the body read
+ * unbounded; here the timeout covers the whole exchange and an oversized body
+ * aborts the read. Any network, timeout, abort or size failure propagates to the
+ * caller, which treats it as "no answer".
+ */
+async function fetchBounded(
   url: string,
   init: RequestInit,
   timeoutMs: number,
+  maxBytes: number,
   fetchImpl: typeof fetch,
   signal?: AbortSignal,
-): Promise<Response> {
+): Promise<Buffer | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const onAbort = () => controller.abort();
   signal?.addEventListener('abort', onAbort, { once: true });
   if (signal?.aborted) controller.abort();
   try {
-    return await fetchImpl(url, { ...init, signal: controller.signal, redirect: 'follow' });
+    const response = await fetchImpl(url, { ...init, signal: controller.signal, redirect: 'follow' });
+    if (!response.ok) return null;
+    return await readCapped(response, maxBytes);
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', onAbort);
   }
+}
+
+/** Read a response body in full, failing if it exceeds `maxBytes`. */
+async function readCapped(response: Response, maxBytes: number): Promise<Buffer> {
+  if (response.body === null) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new Error(`revocation response exceeds ${maxBytes} bytes`);
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks);
 }
 
 function cacheKey(cert: X509Certificate): string {
@@ -560,15 +596,15 @@ async function tryOcsp(
 ): Promise<RevocationAnswer | null> {
   try {
     const requestDer = buildOcspRequest(cert, issuer);
-    const response = await fetchWithTimeout(
+    const bytes = await fetchBounded(
       url,
       { method: 'POST', headers: { 'Content-Type': 'application/ocsp-request' }, body: new Uint8Array(requestDer) },
       options.policy.timeoutMs,
+      options.policy.maxResponseBytes ?? DEFAULT_MAX_REVOCATION_RESPONSE_BYTES,
       fetchImpl,
       options.signal,
     );
-    if (!response.ok) return null;
-    const bytes = Buffer.from(await response.arrayBuffer());
+    if (!bytes) return null;
     const parsed = parseOcspResponse(bytes);
     // Accept the response if it is signed by the issuing CA, or by a delegated
     // responder certificate (id-kp-OCSPSigning) that the issuing CA signed.
@@ -609,15 +645,15 @@ async function tryCrl(
   fetchImpl: typeof fetch,
 ): Promise<RevocationAnswer | null> {
   try {
-    const response = await fetchWithTimeout(
+    const der = await fetchBounded(
       url,
       { method: 'GET' },
       options.policy.timeoutMs,
+      options.policy.maxResponseBytes ?? DEFAULT_MAX_REVOCATION_RESPONSE_BYTES,
       fetchImpl,
       options.signal,
     );
-    if (!response.ok) return null;
-    const der = Buffer.from(await response.arrayBuffer());
+    if (!der) return null;
     const crl = parseCrl(der);
     if (!verifySignature(crl.signatureAlgorithmOid, crl.tbsRaw, crl.signature, issuer.publicKey)) {
       return { status: 'unknown', source: 'crl', reason: 'CRL signature not verifiable with issuer key' };

@@ -17,18 +17,34 @@ const src = join(here, '..', 'src');
 const SHARED_DIRS = ['xml', 'pki', 'crypto'];
 const SHARED_FILES = ['profile.ts'];
 
-const SENDER_ONLY = new Set(['index.ts', 'send.ts', 'multipart.ts', 'outcome.ts']);
-const SENDER_ONLY_DIRS = ['http'];
+const SENDER_ONLY_FILES = new Set(['index.ts', 'send.ts', 'multipart.ts', 'outcome.ts']);
+const SENDER_ONLY_DIRS = new Set(['http']);
+
+interface SourceFile {
+  readonly file: string;
+  readonly text: string;
+}
+
+/** Recursively collect every `.ts` file under a directory. */
+function walk(dir: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...walk(full));
+    else if (entry.isFile() && entry.name.endsWith('.ts')) files.push(full);
+  }
+  return files;
+}
 
 function sharedFiles(): string[] {
   const files: string[] = [];
-  for (const dir of SHARED_DIRS) {
-    for (const entry of readdirSync(join(src, dir), { withFileTypes: true })) {
-      if (entry.isFile() && entry.name.endsWith('.ts')) files.push(join(src, dir, entry.name));
-    }
-  }
+  for (const dir of SHARED_DIRS) files.push(...walk(join(src, dir)));
   for (const file of SHARED_FILES) files.push(join(src, file));
   return files;
+}
+
+function load(files: readonly string[]): SourceFile[] {
+  return files.map((file) => ({ file, text: readFileSync(file, 'utf8') }));
 }
 
 function importSpecifiers(text: string): string[] {
@@ -44,32 +60,72 @@ function importSpecifiers(text: string): string[] {
   return specifiers;
 }
 
-test('xml/, pki/, crypto/ and profile do not import sender-only modules', () => {
-  assertNoSenderOnlyImports(sharedFiles());
-});
+/**
+ * Normalise a resolved module path so a NodeNext `.js` import matches the `.ts`
+ * source it refers to. Without this the guard silently misses every file import
+ * (the previous bug: `SENDER_ONLY` held `.ts` names, `resolve` produced `.js`).
+ */
+function normalizeExtension(path: string): string {
+  return path.replace(/\.(js|ts)$/, '.ts');
+}
 
-test('as4ts/lookup imports nothing from the sender-only modules', () => {
-  const lookupDir = join(src, 'lookup');
-  const files = readdirSync(lookupDir, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.endsWith('.ts'))
-    .map((entry) => join(lookupDir, entry.name));
-  assertNoSenderOnlyImports(files);
-});
-
-function assertNoSenderOnlyImports(files: readonly string[]): void {
+/**
+ * The pure guard: given file/source pairs, return the imports that reach a
+ * sender-only module. Kept separate from filesystem walking so it can be tested
+ * directly with deliberate violations.
+ */
+function findSenderOnlyImports(files: readonly SourceFile[]): string[] {
   const violations: string[] = [];
-  for (const file of files) {
-    const text = readFileSync(file, 'utf8');
+  for (const { file, text } of files) {
     for (const specifier of importSpecifiers(text)) {
       if (!specifier.startsWith('.')) continue;
       const resolved = relative(src, resolve(dirname(file), specifier)).replace(/\\/g, '/');
       const [head, ...rest] = resolved.split('/');
-      if (head !== undefined && SENDER_ONLY_DIRS.includes(head) && rest.length > 0) {
+      if (head !== undefined && SENDER_ONLY_DIRS.has(head) && rest.length > 0) {
         violations.push(`${relative(here, file)} -> ${specifier}`);
         continue;
       }
-      if (SENDER_ONLY.has(resolved)) violations.push(`${relative(here, file)} -> ${specifier}`);
+      if (SENDER_ONLY_FILES.has(normalizeExtension(resolved))) {
+        violations.push(`${relative(here, file)} -> ${specifier}`);
+      }
     }
   }
-  assert.deepEqual(violations, [], `shared modules must not import sender-only modules:\n${violations.join('\n')}`);
+  return violations;
 }
+
+test('xml/, pki/, crypto/ and profile do not import sender-only modules', () => {
+  const violations = findSenderOnlyImports(load(sharedFiles()));
+  assert.deepEqual(violations, [], `shared modules must not import sender-only modules:\n${violations.join('\n')}`);
+});
+
+test('as4ts/lookup imports nothing from the sender-only modules', () => {
+  const violations = findSenderOnlyImports(load(walk(join(src, 'lookup'))));
+  assert.deepEqual(violations, [], `as4ts/lookup must not import sender-only modules:\n${violations.join('\n')}`);
+});
+
+test('the guard catches extension-normalized file and directory imports', () => {
+  // A deliberate violation of exactly the shapes the guard must reject: a direct
+  // sender-only file import (through its `.js` specifier) and a sender-only
+  // directory import. Both must be reported.
+  const fake = join(src, 'xml', 'fake.ts');
+  const violations = findSenderOnlyImports([
+    { file: fake, text: `import { sendAs4 } from '../index.js';` },
+    { file: fake, text: `import { sendHttp } from '../http/send.js';` },
+    { file: fake, text: `import { classify } from '../outcome.js';` },
+  ]);
+  assert.deepEqual(violations, [
+    `${relative(here, fake)} -> ../index.js`,
+    `${relative(here, fake)} -> ../http/send.js`,
+    `${relative(here, fake)} -> ../outcome.js`,
+  ]);
+});
+
+test('the guard allows shared and third-party imports', () => {
+  const fake = join(src, 'xml', 'fake.ts');
+  const violations = findSenderOnlyImports([
+    { file: fake, text: `import { parseXml } from './nodes.js';` },
+    { file: fake, text: `import { types } from '../types.js';` },
+    { file: fake, text: `import { X509Certificate } from 'node:crypto';` },
+  ]);
+  assert.deepEqual(violations, []);
+});

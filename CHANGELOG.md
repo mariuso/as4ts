@@ -95,6 +95,40 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Certificate path validation missed constraints.** The constrained validator
+  now decodes Basic Constraints and Key Usage from DER (Node's `keyUsage`
+  accessor exposes Extended Key Usage OIDs, which caused a false rejection of any
+  CA that asserted an EKU), enforces `pathLenConstraint` by counting the
+  non-self-issued CA certificates below each CA, rejects unknown critical
+  extensions, unsupported path-affecting extensions, duplicate and malformed
+  extensions, and checks the leaf's Key Usage against the requested purpose. The
+  supported profile, including the accepted signature algorithms and chain
+  shapes, is documented in [`docs/certificate-profile.md`](docs/certificate-profile.md).
+- **The shared WS-Security verifier accepted unsupported reference semantics.** It
+  checked reference digests but never the declared transform sequence, and it
+  skipped `cid:` attachment references before checking their digest method, so a
+  correctly re-signed envelope with an unknown transform — or an unsupported
+  attachment algorithm — still verified. Every reference now has its SHA-256
+  digest method and full transform sequence validated before any digest is
+  computed (exclusive C14N for SOAP parts, the SwA content-signature transform for
+  attachments). Signature selection is structural (only a signature inside a
+  `wsse:Security` header; ambiguous headers are rejected), and malformed
+  certificate bytes return a `malformed` value instead of throwing.
+- **Receipt acknowledgements were compared by digest text only.** Each
+  `NonRepudiationInformation` reference is now compared against the reference the
+  sender signed for its digest method, ordered transforms and parameters, and
+  exactly-once cardinality; duplicates and acknowledgements of references we did
+  not sign are rejected. Namespace prefixes remain irrelevant, so captures from
+  independent implementations still verify.
+- **Revocation deadlines ended before the response body.** The fetch cleared its
+  timer once headers arrived, so a stalled or oversized OCSP/CRL body held
+  validation open indefinitely. The deadline and caller cancellation now stay
+  active through the body read, which is capped at `maxResponseBytes` (default
+  1 MiB, configurable on the revocation policy).
+- **The module-layout guard missed file imports.** `SENDER_ONLY` held `.ts` names
+  while resolved imports were `.js`, so only directory imports were caught. The
+  guard now normalises extensions, recurses into subdirectories, and is tested
+  against deliberate violations.
 - **SMP lookup read facts outside the signature.** A forged `ServiceInformation`
   hidden inside the (digest-excluded) `ds:Signature` element was read as
   verified, so a genuine signature over participant A could return an attacker's

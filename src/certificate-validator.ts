@@ -58,6 +58,7 @@ export function createCertificateValidator(options: CertificateValidatorOptions)
         intermediates: intermediatesFor(options, input.purpose),
         revocation: options.revocation,
         now: input.now,
+        purpose: input.purpose,
         cache,
         ...(options.fetch ? { fetchImpl: options.fetch } : {}),
         ...(input.signal ? { signal: input.signal } : {}),
@@ -74,6 +75,7 @@ export function defaultRevocationPolicy(overrides: Partial<RevocationPolicy> = {
     ocsp: true,
     crl: true,
     timeoutMs: 5_000,
+    maxResponseBytes: 1024 * 1024,
     maxCacheMs: 60 * 60 * 1000,
     ...overrides,
   };

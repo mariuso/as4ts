@@ -1,7 +1,15 @@
 import { constants, createHash, verify as cryptoVerify } from 'node:crypto';
 import type { X509Certificate } from 'node:crypto';
-import { ALGO_EXC_C14N, ALGO_RSA_SHA256, ALGO_SHA256, DS_NS, WSSE_NS, WSU_NS } from '../constants.js';
-import { normalizePem, parseCertificate } from '../util.js';
+import {
+  ALGO_EXC_C14N,
+  ALGO_RSA_SHA256,
+  ALGO_SHA256,
+  DS_NS,
+  SWA_TRANSFORM_SIGNATURE,
+  WSSE_NS,
+  WSU_NS,
+} from '../constants.js';
+import { normalizePem, parseCertificate, safeMessage } from '../util.js';
 import { canonicalize, canonicalizeDigest, materializeInclusiveNamespaces } from './c14n.js';
 import { attrOf, elementsByLocalName, firstByLocalName, textOf } from './nodes.js';
 
@@ -11,13 +19,27 @@ export interface SignedReference {
   readonly digest: string;
 }
 
+/**
+ * A reference as verified from an inbound signature: the minimal
+ * {@link SignedReference} facts plus the digest algorithm and the exact
+ * transform sequence that were validated for it. Carrying these lets a caller
+ * reconstruct the reference faithfully (for example in a receipt's
+ * `NonRepudiationInformation`) instead of guessing it back.
+ */
+export interface VerifiedReference extends SignedReference {
+  /** The validated `ds:DigestMethod/@Algorithm`. */
+  readonly digestMethod: string;
+  /** The validated transform algorithm URIs, in document order. */
+  readonly transforms: readonly string[];
+}
+
 /** The facts a verified WS-Security signature yields. Direction-neutral. */
 export interface VerifiedSignature {
   /** The signer's X.509 certificate (PEM), taken from the signed KeyInfo. */
   readonly signerCertificatePem: string;
   readonly signerCertificate: X509Certificate;
   /** Every reference declared in SignedInfo, including non-envelope (`cid:`) ones. */
-  readonly references: readonly SignedReference[];
+  readonly references: readonly VerifiedReference[];
   /** The in-envelope elements whose digests actually verified. */
   readonly coveredElements: readonly Element[];
 }
@@ -44,9 +66,14 @@ export type SignatureVerification =
  *    over `ds:SignedInfo`;
  *  - the duplicate-id rejection: a reference URI is resolved only when exactly
  *    one element carries the id, so an attacker cannot shadow it;
- *  - SHA-256 reference digests, with the digest of each resolvable in-envelope
- *    element compared to its `DigestValue` (non-envelope `cid:` references are
- *    returned but not resolved here).
+ *  - strict profile validation of every reference before any digest is
+ *    computed: SHA-256 digest methods only, exclusive C14N transforms for SOAP
+ *    parts and the SwA content-signature transform for `cid:` attachments, so an
+ *    unsupported algorithm or transform is rejected even when its content is
+ *    resolved later;
+ *  - a single signature selected structurally from a `wsse:Security` header
+ *    (ambiguous headers are rejected), with all expected parsing and
+ *    cryptographic failures returned as values.
  *
  * It does **not** decide what the signature must cover, and it does **not**
  * validate the signer certificate: both are the caller's policy. Every failure
@@ -54,57 +81,82 @@ export type SignatureVerification =
  * `digest-mismatch` family; nothing is thrown.
  */
 export function verifyWsSecuritySignature(doc: Document): SignatureVerification {
-  const signature = findSignature(doc);
-  if (!signature) return fail('malformed', 'no WS-Security signature found');
+  try {
+    const selected = selectSignature(doc);
+    if (!selected.ok) return selected;
+    const signature = selected.signature;
 
-  const signerPem = extractSignerCertificate(doc, signature);
-  if (!signerPem) return fail('malformed', 'no signer certificate found');
-  const signer = parseCertificate(signerPem);
+    const signerPem = extractSignerCertificate(doc, signature);
+    if (!signerPem) return fail('malformed', 'no signer certificate found');
+    const signer = parseCertificate(signerPem);
 
-  const signedInfo = firstByLocalName(signature, DS_NS, 'SignedInfo');
-  if (!signedInfo) return fail('malformed', 'no SignedInfo');
+    const signedInfo = firstByLocalName(signature, DS_NS, 'SignedInfo');
+    if (!signedInfo) return fail('malformed', 'no SignedInfo');
 
-  const c14nMethod = firstByLocalName(signedInfo, DS_NS, 'CanonicalizationMethod');
-  if (attrOf(c14nMethod, 'Algorithm') !== ALGO_EXC_C14N) {
-    return fail('bad-signature', 'unexpected canonicalization method');
+    const c14nMethod = firstByLocalName(signedInfo, DS_NS, 'CanonicalizationMethod');
+    if (attrOf(c14nMethod, 'Algorithm') !== ALGO_EXC_C14N) {
+      return fail('bad-signature', 'unexpected canonicalization method');
+    }
+    const signatureMethod = firstByLocalName(signedInfo, DS_NS, 'SignatureMethod');
+    if (attrOf(signatureMethod, 'Algorithm') !== ALGO_RSA_SHA256) {
+      return fail('bad-signature', 'unexpected signature method');
+    }
+
+    const inclusivePrefixes = inclusivePrefixList(c14nMethod);
+    materializeInclusiveNamespaces(signedInfo, inclusivePrefixes);
+    const canonicalSignedInfo = inclusivePrefixes.length
+      ? canonicalize(signedInfo, inclusivePrefixes)
+      : canonicalize(signedInfo);
+
+    const signatureValue = textOf(firstByLocalName(signature, DS_NS, 'SignatureValue'));
+    if (!signatureValue) return fail('malformed', 'no SignatureValue');
+    const signatureBytes = Buffer.from(signatureValue.trim(), 'base64');
+    const signatureOk = cryptoVerify(
+      'sha256',
+      Buffer.from(canonicalSignedInfo, 'utf8'),
+      { key: signer.publicKey, padding: constants.RSA_PKCS1_PADDING },
+      signatureBytes,
+    );
+    if (!signatureOk) return fail('bad-signature', 'SignatureValue does not verify over SignedInfo');
+
+    const references = verifyReferences(doc, signedInfo);
+    if (!references.ok) return references;
+    if (references.coveredElements.length === 0) {
+      return fail('malformed', 'no verifiable in-envelope references');
+    }
+
+    return {
+      ok: true,
+      signature: {
+        signerCertificatePem: signerPem,
+        signerCertificate: signer,
+        references: references.references,
+        coveredElements: references.coveredElements,
+      },
+    };
+  } catch (err) {
+    // Malformed certificates and other unexpected cryptographic/parsing errors
+    // are facts, never exceptions: the verifier's contract is value-only.
+    return fail('malformed', `signature verification failed: ${safeMessage(err)}`);
   }
-  const signatureMethod = firstByLocalName(signedInfo, DS_NS, 'SignatureMethod');
-  if (attrOf(signatureMethod, 'Algorithm') !== ALGO_RSA_SHA256) {
-    return fail('bad-signature', 'unexpected signature method');
+}
+
+type SignatureSelection = { readonly ok: true; readonly signature: Element } | SignatureVerificationFailure;
+
+/**
+ * Select the one signature this verifier is willing to consider. Only a
+ * `ds:Signature` inside a `wsse:Security` header is eligible — a signature
+ * sitting anywhere else in the document is not — and more than one eligible
+ * signature is ambiguous and rejected rather than guessed between.
+ */
+function selectSignature(doc: Document): SignatureSelection {
+  const signatures: Element[] = [];
+  for (const security of elementsByLocalName(doc, WSSE_NS, 'Security')) {
+    signatures.push(...elementsByLocalName(security, DS_NS, 'Signature'));
   }
-
-  const inclusivePrefixes = inclusivePrefixList(c14nMethod);
-  materializeInclusiveNamespaces(signedInfo, inclusivePrefixes);
-  const canonicalSignedInfo = inclusivePrefixes.length
-    ? canonicalize(signedInfo, inclusivePrefixes)
-    : canonicalize(signedInfo);
-
-  const signatureValue = textOf(firstByLocalName(signature, DS_NS, 'SignatureValue'));
-  if (!signatureValue) return fail('malformed', 'no SignatureValue');
-  const signatureBytes = Buffer.from(signatureValue.trim(), 'base64');
-  const signatureOk = cryptoVerify(
-    'sha256',
-    Buffer.from(canonicalSignedInfo, 'utf8'),
-    { key: signer.publicKey, padding: constants.RSA_PKCS1_PADDING },
-    signatureBytes,
-  );
-  if (!signatureOk) return fail('bad-signature', 'SignatureValue does not verify over SignedInfo');
-
-  const references = verifyReferences(doc, signedInfo);
-  if (!references.ok) return references;
-  if (references.coveredElements.length === 0) {
-    return fail('malformed', 'no verifiable in-envelope references');
-  }
-
-  return {
-    ok: true,
-    signature: {
-      signerCertificatePem: signerPem,
-      signerCertificate: signer,
-      references: references.references,
-      coveredElements: references.coveredElements,
-    },
-  };
+  if (signatures.length === 0) return fail('malformed', 'no WS-Security signature found');
+  if (signatures.length > 1) return fail('malformed', 'ambiguous WS-Security signature');
+  return { ok: true, signature: signatures[0]! };
 }
 
 const fail = (reason: SignatureFailureReason, detail: string): SignatureVerificationFailure => ({
@@ -113,39 +165,63 @@ const fail = (reason: SignatureFailureReason, detail: string): SignatureVerifica
   detail,
 });
 
+/** Cap on SignedInfo references, so a hostile envelope cannot force unbounded work. */
+const MAX_REFERENCES = 64;
+
 type ReferencesVerification =
-  | { readonly ok: true; readonly references: readonly SignedReference[]; readonly coveredElements: readonly Element[] }
+  | {
+      readonly ok: true;
+      readonly references: readonly VerifiedReference[];
+      readonly coveredElements: readonly Element[];
+    }
   | SignatureVerificationFailure;
 
 /**
- * Verify the digests of the SignedInfo references and report which in-envelope
- * elements they cover. `cid:` references target the original message's
- * attachment, which is not part of the signed XML; they are returned with their
- * declared digest but never resolved against the document.
+ * Validate every SignedInfo reference and verify the digests of the in-envelope
+ * ones. The profile fixes both the digest algorithm and the transform sequence:
+ * SOAP parts use SHA-256 over exclusive C14N, and attachments use the SwA
+ * content-signature transform. A reference with any other algorithm or
+ * transform is rejected whether or not its content is resolved here, so an
+ * unsupported `cid:` reference can no longer slip through unchecked. `cid:`
+ * references are returned as validated-and-declared; their content is
+ * authenticated by the receiving layer after decryption.
  */
 function verifyReferences(doc: Document, signedInfo: Element): ReferencesVerification {
   const references = elementsByLocalName(signedInfo, DS_NS, 'Reference');
   if (references.length === 0) return fail('malformed', 'SignedInfo has no references');
+  if (references.length > MAX_REFERENCES) return fail('malformed', 'too many references');
 
-  const declared: SignedReference[] = [];
+  const declared: VerifiedReference[] = [];
   const coveredElements: Element[] = [];
   for (const reference of references) {
     const uri = attrOf(reference, 'URI') ?? '';
     const digest = textOf(firstByLocalName(reference, DS_NS, 'DigestValue'))?.trim();
     if (!digest) return fail('malformed', 'missing DigestValue');
-    declared.push({ uri, digest });
 
-    if (uri.startsWith('cid:')) continue; // attachment; not resolvable here
+    const digestMethod = attrOf(firstByLocalName(reference, DS_NS, 'DigestMethod'), 'Algorithm');
+    if (digestMethod !== ALGO_SHA256) {
+      return fail('bad-signature', 'unexpected digest method');
+    }
+
+    const transforms = elementsByLocalName(reference, DS_NS, 'Transform').map((t) => attrOf(t, 'Algorithm') ?? '');
+    const verified: VerifiedReference = { uri, digest, digestMethod, transforms };
+
+    if (uri.startsWith('cid:')) {
+      if (transforms.length !== 1 || transforms[0] !== SWA_TRANSFORM_SIGNATURE) {
+        return fail('bad-signature', `unsupported attachment transform for ${uri}`);
+      }
+      declared.push(verified);
+      continue; // content is authenticated later, after decryption
+    }
+
     if (!uri.startsWith('#')) return fail('malformed', `unsupported reference ${uri}`);
+    if (transforms.length !== 1 || transforms[0] !== ALGO_EXC_C14N) {
+      return fail('bad-signature', `unsupported transform for ${uri}`);
+    }
 
     const resolved = resolveIdUnique(doc, uri.slice(1));
     if (resolved.matches > 1) return fail('malformed', `duplicate id ${uri}`);
     if (!resolved.element) return fail('malformed', `unresolved reference ${uri}`);
-
-    const digestMethod = firstByLocalName(reference, DS_NS, 'DigestMethod');
-    if (attrOf(digestMethod, 'Algorithm') !== ALGO_SHA256) {
-      return fail('bad-signature', 'unexpected digest method');
-    }
 
     const prefixes = referenceInclusivePrefixes(reference);
     materializeInclusiveNamespaces(resolved.element, prefixes);
@@ -153,17 +229,10 @@ function verifyReferences(doc: Document, signedInfo: Element): ReferencesVerific
       ? createHash('sha256').update(canonicalize(resolved.element, prefixes), 'utf8').digest('base64')
       : canonicalizeDigest(resolved.element);
     if (actual !== digest) return fail('digest-mismatch', `digest mismatch for ${uri}`);
+    declared.push(verified);
     coveredElements.push(resolved.element);
   }
   return { ok: true, references: declared, coveredElements };
-}
-
-function findSignature(doc: Document): Element | null {
-  for (const security of elementsByLocalName(doc, WSSE_NS, 'Security')) {
-    const signature = firstByLocalName(security, DS_NS, 'Signature');
-    if (signature) return signature;
-  }
-  return elementsByLocalName(doc, DS_NS, 'Signature')[0] ?? null;
 }
 
 function extractSignerCertificate(doc: Document, signature: Element): string | null {

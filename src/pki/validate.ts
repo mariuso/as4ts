@@ -1,4 +1,4 @@
-import type { CertificateValidation } from '../types.js';
+import type { CertificatePurpose, CertificateValidation } from '../types.js';
 import { commonNameOf, parseCertificate } from '../util.js';
 import { buildCertificatePath } from './chain.js';
 import {
@@ -14,6 +14,8 @@ export interface ValidateCertificatePemOptions {
   readonly intermediates: readonly string[];
   readonly revocation: RevocationPolicy;
   readonly now: Date;
+  /** Selects the leaf Key Usage requirement; defaults to any signing or encryption use. */
+  readonly purpose?: CertificatePurpose;
   readonly cache?: RevocationCache;
   readonly fetchImpl?: typeof fetch;
   readonly signal?: AbortSignal;
@@ -37,7 +39,13 @@ export async function validateCertificatePem(
 ): Promise<CertificateValidation> {
   const leaf = parseCertificate(pem);
   const now = options.now;
-  const path = buildCertificatePath(leaf, options.intermediates, options.roots, now);
+  const path = buildCertificatePath(
+    leaf,
+    options.intermediates,
+    options.roots,
+    now,
+    options.purpose !== undefined ? { purpose: options.purpose } : {},
+  );
   if (!path.ok) {
     return { ok: false, status: 'invalid', reason: path.reason };
   }

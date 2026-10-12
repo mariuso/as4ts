@@ -16,11 +16,23 @@ import { parseXml, serializeXml } from '../../src/xml/nodes.js';
 import { parseSignal, type ParsedSignal } from '../../src/xml/signal.js';
 import { createSelfSignedCert, type TestCert } from './pki.js';
 
-export interface ReceiptReference {
+/**
+ * A reference echoed in NonRepudiationInformation, or placed directly in the
+ * receipt's SignedInfo (negative tests). Optional fields let a test construct an
+ * acknowledgement whose processing semantics differ from the outbound artifact.
+ */
+export interface SignedInfoReference {
   readonly uri: string;
   readonly transform: string;
   readonly digest: string;
+  readonly digestMethod?: string;
+  /** Override the transform sequence; defaults to `[transform]`. */
+  readonly transforms?: readonly string[];
+  /** Attach an InclusiveNamespaces PrefixList to the transform (altered parameters). */
+  readonly inclusivePrefixes?: readonly string[];
 }
+
+export type ReceiptReference = SignedInfoReference;
 
 export interface ReceiptBuildOptions {
   /** Certificate and key that produce the signature. */
@@ -47,6 +59,10 @@ export interface ReceiptBuildOptions {
   readonly digestMethodAlgorithm?: string;
   /** Override the declared CanonicalizationMethod algorithm (negative tests). */
   readonly canonicalizationAlgorithm?: string;
+  /** Override the transform algorithm of the default signature reference (negative tests). */
+  readonly referenceTransformAlgorithm?: string;
+  /** Extra references to place in SignedInfo after the default one (negative tests). */
+  readonly extraSignedInfoReferences?: readonly SignedInfoReference[];
 }
 
 const SOAP_11_NS = 'http://schemas.xmlsoap.org/soap/envelope/';
@@ -63,6 +79,7 @@ export function buildSignedReceipt(options: ReceiptBuildOptions): { xml: string;
       `xmlns:eb="${EBMS_NS}" ` +
       `xmlns:ds="${DS_NS}" ` +
       `xmlns:ebbp="${EBBP_SIGNALS_NS}" ` +
+      `xmlns:ec="${ALGO_EXC_C14N}" ` +
       `xmlns:wsu="${WSU_NS}" ` +
       `xmlns:wsse="${WSSE_NS}"/>`,
   );
@@ -93,9 +110,17 @@ export function buildSignedReceipt(options: ReceiptBuildOptions): { xml: string;
     const partInfo = mk(EBBP_SIGNALS_NS, 'ebbp:MessagePartNRInformation');
     const reference = mk(DS_NS, 'ds:Reference', { URI: ref.uri });
     const transforms = mk(DS_NS, 'ds:Transforms');
-    transforms.appendChild(mk(DS_NS, 'ds:Transform', { Algorithm: ref.transform }));
+    for (const algorithm of ref.transforms ?? [ref.transform]) {
+      const transform = mk(DS_NS, 'ds:Transform', { Algorithm: algorithm });
+      if (ref.inclusivePrefixes && ref.inclusivePrefixes.length > 0) {
+        transform.appendChild(
+          mk(ALGO_EXC_C14N, 'ec:InclusiveNamespaces', { PrefixList: ref.inclusivePrefixes.join(' ') }),
+        );
+      }
+      transforms.appendChild(transform);
+    }
     reference.appendChild(transforms);
-    reference.appendChild(mk(DS_NS, 'ds:DigestMethod', { Algorithm: ALGO_SHA256 }));
+    reference.appendChild(mk(DS_NS, 'ds:DigestMethod', { Algorithm: ref.digestMethod ?? ALGO_SHA256 }));
     const digest = options.tamperedDigests?.[ref.uri] ?? ref.digest;
     reference.appendChild(mk(DS_NS, 'ds:DigestValue', {}, digest));
     partInfo.appendChild(reference);
@@ -142,13 +167,25 @@ export function buildSignedReceipt(options: ReceiptBuildOptions): { xml: string;
   );
   const signTarget = options.referenceTarget === 'body' ? body : signaling;
   const signTargetId = options.referenceTarget === 'body' ? bodyId : signalingId;
-  const ref = mk(DS_NS, 'ds:Reference', { URI: `#${signTargetId}` });
-  const transforms = mk(DS_NS, 'ds:Transforms');
-  transforms.appendChild(mk(DS_NS, 'ds:Transform', { Algorithm: ALGO_EXC_C14N }));
-  ref.appendChild(transforms);
-  ref.appendChild(mk(DS_NS, 'ds:DigestMethod', { Algorithm: options.digestMethodAlgorithm ?? ALGO_SHA256 }));
-  ref.appendChild(mk(DS_NS, 'ds:DigestValue', {}, canonicalizeDigest(signTarget)));
-  signedInfo.appendChild(ref);
+  const defaultDigestMethod = options.digestMethodAlgorithm ?? ALGO_SHA256;
+  const signedInfoReferences: SignedInfoReference[] = [
+    {
+      uri: `#${signTargetId}`,
+      transform: options.referenceTransformAlgorithm ?? ALGO_EXC_C14N,
+      digest: canonicalizeDigest(signTarget),
+      digestMethod: defaultDigestMethod,
+    },
+    ...(options.extraSignedInfoReferences ?? []),
+  ];
+  for (const reference of signedInfoReferences) {
+    const ref = mk(DS_NS, 'ds:Reference', { URI: reference.uri });
+    const transforms = mk(DS_NS, 'ds:Transforms');
+    transforms.appendChild(mk(DS_NS, 'ds:Transform', { Algorithm: reference.transform }));
+    ref.appendChild(transforms);
+    ref.appendChild(mk(DS_NS, 'ds:DigestMethod', { Algorithm: reference.digestMethod ?? defaultDigestMethod }));
+    ref.appendChild(mk(DS_NS, 'ds:DigestValue', {}, reference.digest));
+    signedInfo.appendChild(ref);
+  }
 
   let signatureValue = cryptoSign('sha256', Buffer.from(canonicalize(signedInfo), 'utf8'), {
     key: options.signer.keyObject,
