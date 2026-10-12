@@ -38,17 +38,18 @@ known advisories.
 
 In scope:
 
-- Receipt signature verification (`src/receipt/verify.ts`).
+- Receipt signature verification (`src/receipt/verify.ts`) and the shared,
+  direction-neutral WS-Security signature verification (`src/xml/ws-security.ts`).
 - Envelope signing and encryption, and exclusive C14N (`src/xml/*`).
 - Certificate path building and revocation (`src/pki/*`).
 - The streaming payload pipeline (`src/crypto/*`).
+- SML/SMP participant lookup and SMP signature verification (`src/lookup/*`).
 
 Out of scope:
 
 - The caller's trust policy, signer and certificate validator (injected by the
   caller; the security of those is the caller's responsibility).
-- The example scripts under `examples/` (not part of the package, and the SMP
-  lookup example deliberately does not verify the SMP response signature).
+- The example scripts under `examples/` (not part of the package).
 - The Peppol Testbed and OpenPeppol PKI themselves.
 
 ## Design properties we rely on

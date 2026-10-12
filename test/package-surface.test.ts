@@ -11,6 +11,9 @@ const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
   version: string;
   dependencies: Record<string, string>;
   exports: Record<string, unknown>;
+  repository?: { url?: string };
+  bugs?: { url?: string };
+  homepage?: string;
 };
 
 test('the sender entry point exports a stable surface', async () => {
@@ -56,6 +59,12 @@ test('the lookup entry point exports a stable surface', async () => {
 test('package identity matches the User-Agent constants', () => {
   assert.equal(PACKAGE_NAME, pkg.name);
   assert.equal(PACKAGE_VERSION, pkg.version);
+});
+
+test('package metadata points at the GitHub repository', () => {
+  assert.match(pkg.repository?.url ?? '', /github\.com\/mariuso\/as4ts/);
+  assert.match(pkg.bugs?.url ?? '', /github\.com\/mariuso\/as4ts\/issues/);
+  assert.match(pkg.homepage ?? '', /github\.com\/mariuso\/as4ts/);
 });
 
 test('runtime dependencies stay at two caret ranges whose floor is the pinned version', () => {

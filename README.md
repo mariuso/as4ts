@@ -32,9 +32,15 @@ Expected failures are **values**, never thrown exceptions.
 
 ## Install
 
+The package is not on npm yet. Until it is, install it straight from the
+repository:
+
 ```bash
-npm install as4ts
+npm install github:mariuso/as4ts
 ```
+
+An npm release will follow; this repository is the only source for now, so there
+is no package name for anyone else to register.
 
 Pre-1.0: the API may change between minor versions until 1.0.
 

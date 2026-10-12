@@ -6,26 +6,12 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
-
-- **`as4ts/lookup`.** `lookupParticipant(input)` performs exactly one SML/SMP
-  discovery and returns a union of facts (`found`, `not-registered`,
-  `not-supported`, `signature-invalid`, `unavailable`). It derives the SML DNS
-  name from the participant identifier, resolves the SMP with a U-NAPTR lookup,
-  fetches the signed service metadata, verifies the SMP's inclusive-C14N
-  enveloped XML signature and validates the signer with purpose `smp-signer`,
-  then selects the endpoint for the process and transport profile within its
-  activation/expiration window. DNS and HTTP are injectable, there is no caching
-  and no retry, and `sendAs4` never calls it.
-- **The receiving side is reserved.** Receiving is planned but not implemented
-  (see [`docs/receiving.md`](docs/receiving.md)); no `receive*` value or type is
-  exported yet, and `test/package-surface.test.ts` now fails if one appears. A
-  future `receiveAs4` can therefore be added without a breaking rename. **No
-  exports were renamed**: nothing sender-specific described a direction-neutral
-  thing.
-
 ### Changed
 
+- **Publishing metadata.** The README installs from the GitHub repository
+  (`npm install github:mariuso/as4ts`) instead of an unregistered npm name;
+  `package.json` gains `repository`, `bugs`, `homepage` and the `./lookup`
+  export; `SECURITY.md` lists the lookup code in scope.
 - **Shared code is direction-neutral.** WS-Security signature verification moved
   out of `receipt/verify.ts` into `xml/ws-security.ts`; `verifyReceipt` now
   applies only the receipt-specific rules (the signature must cover the signal,
@@ -68,10 +54,25 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`as4ts/lookup`.** `lookupParticipant(input)` performs exactly one SML/SMP
+  discovery and returns a union of facts (`found`, `not-registered`,
+  `not-supported`, `signature-invalid`, `unavailable`). It derives the SML DNS
+  name from the participant identifier, resolves the SMP with a U-NAPTR lookup,
+  fetches the signed service metadata, verifies the SMP's inclusive-C14N
+  enveloped XML signature and validates the signer with purpose `smp-signer`,
+  then selects the endpoint for the process and transport profile within its
+  activation/expiration window. DNS and HTTP are injectable, there is no caching
+  and no retry, and `sendAs4` never calls it.
+- **The receiving side is reserved.** Receiving is planned but not implemented
+  (see [`docs/receiving.md`](docs/receiving.md)); no `receive*` value or type is
+  exported yet, and `test/package-surface.test.ts` now fails if one appears. A
+  future `receiveAs4` can therefore be added without a breaking rename. **No
+  exports were renamed**: nothing sender-specific described a direction-neutral
+  thing.
 - Apache-2.0 `LICENSE`; the package is named `as4ts`; `SECURITY.md` points at
   GitHub private vulnerability reporting.
-- Three package entry points: sender, certificate validator, classifier, with a
-  test that snapshots each exported surface.
+- Four package entry points: sender, certificate validator, classifier and
+  lookup, with a test that snapshots each exported surface.
 - Tests for abort at every phase (asserting no temp files remain), a missing or
   throwing validator, a delegated OCSP responder, CRL fallback, a second send on
   a reused connection, and a forged receipt wrapped around another signer's
