@@ -36,6 +36,13 @@ export interface Profile {
  * A signer produces an RSA PKCS#1 v1.5 / SHA-256 signature over bytes, and
  * carries the certificate whose public key must verify it. The private key
  * never leaves the implementation.
+ *
+ * A future receiver will need an additional operation on the same key holder:
+ * unwrapping (decrypting) the session key of an inbound message. It is not
+ * declared here yet because the receiver is not implemented, but an
+ * implementation backed by a key service (HSM/KMS) should plan for that
+ * unwrap-key operation on the same key/certificate pair now, so it does not
+ * have to be retrofitted later.
  */
 export interface Signer {
   /** The signer's X.509 certificate (PEM). */
@@ -45,7 +52,15 @@ export interface Signer {
 }
 
 /** What a certificate is being validated for. */
-export type CertificatePurpose = 'receiver-encryption' | 'receipt-signer';
+export type CertificatePurpose =
+  /** The receiver's certificate we encrypt to (`receiver-encryption`). */
+  | 'receiver-encryption'
+  /** The access point that signed a receipt we received (`receipt-signer`). */
+  | 'receipt-signer'
+  /** The access point that signed an inbound user message (`message-signer`). */
+  | 'message-signer'
+  /** The service metadata publisher that signed an SMP response (`smp-signer`). */
+  | 'smp-signer';
 
 /**
  * The outcome of validating one certificate. The core never decides what this

@@ -17,6 +17,20 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Shared code is direction-neutral.** WS-Security signature verification moved
+  out of `receipt/verify.ts` into `xml/ws-security.ts`; `verifyReceipt` now
+  applies only the receipt-specific rules (the signature must cover the signal,
+  `RefToMessageId`, the NonRepudiationInformation digests, signer equals
+  receiver). `xml/`, `pki/`, `crypto/` and `profile` must not import the
+  sender-only modules, enforced by `test/module-layout.test.ts`.
+- **Certificate purposes.** `CertificatePurpose` gains `message-signer` (the
+  access point that signed an inbound user message) and `smp-signer` (the SMP
+  signer). `createCertificateValidator` accepts `intermediatesByPurpose` so an
+  SMP CA can be kept from validating an access point certificate and the
+  reverse; `message-signer` follows `receipt-signer`.
+- **`Signer` doc.** Notes that a future receiver will need an unwrap-key
+  operation on the same key holder, so key-service implementations can plan for
+  it.
 - **Wire format locked.** Every source of randomness and time is injectable
   internally (clock, XML ids, MIME boundary, content id, session key, IV), with
   committed byte-identical golden fixtures for the SOAP envelope and multipart
