@@ -5,11 +5,12 @@ import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
- * The receiver will reuse `xml/`, `pki/`, `crypto/` and `profile`. Those must
- * stay direction-neutral, so they must never import from the sender-only
- * modules (`index.ts`, `send.ts`, `http/`, `multipart.ts`, `outcome.ts`). This
+ * The receiver reuses `xml/`, `pki/`, `crypto/` and `profile`. Those must stay
+ * direction-neutral, so they must never import from the sender-only modules
+ * (`index.ts`, `send.ts`, `http/`, `multipart.ts`, `outcome.ts`); and the
+ * receiving tree (`src/receive/`) must not reach into the sender either. This
  * test fails if one does, which keeps the sender from leaking into the shared
- * building blocks.
+ * building blocks or the receiving entry point.
  */
 const here = dirname(fileURLToPath(import.meta.url));
 const src = join(here, '..', 'src');
@@ -101,6 +102,11 @@ test('xml/, pki/, crypto/ and profile do not import sender-only modules', () => 
 test('as4ts/lookup imports nothing from the sender-only modules', () => {
   const violations = findSenderOnlyImports(load(walk(join(src, 'lookup'))));
   assert.deepEqual(violations, [], `as4ts/lookup must not import sender-only modules:\n${violations.join('\n')}`);
+});
+
+test('as4ts/receive imports nothing from the sender-only modules', () => {
+  const violations = findSenderOnlyImports(load(walk(join(src, 'receive'))));
+  assert.deepEqual(violations, [], `as4ts/receive must not import sender-only modules:\n${violations.join('\n')}`);
 });
 
 test('the guard catches extension-normalized file and directory imports', () => {

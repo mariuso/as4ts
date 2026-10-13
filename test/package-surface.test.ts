@@ -47,8 +47,28 @@ test('the classifier entry point exports a stable surface', async () => {
   ]);
 });
 
-test('there are exactly four entry points', () => {
-  assert.deepEqual(Object.keys(pkg.exports).sort(), ['.', './certificate-validator', './classifier', './lookup']);
+test('there are exactly five entry points', () => {
+  assert.deepEqual(Object.keys(pkg.exports).sort(), [
+    '.',
+    './certificate-validator',
+    './classifier',
+    './lookup',
+    './receive',
+  ]);
+});
+
+test('the receive entry point exports a stable surface', async () => {
+  const module = await import('../src/receive/index.js');
+  assert.deepEqual(Object.keys(module).sort(), [
+    'defaultInboundLimits',
+    'ebmsErrorFor',
+    'keyHolderFromKey',
+    'notServicedError',
+    'openAs4Message',
+    'peppolProfile',
+    'respondAs4Message',
+    'signerFromKey',
+  ]);
 });
 
 test('the lookup entry point exports a stable surface', async () => {
@@ -82,9 +102,10 @@ test('runtime dependencies stay at two caret ranges whose floor is the pinned ve
 });
 
 /**
- * The receiving side is planned but not implemented. No entry point may already
- * export a `receive*` value or type, so a future `receiveAs4` can add one
- * without a breaking rename. This guards the reservation (see docs/receiving.md).
+ * The receiving surface is `as4ts/receive` with `openAs4Message` and
+ * `respondAs4Message`. No entry point may export a `receive*` name, so a future
+ * `receiveAs4` convenience could still add one without a breaking rename. This
+ * guards the reservation (see docs/receiving.md).
  */
 test('no entry point exports a receive* value', async () => {
   const modules = await Promise.all([
@@ -92,6 +113,7 @@ test('no entry point exports a receive* value', async () => {
     import('../src/certificate-validator.js'),
     import('../src/classifier.js'),
     import('../src/lookup/index.js'),
+    import('../src/receive/index.js'),
   ]);
   for (const module of modules) {
     const offenders = Object.keys(module).filter((name) => /^receive/i.test(name));

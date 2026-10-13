@@ -155,14 +155,16 @@ verification and the TLS 1.2 minimum remain enabled for every transmission.
 
 ## API
 
-| Entry point                   | Exports                                                                                         | Purpose                                                        |
-| ----------------------------- | ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `as4ts`                       | `sendAs4`, `prepareAs4`, `transmitAs4`, `loadPreparedMessage`, `signerFromKey`, `peppolProfile` | Prepare and send one signed, encrypted UserMessage.            |
-| `as4ts/lookup`                | `lookupParticipant` and identifier helpers                                                      | Discover an endpoint and verify its signed SMP metadata.       |
-| `as4ts/certificate-validator` | `createCertificateValidator`, `defaultRevocationPolicy`, `RevocationCache`                      | Apply the supported certificate profile and revocation policy. |
-| `as4ts/classifier`            | `classify`, `classifyEbmsError`, policy tables                                                  | Map send facts to application decisions.                       |
+| Entry point                   | Exports                                                                                         | Purpose                                                                    |
+| ----------------------------- | ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `as4ts`                       | `sendAs4`, `prepareAs4`, `transmitAs4`, `loadPreparedMessage`, `signerFromKey`, `peppolProfile` | Prepare and send one signed, encrypted UserMessage.                        |
+| `as4ts/receive`               | `openAs4Message`, `respondAs4Message`, `keyHolderFromKey`, `ebmsErrorFor`, `notServicedError`   | Verify and unpack one inbound UserMessage, then build its signed response. |
+| `as4ts/lookup`                | `lookupParticipant` and identifier helpers                                                      | Discover an endpoint and verify its signed SMP metadata.                   |
+| `as4ts/certificate-validator` | `createCertificateValidator`, `defaultRevocationPolicy`, `RevocationCache`                      | Apply the supported certificate profile and revocation policy.             |
+| `as4ts/classifier`            | `classify`, `classifyEbmsError`, policy tables                                                  | Map send facts to application decisions.                                   |
 
-The public types document the full [send input and results](src/types.ts) and
+The public types document the full [send input and results](src/types.ts),
+[receive input and results](src/receive/types.ts), and
 [lookup input and results](src/lookup/types.ts).
 
 ### Send results
@@ -198,10 +200,11 @@ injectable; your application owns discovery caching.
 
 ## Status
 
-Pre-1.0. Sending, signed participant discovery, receipt verification, certificate
-validation, cancellation, and phase timing hooks are implemented. The test suite
-covers message construction, tampering, certificate constraints, transport
-failures, cancellation, and streaming memory use.
+Pre-1.0. Sending, inbound verification and response construction, signed
+participant discovery, receipt verification, certificate validation,
+cancellation, and phase timing hooks are implemented. The test suite covers
+message construction, tampering, certificate constraints, transport failures,
+cancellation, and streaming memory use.
 
 Test-network sends have produced verified receipts from independent access
 points. [Captured receipts](test/fixtures/captures/) are exercised offline for
@@ -214,9 +217,15 @@ the applicable [Peppol Testbed](https://www.testbed.peppol.org/) onboarding test
 
 Current limits:
 
-- **Receiving is planned.** The [receiving design](docs/receiving.md) separates
-  verification from acknowledgement so the application can store a document
-  durably before issuing its receipt. There is no receiving API yet.
+- **Receiving is implemented.** The [`as4ts/receive`](docs/receiving.md) entry
+  point separates verification (`openAs4Message`) from acknowledgement
+  (`respondAs4Message`) so the application can store a document durably before
+  issuing its receipt; [`examples/receive-inbox.ts`](examples/receive-inbox.ts)
+  shows a durable inbox with duplicate suppression and lost-response recovery.
+  The required signature coverage for an empty SOAP Body and the sender fixtures
+  that freeze it are still open (see
+  [`docs/receiving-coverage.md`](docs/receiving-coverage.md)); until then the
+  inbound parser is exercised against locally generated messages, not live peers.
 - **Durable retransmission is caller-driven.** `prepareAs4` + `transmitAs4`
   re-send an identical artifact, and the directory it writes can be persisted and
   reloaded with `loadPreparedMessage`. Persistence, retention and retry policy
@@ -262,6 +271,7 @@ Useful commands:
 npm run examples:send -- --help
 npm run examples:smp -- --help
 npm run examples:record-smp -- --help
+npm run examples:receive
 ```
 
 Runtime dependencies are `@xmldom/xmldom` for XML parsing and serialization, and

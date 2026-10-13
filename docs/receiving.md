@@ -1,16 +1,20 @@
 # Receiving AS4: design note
 
-This is a design note, not a promise. It records how receiving is expected to
-fit the package so that adding it later is not a breaking change. It is **not**
-implemented.
+This note records how receiving fits the package. It is now implemented as the
+`as4ts/receive` entry point.
 
 ## Status
 
-**Planned, not implemented.** No `receive*` value or type is exported today, and
-`test/package-surface.test.ts` fails if one appears before it is designed. The
-shared building blocks (`xml/`, `pki/`, `crypto/`, the profile) and the
-certificate purpose `message-signer` exist already; the two-step public shape
-below is the plan.
+**Implemented.** `as4ts/receive` exports `openAs4Message`, `respondAs4Message`,
+`keyHolderFromKey`, `ebmsErrorFor`, `notServicedError` and `defaultInboundLimits`.
+No `receive*` value or type is exported, so a future `receiveAs4` convenience can
+still be added without a breaking rename. The shared building blocks (`xml/`,
+`pki/`, `crypto/`, the profile) and the certificate purpose `message-signer` are
+reused unchanged; the receiving tree never imports a sender-only module.
+
+Open interoperability questions (the exact required signature coverage for an
+empty SOAP Body, and the sender fixtures that freeze it) are tracked in
+[receiving-coverage.md](receiving-coverage.md).
 
 ## Principle
 
@@ -59,7 +63,18 @@ Called by the caller **after** it has durably stored the document. It builds:
 **Why two steps.** A receipt is a legal acknowledgement. Creating it inside
 `open` would either force the package to store the document (it must not) or
 risk acknowledging a document that is then lost before it is stored. Splitting
-the call makes "store, then acknowledge" the only possible order.
+the call makes "store, then acknowledge" the natural order — but it cannot prove
+that the caller stored anything. **The caller carries the obligation**: it must
+have durably accepted the document (and its evidence) before it asks `respond`
+for a positive receipt, and it must persist the exact response bytes before
+writing them. `respondAs4Message` requires an explicit
+`decision: 'committed' | 'already-committed'` to make that assertion, and
+validates the persisted context, but the assertion itself is the caller's.
+
+[`examples/receive-inbox.ts`](../examples/receive-inbox.ts) shows a concrete
+durable inbox: commit payload, evidence and receipt context, then respond,
+persist the response bytes, write the HTTP response, and replay or regenerate the
+receipt on a duplicate. Run it with `npm run examples:receive`.
 
 ## Left to the caller
 
