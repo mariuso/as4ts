@@ -18,7 +18,27 @@ ES modules and requires Node.js 22 or later.
 
 ## Install
 
-Build a package from the repository:
+Install a published release directly from its GitHub asset, pinned by URL and
+hash:
+
+```bash
+# The receiving entry point ships in the 0.2.0-rc.1 pre-release; the latest
+# stable release, 0.1.0, is the sender-only surface.
+VERSION=0.2.0-rc.1
+curl -fsSL -o "as4ts-$VERSION.tgz" \
+  "https://github.com/mariuso/as4ts/releases/download/v$VERSION/as4ts-$VERSION.tgz"
+shasum -a 256 "as4ts-$VERSION.tgz"
+# expect 5a909ea9b5ed329569bdaddaf07d8f3bc1038f44d18cf03adc4f08ba876e0e21
+npm install "./as4ts-$VERSION.tgz"
+```
+
+Each release note records the commit it was built from and the asset's sha256.
+Releases are immutable — a fix is a new version, never a replaced asset — so pin
+the URL and the hash in your lockfile. New releases are listed on the
+[releases page](https://github.com/mariuso/as4ts/releases); once the package is on
+npm, install the plain version instead.
+
+To build from source instead:
 
 ```bash
 git clone https://github.com/mariuso/as4ts.git
@@ -26,11 +46,11 @@ cd as4ts
 npm ci
 npm run build
 npm pack
+npm install /path/to/as4ts-<version>.tgz
 ```
 
-Install the generated `as4ts-<version>.tgz` in your application with
-`npm install /path/to/as4ts-<version>.tgz`. Building first is required: the package
-exports compiled JavaScript and declarations from `dist/`.
+Building is required for the source path: the package exports compiled JavaScript
+and declarations from `dist/`.
 
 To try a local send with generated test certificates and a local HTTPS receiver:
 
@@ -165,7 +185,9 @@ verification and the TLS 1.2 minimum remain enabled for every transmission.
 
 The public types document the full [send input and results](src/types.ts),
 [receive input and results](src/receive/types.ts), and
-[lookup input and results](src/lookup/types.ts).
+[lookup input and results](src/lookup/types.ts). The two-step receiving flow
+(`openAs4Message` / `respondAs4Message`) is documented in
+[Receiving API](docs/receiving-api.md).
 
 ### Send results
 

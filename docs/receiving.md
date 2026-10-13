@@ -1,7 +1,8 @@
 # Receiving AS4: design note
 
 This note records how receiving fits the package. It is now implemented as the
-`as4ts/receive` entry point.
+`as4ts/receive` entry point. For the API surface and usage, see
+[receiving-api.md](receiving-api.md).
 
 ## Status
 
