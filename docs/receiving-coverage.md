@@ -33,9 +33,16 @@ The receiver requires, for a `UserMessage`:
    AS4 §5.1.4. Unexpected business content in the Body is rejected (Peppol
    carries the document as an attachment, not in the Body).
 
-This is the strict reading: it accepts the union of both §5.1.4 and §5.1.5, so a
-conformant sender under either section is accepted, and a message whose Body is
-tampered with is rejected. There is no option to disable coverage checking.
+This is stricter than §5.1.5 read on its own. §5.1.4 (SOAP messages) signs the
+Body; §5.1.5 (SOAP with Attachments) signs `eb:Messaging` and the attachments and
+does not by itself require a Body reference. Requiring Messaging + Body +
+attachments therefore accepts §5.1.4 senders and SwA senders that _also_ sign the
+Body, but it **rejects** an SwA sender that omits the Body reference. It is not
+true that combining the two sections accepts a conformant sender under either
+one: the union of the signing rules is not the intersection of the acceptance
+conditions. Whether the senders Peppol actually deploys sign the empty Body is
+exactly the interoperability question the captures must answer, and it is not
+settled on paper. There is no option to disable coverage checking.
 
 ## Attachment-digest rule
 
@@ -49,6 +56,9 @@ decompression), while an XML attachment is canonicalised first. See
 
 Before this policy is frozen, the fixtures from two independent senders must
 confirm: (a) both emit a signed empty Body, and (b) each attachment reference's
-declared transform and digest match what the receiver computes. If a sender signs
+declared transform and digest match what the receiver computes. Capture behaviour
+is interoperability evidence about deployed senders, not authority to relax a
+specification requirement: a sender that omits the Body reference is reported as
+a mismatch to resolve, not a licence to drop the Body rule. If a sender signs
 under §5.1.5 without a Body reference, the Body requirement in step 3 must be
 revisited with that evidence — not silently relaxed.

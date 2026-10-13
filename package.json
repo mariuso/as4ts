@@ -55,6 +55,7 @@
     "examples:receive": "node --import tsx examples/receive-inbox.ts",
     "examples:record-smp": "node --import tsx examples/record-smp.ts",
     "selftest": "node --import tsx examples/local-selftest.ts",
+    "validate:receive": "node --import tsx test/validate-receive.ts",
     "make-invoice": "node --import tsx examples/make-bis-invoice.ts",
     "trust:update": "node --import tsx examples/update-trust.ts"
   },
