@@ -61,6 +61,7 @@ export type InboundFailureReason =
   // xml
   | 'xml.malformed'
   | 'xml.doctype'
+  | 'xml.too-large'
   | 'xml.too-deep'
   | 'xml.too-many-nodes'
   // signature
@@ -74,6 +75,7 @@ export type InboundFailureReason =
   | 'certificate.revoked'
   | 'certificate.unavailable'
   // decrypt
+  | 'encryption.invalid'
   | 'decrypt.unsupported-algorithm'
   | 'decrypt.key-unwrap'
   | 'decrypt.bad-key-length'
@@ -88,6 +90,7 @@ export type InboundFailureReason =
   | 'addressing.sbdh-mismatch'
   // local
   | 'payload.spool-failed'
+  | 'payload.too-large'
   | 'internal.error';
 
 /**
@@ -124,8 +127,17 @@ export interface InboundLimits {
   readonly maxParts: number;
   readonly maxHeaderBytes: number;
   readonly maxPartBytes: number;
+  /** Cap on the decrypted, pre-decompression representation (the compressed bytes for gzip). */
+  readonly maxRepresentationBytes: number;
+  /** Absolute cap on decompressed output for a single attachment. */
   readonly maxDecompressedBytes: number;
+  /** Aggregate decompressed output across every attachment in one message. */
+  readonly maxAggregateOutputBytes: number;
+  /** Cap on XML bytes handed to the DOM parser. */
+  readonly maxXmlBytes: number;
   readonly maxBoundaryLength: number;
+  /** Maximum number of decryption credentials tried during rollover. */
+  readonly maxKeyCandidates: number;
 }
 
 export const defaultInboundLimits: InboundLimits = {
@@ -134,8 +146,12 @@ export const defaultInboundLimits: InboundLimits = {
   maxParts: 8,
   maxHeaderBytes: 16 * 1024,
   maxPartBytes: 64 * 1024 * 1024,
+  maxRepresentationBytes: 64 * 1024 * 1024,
   maxDecompressedBytes: 256 * 1024 * 1024,
+  maxAggregateOutputBytes: 512 * 1024 * 1024,
+  maxXmlBytes: 64 * 1024 * 1024,
   maxBoundaryLength: 70,
+  maxKeyCandidates: 4,
 };
 
 /** Observation hook for inbound phases. Observe only; never receives secrets. */
@@ -298,3 +314,107 @@ export interface RespondSuccess {
 }
 
 export type RespondResult = RespondSuccess | { readonly ok: false; readonly reason: string };
+
+// ---------------------------------------------------------------------------
+// Phase 2: receiving primitives
+// ---------------------------------------------------------------------------
+
+/**
+ * The encryption-graph facts recovered from the Security header. This is a
+ * structural descriptor only — parsing it performs no private-key operation. It
+ * is validated by `parseInboundEncryption` before any credential is used.
+ */
+export interface InboundEncryption {
+  /** The AES-128-GCM data-encryption algorithm URI, validated. */
+  readonly dataAlgorithm: string;
+  /** `EncryptedData/@MimeType` — the *original* attachment media type (SwA §5.5.3). */
+  readonly mediaType: string;
+  /** `EncryptedData/@Type`, validated to be attachment-content-only. */
+  readonly dataType: string;
+  /** The single ciphertext transform URI, validated. */
+  readonly ciphertextTransform: string;
+  /** The attachment href from `CipherReference`, e.g. `cid:...@host`. */
+  readonly attachmentHref: string;
+  /** RSA-OAEP wrapped session key bytes. */
+  readonly wrappedKey: Uint8Array;
+  /** The OAEP parameters the sender declared (all required and validated). */
+  readonly oaep: {
+    readonly digest: string;
+    readonly mgf: string;
+    /** OAEP label; the constrained profile allows only the empty label. */
+    readonly label: Uint8Array;
+  };
+  /** The certificate the sender encrypted to, when the EncryptedKey names one. */
+  readonly recipientCertificate?: string;
+}
+
+/** The ciphertext attachment resolved from the MIME parts by `cid:` href. */
+export interface ResolvedAttachment {
+  /** Content-ID without angle brackets. */
+  readonly contentId: string;
+  readonly byteLength: number;
+  readonly bytes: Uint8Array;
+}
+
+/** The compression declared for the payload, from validated metadata. */
+export type CompressionDeclaration = { readonly kind: 'gzip'; readonly declaredBy: string } | { readonly kind: 'none' };
+
+/**
+ * The authenticated representation of the attachment — the original decrypted
+ * bytes before decompression. For gzip that is the original compressed stream;
+ * for uncompressed XML it is the original XML bytes. Recompression cannot
+ * reconstruct the signed evidence, so this is retained verbatim.
+ */
+export interface RepresentationHandle {
+  readonly byteLength: number;
+  /** Raw-byte base64 SHA-256 of the representation. */
+  readonly rawDigestBase64: string;
+  /** The original media type restored from `EncryptedData/@MimeType`. */
+  readonly mediaType: string;
+  /** The transform digest verified against the authenticated reference. */
+  readonly transformDigestBase64: string;
+  /** Read the representation (repeatable until disposed). */
+  read(): Readable;
+  dispose(): Promise<void>;
+}
+
+/** The credential facts reported only after successful authentication. */
+export interface CredentialFacts {
+  /** AP certificate of the credential that unwrapped the session key. */
+  readonly certificate: string;
+}
+
+/**
+ * The result of recovering one inbound payload. `dispose()` is idempotent and
+ * releases everything, including active readers.
+ */
+export interface InboundBundle {
+  readonly payload: PayloadHandle;
+  readonly representation: RepresentationHandle;
+  readonly credential: CredentialFacts;
+  dispose(): Promise<void>;
+}
+
+/** Everything `recoverInboundPayload` needs. Trust is established by Phase 3. */
+export interface RecoverInboundPayloadInput {
+  /** Structurally validated encryption descriptor. */
+  readonly encryption: InboundEncryption;
+  /** The ciphertext attachment resolved from the MIME parts. */
+  readonly attachment: ResolvedAttachment;
+  /**
+   * The attachment reference the sender's XML signature authenticated: URI,
+   * digest algorithm, digest, ordered transforms and parameters. Phase 2 checks
+   * the decrypted bytes against it.
+   */
+  readonly reference: VerifiedReference;
+  /** The validated compression declaration. */
+  readonly compression: CompressionDeclaration;
+  /** Candidate decryption credentials, tried in order (rollover). */
+  readonly keyHolder: readonly InboundKeyHolder[];
+  readonly limits: InboundLimits;
+  readonly spoolDirectory?: string;
+  readonly signal?: AbortSignal;
+  readonly onEvent?: OnInboundEvent;
+}
+
+export type RecoverResult = InboundBundle | InboundFailure;
