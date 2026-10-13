@@ -206,7 +206,7 @@ export function selectSoapPart(parsed: ParsedMultipart): MimePart {
   return candidates[0]!;
 }
 
-function parseHeaderBlock(block: Buffer): Record<string, string> {
+export function parseHeaderBlock(block: Buffer): Record<string, string> {
   const headers: Record<string, string> = Object.create(null) as Record<string, string>;
   let current: string | null = null;
   for (const line of block.toString('latin1').split('\r\n')) {
@@ -226,7 +226,7 @@ function parseHeaderBlock(block: Buffer): Record<string, string> {
   return headers;
 }
 
-function normalizeContentId(value: string | undefined): string | null {
+export function normalizeContentId(value: string | undefined): string | null {
   if (!value) return null;
   const trimmed = value.trim();
   return trimmed.startsWith('<') && trimmed.endsWith('>') ? trimmed.slice(1, -1) : trimmed;
