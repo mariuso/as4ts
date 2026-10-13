@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
@@ -615,5 +615,62 @@ test('a writer failure with no pending write interrupts the parser', async () =>
     assert.ok(stream.wasReturned(), 'the source was signalled for cleanup');
   } finally {
     delete multipartHooks.createSpoolWriter;
+  }
+});
+
+test('a delayed successful close delays parser success', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'as4-mp-'));
+  let writerClosed = false;
+  multipartHooks.createSpoolWriter = (path) => {
+    const writer = new Writable({
+      write(chunk, _encoding, callback) {
+        appendFileSync(path, chunk);
+        callback();
+      },
+      // 'finish' fires immediately; actual filesystem closure is delayed.
+      destroy(error, callback) {
+        setTimeout(() => callback(error ?? null), 50);
+      },
+    });
+    writer.on('close', () => {
+      writerClosed = true;
+    });
+    return writer;
+  };
+  try {
+    const message = await parse(
+      multipart([soapPart(), attachment(Buffer.from('payload'))]),
+      {},
+      { spoolDirectory: dir },
+    );
+    await message.dispose();
+    assert.equal(writerClosed, true, 'the parser waits for actual writer closure before succeeding');
+  } finally {
+    delete multipartHooks.createSpoolWriter;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a delayed failing close rejects parsing and cleans up', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'as4-mp-'));
+  multipartHooks.createSpoolWriter = (path) =>
+    new Writable({
+      write(chunk, _encoding, callback) {
+        appendFileSync(path, chunk);
+        callback();
+      },
+      destroy(_error, callback) {
+        setTimeout(() => callback(new Error('late filesystem close failure')), 50);
+      },
+    });
+  try {
+    await assert.rejects(
+      parse(multipart([soapPart(), attachment(Buffer.from('payload'))]), {}, { spoolDirectory: dir }),
+      (err) => err instanceof Error && /late filesystem close failure/.test(err.message),
+    );
+    assert.deepEqual(readdirSync(dir), [], 'the spool is removed after a close failure');
+  } finally {
+    delete multipartHooks.createSpoolWriter;
+    rmSync(dir, { recursive: true, force: true });
   }
 });

@@ -150,9 +150,29 @@ function openSpool(path: string, onFailure: (err: Error) => void): SpoolWriter {
       });
     },
     close(): Promise<void> {
-      if (failure) return Promise.reject(failure);
+      if (closed) return failure ? Promise.reject(failure) : Promise.resolve();
       return new Promise<void>((resolve, reject) => {
-        stream.end((err?: Error | null) => (err ? reject(err) : resolve()));
+        let settled = false;
+        const finish = (err: Error | null): void => {
+          if (settled) return;
+          settled = true;
+          stream.off('error', onError);
+          stream.off('close', onClose);
+          if (err) reject(err);
+          else resolve();
+        };
+        const onError = (err: Error): void => finish(err);
+        const onClose = (): void => {
+          closed = true;
+          finish(failure);
+        };
+        stream.on('error', onError);
+        stream.once('close', onClose);
+        try {
+          stream.end();
+        } catch (err) {
+          finish(err instanceof Error ? err : new Error(String(err)));
+        }
       });
     },
     destroy(): Promise<void> {
