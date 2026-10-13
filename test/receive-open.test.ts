@@ -5,14 +5,22 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
-import { PEPPOL_PARTY_ID_TYPE, DS_NS, ALGO_SHA256, SWA_TRANSFORM_SIGNATURE } from '../src/constants.js';
+import {
+  PEPPOL_PARTY_ID_TYPE,
+  DS_NS,
+  ALGO_SHA256,
+  SWA_TRANSFORM_SIGNATURE,
+  EBMS_NS,
+  WSU_NS,
+} from '../src/constants.js';
 import { signerFromKey } from '../src/index.js';
 import { defaultEntropy, prepareAs4Internal } from '../src/internal.js';
 import { buildMultipartBody } from '../src/multipart.js';
 import { openAs4Message } from '../src/receive/open.js';
 import { payloadHooks } from '../src/receive/payload-hooks.js';
+import { canonicalizeDigest } from '../src/xml/c14n.js';
 import { signSignedInfo } from '../src/xml/security.js';
-import { append, element, firstByLocalName, parseXml, serializeXml } from '../src/xml/nodes.js';
+import { append, element, elementsByLocalName, firstByLocalName, parseXml, serializeXml } from '../src/xml/nodes.js';
 import type { InboundKeyHolder, OpenAs4MessageInput } from '../src/receive/types.js';
 import { createTestPki } from './helpers/pki.js';
 import { testValidator } from './helpers/input.js';
@@ -267,6 +275,35 @@ function renameRoot(xml: string): string {
   return xml.replace('<env:Envelope', '<env:NotEnvelope').replace('</env:Envelope>', '</env:NotEnvelope>');
 }
 
+/**
+ * Duplicate the eb:UserMessage, then re-sign: the Messaging reference digest and
+ * the SignedInfo/SignatureValue are recomputed, so the mutation reaches the
+ * header-cardinality check instead of failing at the signature.
+ */
+async function duplicateUserMessage(xml: string): Promise<string> {
+  const doc = parseXml(xml);
+  const messaging = firstByLocalName(doc, EBMS_NS, 'Messaging');
+  const userMessage = firstByLocalName(doc, EBMS_NS, 'UserMessage');
+  const signedInfo = firstByLocalName(doc, DS_NS, 'SignedInfo');
+  const signatureValue = firstByLocalName(doc, DS_NS, 'SignatureValue');
+  assert.ok(messaging && userMessage && signedInfo && signatureValue, 'the fixture has a signed Messaging');
+  if (!messaging || !userMessage || !signedInfo || !signatureValue) throw new Error('unreachable');
+  append(messaging, userMessage.cloneNode(true));
+  const messagingId = messaging.getAttributeNS(WSU_NS, 'Id');
+  const digest = canonicalizeDigest(messaging);
+  for (const reference of elementsByLocalName(signedInfo, DS_NS, 'Reference')) {
+    if (reference.getAttribute('URI') !== `#${messagingId}`) continue;
+    const digestValue = firstByLocalName(reference, DS_NS, 'DigestValue');
+    if (!digestValue) continue;
+    while (digestValue.firstChild) digestValue.removeChild(digestValue.firstChild);
+    digestValue.appendChild(doc.createTextNode(digest));
+  }
+  const value = await signSignedInfo(signedInfo, signerFromKey(pki.sender.keyObject, pki.sender.certPem));
+  while (signatureValue.firstChild) signatureValue.removeChild(signatureValue.firstChild);
+  signatureValue.appendChild(doc.createTextNode(value));
+  return serializeXml(doc);
+}
+
 test('rejects a document whose root is not a SOAP envelope', async () => {
   await withRequest(
     sbdhDocument(SENDER.value),
@@ -307,6 +344,21 @@ test('rejects wsse:Security placed outside the SOAP Header', async () => {
       assert.ok(match, 'the fixture has a wsse:Security element');
       return xml.replace(match[0], '').replace('</env:Envelope>', `${match[0]}</env:Envelope>`);
     },
+  );
+});
+
+test('rejects a duplicated UserMessage (re-signed end to end)', async () => {
+  await withRequest(
+    sbdhDocument(SENDER.value),
+    async (request) => {
+      const result = await openAs4Message(openInput(request));
+      assert.equal(result.ok, false);
+      if (!result.ok) {
+        assert.equal(result.stage, 'addressing');
+        assert.equal(result.reason, 'addressing.unsupported');
+      }
+    },
+    duplicateUserMessage,
   );
 });
 
