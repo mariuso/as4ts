@@ -259,6 +259,17 @@ function supportedTransformAlgorithm(uri: string): string {
 }
 
 /**
+ * A reference is either an in-envelope `#<fragment>` or an attachment
+ * `cid:<identifier>`. Anything else — an external URL, arbitrary text, or a
+ * `#`/`cid:` with no value — is not a reference this profile can acknowledge.
+ */
+function isSupportedReference(uri: string): boolean {
+  if (uri.startsWith('#')) return uri.length > 1;
+  if (uri.startsWith('cid:')) return uri.length > 'cid:'.length;
+  return false;
+}
+
+/**
  * Reject an unusable persisted receipt context before any signing: a receipt is
  * only produced for a non-empty, unique set of references whose semantics the
  * profile supports — SHA-256 over exclusive C14N for SOAP parts, the SwA content
@@ -277,6 +288,9 @@ function validateReceipt(receipt: ReceiptContext): RespondFailure | null {
   for (const reference of references) {
     if (!reference || typeof reference.uri !== 'string' || reference.uri.length === 0) {
       return refuse('respond.invalid-receipt', 'a reference has no URI');
+    }
+    if (!isSupportedReference(reference.uri)) {
+      return refuse('respond.invalid-receipt', `reference ${reference.uri} is not a supported reference URI`);
     }
     if (typeof reference.digest !== 'string' || !isSha256Base64(reference.digest)) {
       return refuse('respond.invalid-receipt', `reference ${reference.uri} has a malformed digest`);
