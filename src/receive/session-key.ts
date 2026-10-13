@@ -69,20 +69,43 @@ function fingerprint(pem: string): string | null {
   }
 }
 
-/** Resolve or reject as soon as `signal` aborts; a later result is ignored. */
-function raceWithSignal<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+/**
+ * Resolve or reject as soon as `signal` aborts. Fulfilment/rejection handlers are
+ * always attached, so a provider rejection is never left unhandled even when the
+ * signal is already aborted, and a result that arrives after cancellation is
+ * passed to `onAbandon` for disposal instead of being dropped.
+ */
+function raceWithSignal<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+  onAbandon: (value: T) => void,
+): Promise<T> {
   if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(abortError());
+  let settled = false;
   return new Promise<T>((resolve, reject) => {
-    const onAbort = (): void => reject(abortError());
-    signal.addEventListener('abort', onAbort, { once: true });
+    const onAbort = (): void => {
+      if (settled) return;
+      settled = true;
+      reject(abortError());
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+
     promise.then(
       (value) => {
         signal.removeEventListener('abort', onAbort);
+        if (settled) {
+          // Cancellation already won: dispose the abandoned result.
+          onAbandon(value);
+          return;
+        }
+        settled = true;
         resolve(value);
       },
       (err) => {
         signal.removeEventListener('abort', onAbort);
+        if (settled) return; // already rejected through cancellation
+        settled = true;
         reject(err);
       },
     );
@@ -111,7 +134,7 @@ export async function unwrapSessionKey(input: UnwrapSessionKeyInput): Promise<Un
     if (input.signal?.aborted) throw new SessionKeyFault('aborted', 'aborted before unwrapping the session key');
     let key: Uint8Array;
     try {
-      key = await raceWithSignal(holder.unwrap(input.wrappedKey, input.signal), input.signal);
+      key = await raceWithSignal(holder.unwrap(input.wrappedKey, input.signal), input.signal, (late) => late.fill(0));
     } catch (err) {
       if (isAbortError(err)) throw new SessionKeyFault('aborted', 'aborted while unwrapping the session key');
       if (isUnavailable(err)) providerUnavailable = true;

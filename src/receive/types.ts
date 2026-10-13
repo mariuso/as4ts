@@ -24,8 +24,13 @@ export interface InboundKeyHolder {
   /** The holder's AP certificate (PEM), used for evidence and identity binding. */
   readonly certificate: string;
   /**
-   * Unwrap the RSA-OAEP(SHA-256, MGF1-SHA-256) encrypted session key. Must
-   * return a valid AES-128 key (16 bytes) or reject; must honour `signal`.
+   * Unwrap the RSA-OAEP(SHA-256, MGF1-SHA-256) encrypted session key. Must return
+   * a valid AES-128 key (16 bytes) or reject; must honour `signal`. A holder that
+   * cannot serve the request should reject with an error carrying
+   * `code === 'KEY_UNAVAILABLE'`.
+   *
+   * Ownership of the returned buffer transfers to the caller, which clears it.
+   * A holder must return a fresh buffer and must not retain or reuse it.
    */
   unwrap(wrappedKey: Uint8Array, signal?: AbortSignal): Promise<Uint8Array>;
 }

@@ -19,10 +19,23 @@ test('a refused reservation records nothing', () => {
   assert.equal(budget.remaining(), 10);
 });
 
-test('rejects non-finite and negative reservations', () => {
+test('rejects an invalid maximum', () => {
+  assert.throws(() => new MessageBudget(Number.NaN), RangeError);
+  assert.throws(() => new MessageBudget(Number.POSITIVE_INFINITY), RangeError);
+  assert.throws(() => new MessageBudget(-1), RangeError);
+  assert.throws(() => new MessageBudget(1.5), RangeError);
+});
+
+test('rejects an invalid reservation', () => {
   const budget = new MessageBudget(10);
-  assert.equal(budget.reserve(Number.NaN), false);
-  assert.equal(budget.reserve(Number.POSITIVE_INFINITY), false);
-  assert.equal(budget.reserve(-1), false);
+  assert.throws(() => budget.reserve(Number.NaN), RangeError);
+  assert.throws(() => budget.reserve(Number.POSITIVE_INFINITY), RangeError);
+  assert.throws(() => budget.reserve(-1), RangeError);
   assert.equal(budget.remaining(), 10);
+});
+
+test('zero is a valid, already-exhausted budget', () => {
+  const budget = new MessageBudget(0);
+  assert.equal(budget.remaining(), 0);
+  assert.equal(budget.reserve(1), false);
 });

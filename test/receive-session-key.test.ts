@@ -124,7 +124,7 @@ test('bounds the number of credentials tried', async () => {
   assert.equal(calls, 2, 'a candidate beyond the bound is never tried');
 });
 
-test('cancels a stalled provider and discards a late result', async () => {
+test('cancels a stalled provider and clears the abandoned result', async () => {
   const controller = new AbortController();
   let release: (key: Uint8Array) => void = () => {};
   const stalled: InboundKeyHolder = {
@@ -148,8 +148,45 @@ test('cancels a stalled provider and discards a late result', async () => {
   await assert.rejects(pending, reason('aborted'));
   assert.equal(await settled, 'rejected');
 
-  // The late result must not turn the operation into a success.
-  release(Buffer.alloc(16, 5));
+  // The late result must not turn the operation into a success, and the key it
+  // handed back must be cleared.
+  const late = Buffer.alloc(16, 5);
+  release(late);
   await delay(10);
   assert.equal(await settled, 'rejected');
+  assert.ok(
+    late.every((byte) => byte === 0),
+    'the abandoned session key is cleared',
+  );
+});
+
+test('attaches handlers when the provider aborts synchronously', async () => {
+  const controller = new AbortController();
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => {
+    unhandled.push(reason);
+  };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const bad: InboundKeyHolder = {
+      certificate: 'x',
+      unwrap: () => {
+        controller.abort();
+        return Promise.reject(new Error('provider failed'));
+      },
+    };
+    await assert.rejects(
+      unwrapSessionKey({
+        wrappedKey: new Uint8Array([1]),
+        holders: [bad],
+        maxCandidates: 4,
+        signal: controller.signal,
+      }),
+      reason('aborted'),
+    );
+    await delay(20);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.removeListener('unhandledRejection', onUnhandled);
+  }
 });
