@@ -6,6 +6,50 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0-rc.1] - 2026-10-13
+
+A release candidate for the inbound receiving side. The signature-coverage policy
+is selected but **not yet frozen** — it awaits captured wire bytes from independent
+senders — and peer interoperability and the Peppol Testbed are not yet complete.
+See [`docs/receiving-coverage.md`](docs/receiving-coverage.md) and
+[`docs/receiving-fixtures.md`](docs/receiving-fixtures.md).
+
+### Added
+
+- **Inbound receiving: `openAs4Message` and `respondAs4Message`.** `openAs4Message`
+  verifies and unpacks one inbound `UserMessage` — bounded MIME parsing, strict
+  XML, WS-Security signature and coverage (`eb:Messaging`, the SOAP Body and every
+  attachment), signer validation with purpose `message-signer`, session-key unwrap
+  with rollover, ciphertext-only quarantine with a two-pass recovery,
+  decompression and payload recovery — and returns verified facts, owned
+  disposable handles and a serialisable receipt context. `respondAs4Message`
+  returns the exact signed receipt or ebMS error bytes once the caller has durably
+  accepted the document. Expected failures are values with a stage, a reason and
+  whether a correlated error is answerable.
+- **`as4ts/receive` entry point** (`openAs4Message`, `respondAs4Message`,
+  `keyHolderFromKey`, `ebmsErrorFor`, `notServicedError`, `defaultInboundLimits`) —
+  a fifth package entry point.
+- **Durable-inbox example** (`npm run examples:receive`) demonstrating
+  commit-before-acknowledge, per-message serialisation, atomic fsynced publication,
+  duplicate suppression and lost-response recovery.
+- **Inbound capture harness and Phase 6 validation gate** (`npm run validate:receive`),
+  which requires successful, receipt-accepted captures from two distinct sender
+  implementations.
+
+### Changed
+
+- **Shared ebMS error definitions.** Direction-neutral error metadata (code, name,
+  severity, category) moved out of the sender classification layer; receiving maps
+  each failure reason deliberately and keeps local diagnostics off the wire.
+- **`verifyReceipt` compares full reference semantics.** Receipt acknowledgements
+  are compared against the supplied digest method, ordered transforms and
+  inclusive-prefix parameters, not only URI/digest pairs, so a peer that used
+  supported canonicalisation parameters is accepted. The fixed expectations for
+  the sender's own URI/digest-only references are unchanged.
+- **Five package entry points** (adds `./receive`).
+
+## [0.1.0] - 2026-10-13
+
 ### Changed
 
 - **Publishing metadata.** The README installs from the GitHub repository
