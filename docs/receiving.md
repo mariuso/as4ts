@@ -80,7 +80,11 @@ so a receipt is only issued once the accepted bytes are durable. A directory-syn
 failure propagates: the example refuses to acknowledge rather than claim a
 durability it did not establish, and an explicit `{ directorySync: 'none' }`
 constructor option selects a documented weaker mode for filesystems that cannot
-fsync a directory. On restart the index is rebuilt only from canonical published
+fsync a directory. A published response is replayed only after a separate
+confirmation marker has been synced, so a response whose directory sync failed is
+regenerated rather than replayed; and a record directory that was published but
+whose parent sync failed is reconciled (validated and re-synced) on the next
+attempt instead of being overwritten. On restart the index is rebuilt only from canonical published
 directories whose name matches the hash of their record's MessageId, so an
 interrupted staging directory is never mistaken for a committed record. The
 in-process per-id lock is illustrative: a production store must additionally
