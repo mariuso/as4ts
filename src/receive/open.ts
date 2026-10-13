@@ -189,6 +189,9 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
         // The envelope budget is passed explicitly; the parser must not fall back
         // to maxPartBytes for the SOAP part.
         maxEnvelopeBytes: limits.maxEnvelopeBytes,
+        // The caller's spool root is used for the parser's private spool directory
+        // as well, so the transfer shares a filesystem with recovery's workspace.
+        ...(input.spoolDirectory ? { spoolDirectory: input.spoolDirectory } : {}),
         ...(abort ? { signal: abort } : {}),
       }),
     );

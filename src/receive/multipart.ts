@@ -201,7 +201,7 @@ export async function parseMultipartMessage(input: {
   /** Additional bound for the buffered SOAP envelope; defaults to `maxPartBytes`. */
   readonly maxEnvelopeBytes?: number;
   readonly signal?: AbortSignal;
-  /** Directory for owned spools; a fresh private directory is created when absent. */
+  /** Parent directory for the private spool directory; defaults to the OS temp directory. */
   readonly spoolDirectory?: string;
 }): Promise<ParsedMultipartMessage> {
   const { limits } = input;
@@ -221,8 +221,14 @@ export async function parseMultipartMessage(input: {
   };
   const signal = input.signal ? AbortSignal.any([input.signal, failureController.signal]) : failureController.signal;
 
-  const ownsDirectory = input.spoolDirectory === undefined;
-  const directory = input.spoolDirectory ?? (await mkdtemp(join(tmpdir(), 'as4-mime-')));
+  // Always create a private directory, so concurrent receives cannot collide.
+  // When the caller configures a spool root, create it there: the parser spool and
+  // the recovery workspace then share a filesystem, so the ciphertext transfer is
+  // a rename (no EXDEV, no copy), and the initial quarantine honours the caller's
+  // selected storage location.
+  const directory = input.spoolDirectory
+    ? await mkdtemp(join(input.spoolDirectory, 'as4-mime-'))
+    : await mkdtemp(join(tmpdir(), 'as4-mime-'));
   multipartHooks.onDirectory?.(directory);
   const ownedSpools = new Set<string>();
   const parts: MultipartPart[] = [];
@@ -322,7 +328,7 @@ export async function parseMultipartMessage(input: {
         // retain for a retry
       }
     }
-    if (ownsDirectory && ownedSpools.size === 0) {
+    if (ownedSpools.size === 0) {
       await rm(directory, { recursive: true, force: true }).catch(() => {});
     }
   };

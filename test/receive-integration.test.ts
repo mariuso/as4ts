@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { constants, privateDecrypt } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -224,4 +224,41 @@ test('parser disposal leaves the returned payload and representation handles usa
       await result.dispose();
     }
   });
+});
+
+test('the configured spool root is used by MIME parsing and recovery', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'as4-spoolroot-'));
+  try {
+    await withRequest(async (request) => {
+      const parserDirs: string[] = [];
+      const workspaces: string[] = [];
+      const transfers: Array<[string, string]> = [];
+      multipartHooks.onDirectory = (dir) => parserDirs.push(dir);
+      payloadHooks.onWorkspace = (dir) => workspaces.push(dir);
+      payloadHooks.onSpoolTransfer = (from, to) => {
+        transfers.push([from, to]);
+      };
+      try {
+        const result = await openAs4Message(openInput(request, { spoolDirectory: root }));
+        assert.equal(result.ok, true, JSON.stringify(result));
+        if (result.ok) await result.dispose();
+        assert.equal(parserDirs.length, 1, 'the parser created a spool directory');
+        assert.ok(parserDirs[0]!.startsWith(root), `parser dir ${parserDirs[0]} is under the configured root`);
+        assert.equal(workspaces.length, 1, 'recovery created a workspace');
+        assert.ok(workspaces[0]!.startsWith(root), `workspace ${workspaces[0]} is under the configured root`);
+        assert.equal(transfers.length, 1, 'one transfer happened');
+        assert.ok(
+          transfers[0]![0].startsWith(root) && transfers[0]![1].startsWith(root),
+          'the rename stays within the configured root (same filesystem)',
+        );
+        assert.deepEqual(readdirSync(root), [], 'the configured root is left clean');
+      } finally {
+        delete multipartHooks.onDirectory;
+        delete payloadHooks.onWorkspace;
+        delete payloadHooks.onSpoolTransfer;
+      }
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

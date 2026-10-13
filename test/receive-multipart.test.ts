@@ -482,9 +482,15 @@ test('ciphertext reaches its spool before the request finishes', async () => {
     const pending = parse(stream.body, {}, { spoolDirectory: dir });
     stream.push(full.subarray(0, split));
     await new Promise((resolve) => setTimeout(resolve, 20));
-    const files = readdirSync(dir);
-    assert.equal(files.length, 1, 'the attachment spool exists mid-request');
-    assert.ok(readFileSync(join(dir, files[0]!)).length > 0, 'bytes reached the spool before the request finished');
+    const files = readdirSync(dir, { withFileTypes: true });
+    const subdir = files.find((entry) => entry.isDirectory());
+    assert.ok(subdir, 'the parser created a private spool directory');
+    const spooled = readdirSync(join(dir, subdir!.name));
+    assert.equal(spooled.length, 1, 'the attachment spool exists mid-request');
+    assert.ok(
+      readFileSync(join(dir, subdir!.name, spooled[0]!)).length > 0,
+      'bytes reached the spool before the request finished',
+    );
     stream.push(full.subarray(split));
     stream.end();
     const message = await pending;
