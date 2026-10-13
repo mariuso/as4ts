@@ -120,3 +120,38 @@ test('documentTypeFromAction splits the eb:Action scheme and value', () => {
   assert.deepEqual(documentTypeFromAction(`${DOCUMENT.scheme}::${DOCUMENT.value}`), DOCUMENT);
   assert.equal(documentTypeFromAction('no-separator'), null);
 });
+
+/** The SBDH header with extra business content after it. */
+function withBody(extra: string): string {
+  return header().replace('</StandardBusinessDocument>', `${extra}</StandardBusinessDocument>`);
+}
+
+test('node exhaustion is a resource limit, not malformed XML', () => {
+  const manyNodes = withBody('<i>x</i>'.repeat(20));
+  assert.deepEqual(checkSbdh(Buffer.from(manyNodes, 'utf8'), { ...defaultXmlLimits, maxNodes: 10 }, expected), {
+    status: 'resource-limit',
+    reason: 'xml.too-many-nodes',
+  });
+  // The same document is consistent under a sufficient budget.
+  assert.deepEqual(checkSbdh(Buffer.from(manyNodes, 'utf8'), defaultXmlLimits, expected), { status: 'consistent' });
+});
+
+test('depth exhaustion is a resource limit, not malformed XML', () => {
+  const deep = withBody('<d>'.repeat(20) + '</d>'.repeat(20));
+  assert.deepEqual(checkSbdh(Buffer.from(deep, 'utf8'), { ...defaultXmlLimits, maxDepth: 8 }, expected), {
+    status: 'resource-limit',
+    reason: 'xml.too-deep',
+  });
+  assert.deepEqual(checkSbdh(Buffer.from(deep, 'utf8'), defaultXmlLimits, expected), { status: 'consistent' });
+});
+
+test('byte exhaustion is a resource limit, not malformed XML', () => {
+  assert.deepEqual(checkSbdh(Buffer.from(header(), 'utf8'), { ...defaultXmlLimits, maxBytes: 16 }, expected), {
+    status: 'resource-limit',
+    reason: 'xml.too-large',
+  });
+});
+
+test('malformed XML stays malformed, distinct from a resource limit', () => {
+  assert.equal(check('<a>').status, 'malformed');
+});

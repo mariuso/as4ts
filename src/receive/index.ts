@@ -48,6 +48,7 @@ export type {
   RespondResult,
   RespondSuccess,
   SbdhConsistency,
+  SbdhResourceLimit,
 } from './types.js';
 export type { Profile, ScopedId, Signer, ValidateCertificate } from '../types.js';
 export type { VerifiedReference, VerifiedTransform } from '../xml/ws-security.js';

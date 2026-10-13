@@ -43,6 +43,7 @@
     "dist"
   ],
   "scripts": {
+    "version": "node scripts/sync-version.mjs",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts",

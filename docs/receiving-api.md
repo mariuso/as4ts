@@ -83,7 +83,9 @@ idempotent. Call it on every path.
 (`maxDecompressedBytes`, `maxAggregateOutputBytes`), the XML handed to the DOM
 parser (`maxXmlBytes`), and the number of decryption credentials tried
 (`maxKeyCandidates`). Limits are applied before any trust decision and validated
-as facts.
+as facts. The full table, what is buffered versus streamed, and the current
+size-envelope limitations are in
+[receiving-limits.md](receiving-limits.md).
 
 ### Key holders and rollover
 

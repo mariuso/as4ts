@@ -282,15 +282,25 @@ export interface OpenSuccess {
 }
 
 /**
+ * Why the SBDH could not be inspected: a resource limit, not malformed content.
+ * The parser's own reason is preserved so byte, node and depth exhaustion stay
+ * distinguishable.
+ */
+export type SbdhResourceLimit = 'xml.too-large' | 'xml.too-many-nodes' | 'xml.too-deep';
+
+/**
  * The outcome of the SBDH consistency check. Consistency is reported as distinct
- * facts so a caller can tell "verified consistent" from "could not check".
+ * facts so a caller can tell "verified consistent" from "could not check":
+ * `missing` (no SBDH), `malformed` (not well formed) and `resource-limit` (the
+ * bounded inspection hit a byte, node or depth budget) are deliberately
+ * different — a resource limit is not a malformed business document.
  */
 export type SbdhConsistency =
   | { readonly status: 'consistent' }
   | { readonly status: 'inconsistent'; readonly mismatches: readonly string[] }
   | { readonly status: 'missing' }
   | { readonly status: 'malformed'; readonly detail: string }
-  | { readonly status: 'too-large' };
+  | { readonly status: 'resource-limit'; readonly reason: SbdhResourceLimit };
 
 export type OpenResult = OpenSuccess | InboundFailure;
 

@@ -18,6 +18,7 @@ import { defaultEntropy, prepareAs4Internal } from '../src/internal.js';
 import { buildMultipartBody } from '../src/multipart.js';
 import { openAs4Message } from '../src/receive/open.js';
 import { payloadHooks } from '../src/receive/payload-hooks.js';
+import { defaultInboundLimits } from '../src/receive/types.js';
 import { canonicalizeDigest } from '../src/xml/c14n.js';
 import { signSignedInfo } from '../src/xml/security.js';
 import { append, element, elementsByLocalName, firstByLocalName, parseXml, serializeXml } from '../src/xml/nodes.js';
@@ -195,6 +196,42 @@ test('reports a missing or malformed SBDH distinctly', async () => {
     assert.equal(result.ok, true);
     if (result.ok) {
       assert.equal(result.sbdh.status, 'malformed');
+      await result.dispose();
+    }
+  });
+});
+
+test('reports SBDH resource exhaustion as a resource limit, not malformed XML', async () => {
+  // A well-formed, SBDH-wrapped document with more nodes than the default
+  // inspection budget allows. The message is accepted; only the SBDH fact is a
+  // resource limit, and it must not be reported as a malformed business document.
+  const extra = '<i>x</i>'.repeat(60_000);
+  const document = Buffer.from(
+    sbdhDocument(SENDER.value)
+      .toString('utf8')
+      .replace('</StandardBusinessDocument>', `${extra}</StandardBusinessDocument>`),
+    'utf8',
+  );
+  await withRequest(document, async (request) => {
+    const result = await openAs4Message(openInput(request));
+    assert.equal(result.ok, true, JSON.stringify(result));
+    if (!result.ok) return;
+    try {
+      assert.deepEqual(result.sbdh, { status: 'resource-limit', reason: 'xml.too-many-nodes' });
+    } finally {
+      await result.dispose();
+    }
+  });
+});
+
+test('a bounded SBDH read overflows as a resource limit, not malformed XML', async () => {
+  await withRequest(sbdhDocument(SENDER.value), async (request) => {
+    const result = await openAs4Message(openInput(request, { limits: { ...defaultInboundLimits, maxXmlBytes: 16 } }));
+    assert.equal(result.ok, true, JSON.stringify(result));
+    if (!result.ok) return;
+    try {
+      assert.deepEqual(result.sbdh, { status: 'resource-limit', reason: 'xml.too-large' });
+    } finally {
       await result.dispose();
     }
   });

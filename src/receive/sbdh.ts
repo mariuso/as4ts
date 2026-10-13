@@ -116,7 +116,11 @@ export function checkSbdh(
     document = parseStrictXml(bytes, limits);
   } catch (err) {
     if (err instanceof XmlFault) {
-      if (err.reason === 'xml.too-large') return { status: 'too-large' };
+      // Byte, node and depth exhaustion are resource limits, not malformed XML.
+      // Preserve the reason so the caller can tell them apart.
+      if (err.reason === 'xml.too-large' || err.reason === 'xml.too-many-nodes' || err.reason === 'xml.too-deep') {
+        return { status: 'resource-limit', reason: err.reason };
+      }
       return { status: 'malformed', detail: err.message };
     }
     throw err;

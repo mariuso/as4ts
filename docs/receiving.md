@@ -2,7 +2,8 @@
 
 This note records how receiving fits the package. It is now implemented as the
 `as4ts/receive` entry point. For the API surface and usage, see
-[receiving-api.md](receiving-api.md).
+[receiving-api.md](receiving-api.md); for the size limits and what is streamed
+versus buffered, see [receiving-limits.md](receiving-limits.md).
 
 ## Status
 

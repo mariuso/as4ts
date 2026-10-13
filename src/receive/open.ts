@@ -297,7 +297,7 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
     try {
       const payload = await readPayload(recovered.payload, limits.maxXmlBytes, abort);
       sbdh = payload.tooLarge
-        ? { status: 'too-large' }
+        ? { status: 'resource-limit', reason: 'xml.too-large' }
         : checkSbdh(
             payload.bytes,
             { ...defaultXmlLimits, maxBytes: limits.maxXmlBytes },
