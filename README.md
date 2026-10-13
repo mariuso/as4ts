@@ -316,13 +316,29 @@ The API may change between minor versions before 1.0. See the
 
 ### Releases
 
-Releases are cut from a tag. Set `package.json` to the release version, commit,
-and push a matching `v<version>` tag; the
-[Release workflow](.github/workflows/release.yml) verifies the tag matches
-`package.json`, runs the checks, builds and packs (`npm run build && npm pack`),
-and attaches `as4ts-<version>.tgz` to the GitHub release. A tag containing `-`
-(for example `v0.2.0-rc.1`) is published as a pre-release. Release assets are
-immutable: a fix is a new version, never a replaced file.
+Releases are cut from a tag whose commit carries matching versions in
+`package.json`, `package-lock.json` and `src/version.ts`. The supported
+procedure:
+
+```bash
+# 1. Bump without letting npm commit or tag; the `version` lifecycle script
+#    rewrites src/version.ts from package.json.
+npm version <version> --no-git-tag-version
+
+# 2. Stage every version file, commit, and tag the tested commit.
+git add package.json package-lock.json src/version.ts
+git commit -m "release: <version>"
+git tag -a v<version> -m "as4ts v<version>"
+git push && git push origin v<version>
+```
+
+The [Release workflow](.github/workflows/release.yml) then verifies the tag
+matches `package.json`, runs the checks, builds and packs
+(`npm run build && npm pack`), and attaches `as4ts-<version>.tgz` to the GitHub
+release. A tag containing `-` (for example `v0.2.0-rc.1`) is published as a
+pre-release. Release assets are immutable: a fix is a new version, never a
+replaced file. `test/release-procedure.test.ts` exercises this procedure in a
+throwaway repository and asserts the versions inside the tag.
 
 Issues and pull requests are welcome. Add regression coverage for behavior
 changes and run the development checks before opening a PR. Report suspected
