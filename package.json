@@ -1,6 +1,6 @@
 {
   "name": "as4ts",
-  "version": "0.2.0-rc.1",
+  "version": "0.2.0-rc.2",
   "description": "Peppol AS4 messaging in TypeScript: one-shot AS4 sending plus optional SML/SMP participant lookup. Each call performs exactly one operation and reports facts.",
   "type": "module",
   "license": "Apache-2.0",
