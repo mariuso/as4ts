@@ -266,8 +266,18 @@ export interface OpenSuccess {
   /** The credential (AP certificate) that actually unwrapped the session key. */
   readonly credentialCertificate: string;
   readonly payload: PayloadHandle;
+  /** The authenticated compressed (or original) attachment representation. */
+  readonly representation: RepresentationHandle;
   readonly evidence: EvidenceHandle;
   readonly receipt: ReceiptContext;
+  /**
+   * Explicit SBDH/header inconsistencies found in the authenticated payload
+   * (empty when consistent or unreadable). Protocol consistency facts, not a
+   * business-document validation.
+   */
+  readonly sbdhMismatches?: readonly string[];
+  /** Release the payload, representation and evidence handles. Idempotent. */
+  dispose(): Promise<void>;
 }
 
 export type OpenResult = OpenSuccess | InboundFailure;
