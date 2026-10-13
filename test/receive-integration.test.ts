@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Readable } from 'node:stream';
+import { Readable, Writable } from 'node:stream';
 import { PEPPOL_PARTY_ID_TYPE } from '../src/constants.js';
 import { signerFromKey } from '../src/index.js';
 import { defaultEntropy, prepareAs4Internal } from '../src/internal.js';
@@ -261,4 +261,97 @@ test('the configured spool root is used by MIME parsing and recovery', async () 
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('a missing configured spool root is a storage failure', async () => {
+  await withRequest(async (request) => {
+    const missing = join(tmpdir(), `as4-missing-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const result = await openAs4Message(openInput(request, { spoolDirectory: missing }));
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.stage, 'payload');
+      assert.equal(result.reason, 'payload.spool-failed');
+      assert.equal(result.answerable, false);
+    }
+  });
+});
+
+test('spool open, write and delayed close failures are all payload.spool-failed', async () => {
+  await withRequest(async (request) => {
+    try {
+      // Open failure.
+      multipartHooks.createSpoolWriter = () => {
+        const writer = new Writable({
+          write(_chunk, _encoding, callback) {
+            callback();
+          },
+        });
+        process.nextTick(() => writer.destroy(Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })));
+        return writer;
+      };
+      const openFailure = await openAs4Message(openInput(request));
+      assert.equal(openFailure.ok, false);
+      if (!openFailure.ok) assert.equal(openFailure.reason, 'payload.spool-failed');
+
+      // Write failure.
+      multipartHooks.createSpoolWriter = () =>
+        new Writable({
+          write(_chunk, _encoding, callback) {
+            callback(Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }));
+          },
+        });
+      const writeFailure = await openAs4Message(openInput(request));
+      assert.equal(writeFailure.ok, false);
+      if (!writeFailure.ok) {
+        assert.equal(writeFailure.stage, 'payload');
+        assert.equal(writeFailure.reason, 'payload.spool-failed');
+      }
+
+      // Delayed close failure.
+      multipartHooks.createSpoolWriter = () =>
+        new Writable({
+          write(_chunk, _encoding, callback) {
+            callback();
+          },
+          destroy(_error, callback) {
+            setTimeout(() => callback(new Error('late filesystem close failure')), 20);
+          },
+        });
+      const closeFailure = await openAs4Message(openInput(request));
+      assert.equal(closeFailure.ok, false);
+      if (!closeFailure.ok) assert.equal(closeFailure.reason, 'payload.spool-failed');
+    } finally {
+      delete multipartHooks.createSpoolWriter;
+    }
+  });
+});
+
+test('a MIME storage failure leaves no residue, and cancellation stays aborted', async () => {
+  await withRequest(async (request) => {
+    const dirs: string[] = [];
+    multipartHooks.onDirectory = (dir) => dirs.push(dir);
+    multipartHooks.createSpoolWriter = () =>
+      new Writable({
+        write(_chunk, _encoding, callback) {
+          callback(new Error('ENOSPC: no space left on device'));
+        },
+      });
+    try {
+      const result = await openAs4Message(openInput(request));
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.reason, 'payload.spool-failed');
+      assert.equal(dirs.length, 1, 'the parser created a spool directory');
+      assert.equal(existsSync(dirs[0]!), false, 'the parser removed its spool directory');
+    } finally {
+      delete multipartHooks.onDirectory;
+      delete multipartHooks.createSpoolWriter;
+    }
+
+    // A caller cancellation of the incoming stream is not a storage failure.
+    const controller = new AbortController();
+    controller.abort();
+    const aborted = await openAs4Message(openInput(request, { signal: controller.signal }));
+    assert.equal(aborted.ok, false);
+    if (!aborted.ok) assert.equal(aborted.reason, 'aborted');
+  });
 });

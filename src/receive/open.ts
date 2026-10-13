@@ -5,7 +5,13 @@ import { commonNameOf, parseCertificate, safeMessage } from '../util.js';
 import { MessageBudget } from './budget.js';
 import { EncryptionFault, parseInboundEncryption } from './encryption.js';
 import { MimeFault } from './mime.js';
-import { parseMultipartMessage, selectSoapPart, type MultipartPart, type ParsedMultipartMessage } from './multipart.js';
+import {
+  MimeStorageFault,
+  parseMultipartMessage,
+  selectSoapPart,
+  type MultipartPart,
+  type ParsedMultipartMessage,
+} from './multipart.js';
 import { recoverInboundPayload } from './payload.js';
 import { payloadHooks } from './payload-hooks.js';
 import { checkSbdh, documentTypeFromAction } from './sbdh.js';
@@ -371,6 +377,7 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     if (err instanceof MimeFault) return fail('mime', err.reason, detail);
+    if (err instanceof MimeStorageFault) return fail('payload', 'payload.spool-failed', detail);
     if (err instanceof XmlFault) return fail('xml', err.reason, detail);
     if (err instanceof EncryptionFault) return fail('decrypt', err.reason, detail);
     if (err instanceof AddressingFault) return fail('addressing', err.reason, detail);

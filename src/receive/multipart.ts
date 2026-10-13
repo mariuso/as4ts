@@ -14,6 +14,7 @@ import {
 } from './mime.js';
 import { abortableAwait, abortableStream, isAbortError } from './streams.js';
 import type { InboundFailureReason } from './types.js';
+import { safeMessage } from '../util.js';
 
 /**
  * Incremental `multipart/related` parsing with owned spools (Phase 6).
@@ -45,6 +46,14 @@ export const multipartHooks: {
   onRetained?: (pendingBytes: number) => void;
   onDirectory?: (directory: string) => void;
 } = {};
+
+/** A local storage failure in the MIME spool: directory, file open, write or close. */
+export class MimeStorageFault extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'MimeStorageFault';
+  }
+}
 
 export interface MultipartPart {
   readonly headers: Readonly<Record<string, string>>;
@@ -112,18 +121,25 @@ function findLineStart(buffer: Buffer, marker: Buffer): number {
 /** A writer that records failure, emits no unhandled error, and closes on demand. */
 function openSpool(path: string, onFailure: (err: Error) => void): SpoolWriter {
   const stream = multipartHooks.createSpoolWriter?.(path) ?? createWriteStream(path, { mode: 0o600 });
-  let failure: Error | null = null;
+  let failure: MimeStorageFault | null = null;
   let closed = false;
-  let pendingReject: ((err: Error) => void) | null = null;
+  let pendingReject: ((err: MimeStorageFault) => void) | null = null;
+  // Every storage failure — open, write or close — becomes a MimeStorageFault, so
+  // the caller can classify it without guessing from an arbitrary error.
+  const recordFailure = (err: unknown): MimeStorageFault => {
+    const fault = err instanceof MimeStorageFault ? err : new MimeStorageFault(safeMessage(err));
+    failure ??= fault;
+    const reject = pendingReject;
+    pendingReject = null;
+    reject?.(failure);
+    onFailure(failure);
+    return failure;
+  };
   stream.on('close', () => {
     closed = true;
   });
   stream.on('error', (err: unknown) => {
-    failure ??= err instanceof Error ? err : new Error(String(err));
-    onFailure(failure);
-    const reject = pendingReject;
-    pendingReject = null;
-    reject?.(failure);
+    recordFailure(err);
   });
   return {
     path,
@@ -133,16 +149,16 @@ function openSpool(path: string, onFailure: (err: Error) => void): SpoolWriter {
       if (chunk.length === 0) return Promise.resolve();
       return new Promise<void>((resolve, reject) => {
         let settled = false;
-        const fail = (err: Error): void => {
+        const settleReject = (err: MimeStorageFault): void => {
           if (settled) return;
           settled = true;
           pendingReject = null;
           reject(err);
         };
-        pendingReject = fail;
+        pendingReject = settleReject;
         stream.write(chunk, (err) => {
           pendingReject = null;
-          if (err) fail(err);
+          if (err) settleReject(recordFailure(err));
           else if (!settled) {
             settled = true;
             resolve();
@@ -154,7 +170,7 @@ function openSpool(path: string, onFailure: (err: Error) => void): SpoolWriter {
       if (closed) return failure ? Promise.reject(failure) : Promise.resolve();
       return new Promise<void>((resolve, reject) => {
         let settled = false;
-        const finish = (err: Error | null): void => {
+        const finish = (err: MimeStorageFault | null): void => {
           if (settled) return;
           settled = true;
           stream.off('error', onError);
@@ -162,7 +178,7 @@ function openSpool(path: string, onFailure: (err: Error) => void): SpoolWriter {
           if (err) reject(err);
           else resolve();
         };
-        const onError = (err: Error): void => finish(err);
+        const onError = (err: unknown): void => finish(recordFailure(err));
         const onClose = (): void => {
           closed = true;
           finish(failure);
@@ -172,7 +188,7 @@ function openSpool(path: string, onFailure: (err: Error) => void): SpoolWriter {
         try {
           stream.end();
         } catch (err) {
-          finish(err instanceof Error ? err : new Error(String(err)));
+          finish(recordFailure(err));
         }
       });
     },
@@ -226,9 +242,15 @@ export async function parseMultipartMessage(input: {
   // the recovery workspace then share a filesystem, so the ciphertext transfer is
   // a rename (no EXDEV, no copy), and the initial quarantine honours the caller's
   // selected storage location.
-  const directory = input.spoolDirectory
-    ? await mkdtemp(join(input.spoolDirectory, 'as4-mime-'))
-    : await mkdtemp(join(tmpdir(), 'as4-mime-'));
+  let directory: string;
+  try {
+    directory = input.spoolDirectory
+      ? await mkdtemp(join(input.spoolDirectory, 'as4-mime-'))
+      : await mkdtemp(join(tmpdir(), 'as4-mime-'));
+  } catch (err) {
+    // A directory that cannot be created is a local storage failure.
+    throw new MimeStorageFault(safeMessage(err));
+  }
   multipartHooks.onDirectory?.(directory);
   const ownedSpools = new Set<string>();
   const parts: MultipartPart[] = [];
@@ -419,6 +441,9 @@ export async function parseMultipartMessage(input: {
     }
   } catch (err) {
     await dispose();
+    // Caller cancellation stays aborted; a writer failure is reported as a storage
+    // error. An arbitrary error from the incoming stream is neither.
+    if (input.signal?.aborted) throw new MimeFault('aborted', 'request body read aborted');
     if (writerFailure) throw writerFailure;
     if (isAbortError(err)) throw new MimeFault('aborted', 'request body read aborted');
     throw err;
