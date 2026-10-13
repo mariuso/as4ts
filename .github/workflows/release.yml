@@ -38,9 +38,9 @@ jobs:
           echo "VERSION=${version}" >> "$GITHUB_ENV"
           echo "TGZ=as4ts-${version}.tgz" >> "$GITHUB_ENV"
           if [[ "${TAG}" == *-* ]]; then
-            echo "PRERELEASE=--prerelease" >> "$GITHUB_ENV"
+            echo "PRERELEASE=1" >> "$GITHUB_ENV"
           else
-            echo "PRERELEASE=" >> "$GITHUB_ENV"
+            echo "PRERELEASE=0" >> "$GITHUB_ENV"
           fi
 
       # A tag is cut from a commit CI already tested; run the checks again so a
@@ -107,9 +107,9 @@ jobs:
             # A prior run created the release but not its asset; add it without clobbering.
             gh release upload "${TAG}" "${TGZ}"
           else
-            gh release create "${TAG}" "${TGZ}" \
-              --title "as4ts ${TAG}" \
-              --verify-tag \
-              ${PRERELEASE} \
-              --notes-file RELEASE_NOTES.md
+            args=(--title "as4ts ${TAG}" --verify-tag --notes-file RELEASE_NOTES.md)
+            if [ "${PRERELEASE}" = "1" ]; then
+              args+=(--prerelease)
+            fi
+            gh release create "${TAG}" "${TGZ}" "${args[@]}"
           fi
