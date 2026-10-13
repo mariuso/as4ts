@@ -1,5 +1,5 @@
 import { createReadStream, createWriteStream } from 'node:fs';
-import { copyFile, mkdtemp, rename, rm } from 'node:fs/promises';
+import { mkdtemp, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -18,16 +18,16 @@ import type { InboundFailureReason } from './types.js';
 /**
  * Incremental `multipart/related` parsing with owned spools (Phase 6).
  *
- * Unlike the buffered `parseMultipartRelated`, this parses headers and delimiters
- * as bytes arrive: the bounded SOAP part is retained in memory (under the envelope
- * budget), while every other part is streamed straight to a private spool file
- * with backpressure. Receiving a larger attachment therefore grows disk usage and
- * processing time, not the in-memory buffer.
+ * Headers and delimiters are parsed as bytes arrive: the SOAP part is buffered
+ * under both `maxPartBytes` and a dedicated `maxEnvelopeBytes`, while every other
+ * part is streamed straight to a private spool file with backpressure. Receiving
+ * a larger attachment therefore grows disk usage and processing time, not the
+ * in-memory buffer.
  *
- * The SOAP root may appear in any position; the whole structure is traversed (and
- * the epilogue drained and discarded) before success, so a trailing part cannot
- * escape validation. Writer errors, cancellation and closure are managed for the
- * writer's whole lifetime; cancellation interrupts a stalled write.
+ * Writer failure is a parser-wide event: it interrupts source reads and writer
+ * operations, so a storage failure is reported as such rather than as a stall or
+ * a cancellation. Cleanup waits for writers to actually close before unlinking,
+ * so a delayed file open cannot recreate a spool after cleanup.
  */
 const CR = 0x0d;
 const LF = 0x0a;
@@ -39,8 +39,11 @@ const MAX_PARTIAL_TERMINATOR = 3;
 
 const SOAP_MEDIA = /^(?:application\/soap\+xml|application\/xml)$/i;
 
-/** Test seam: inject a spool writer (for example a slow or failing one). */
-export const multipartHooks: { createSpoolWriter?: (path: string) => Writable } = {};
+/** Test seams: inject a spool writer, and observe retained bytes. */
+export const multipartHooks: {
+  createSpoolWriter?: (path: string) => Writable;
+  onRetained?: (pendingBytes: number) => void;
+} = {};
 
 export interface MultipartPart {
   readonly headers: Readonly<Record<string, string>>;
@@ -60,10 +63,11 @@ export interface ParsedMultipartMessage {
   readonly parts: readonly MultipartPart[];
   readonly startContentId: string | null;
   /**
-   * Transactionally move an attachment's ciphertext spool into `destination`,
-   * transferring ownership. The part's Content-ID must match `expectedContentId`;
-   * on any mismatch or move failure the parser keeps ownership (and deletes the
-   * spool on dispose). Returns the destination path, or null.
+   * Move an attachment's ciphertext spool into `destination` with a single
+   * rename, transferring ownership. The part's Content-ID must match
+   * `expectedContentId`. Both directories must be on the same filesystem: on any
+   * mismatch or rename failure the parser keeps ownership (and deletes the spool
+   * on dispose), and the caller can still read the spool via `part.read()`.
    */
   transferSpool(part: MultipartPart, expectedContentId: string, destination: string): Promise<string | null>;
   /** Delete owned spools and the private directory. Retries are safe; failures are retained. */
@@ -86,7 +90,8 @@ interface SpoolWriter {
   failure(): Error | null;
   write(chunk: Buffer): Promise<void>;
   close(): Promise<void>;
-  destroy(): void;
+  /** Destroy the writer and resolve once it has actually closed. */
+  destroy(): Promise<void>;
 }
 
 function isSoapMediaType(contentType: string | null): boolean {
@@ -103,13 +108,18 @@ function findLineStart(buffer: Buffer, marker: Buffer): number {
   }
 }
 
-/** A writer that records failure, emits no unhandled error, and can be destroyed. */
-function openSpool(path: string): SpoolWriter {
+/** A writer that records failure, emits no unhandled error, and closes on demand. */
+function openSpool(path: string, onFailure: (err: Error) => void): SpoolWriter {
   const stream = multipartHooks.createSpoolWriter?.(path) ?? createWriteStream(path, { mode: 0o600 });
   let failure: Error | null = null;
+  let closed = false;
   let pendingReject: ((err: Error) => void) | null = null;
+  stream.on('close', () => {
+    closed = true;
+  });
   stream.on('error', (err: unknown) => {
     failure ??= err instanceof Error ? err : new Error(String(err));
+    onFailure(failure);
     const reject = pendingReject;
     pendingReject = null;
     reject?.(failure);
@@ -145,8 +155,20 @@ function openSpool(path: string): SpoolWriter {
         stream.end((err?: Error | null) => (err ? reject(err) : resolve()));
       });
     },
-    destroy(): void {
-      stream.destroy();
+    destroy(): Promise<void> {
+      if (closed) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        stream.once('close', () => {
+          closed = true;
+          resolve();
+        });
+        try {
+          stream.destroy();
+        } catch {
+          closed = true;
+          resolve();
+        }
+      });
     },
   };
 }
@@ -155,7 +177,7 @@ export async function parseMultipartMessage(input: {
   readonly contentType: string | undefined;
   readonly body: AsyncIterable<Uint8Array>;
   readonly limits: MimeLimits;
-  /** Bound for the buffered SOAP envelope; defaults to `maxPartBytes`. */
+  /** Additional bound for the buffered SOAP envelope; defaults to `maxPartBytes`. */
   readonly maxEnvelopeBytes?: number;
   readonly signal?: AbortSignal;
   /** Directory for owned spools; a fresh private directory is created when absent. */
@@ -167,6 +189,16 @@ export async function parseMultipartMessage(input: {
   const startContentId = extractStart(input.contentType);
   const marker = Buffer.from(`--${boundary}`, 'latin1');
   const bodyNeedle = Buffer.from(`\r\n--${boundary}`, 'latin1');
+
+  // A writer failure aborts this controller, which interrupts the source read and
+  // any in-flight writer operation; the failure itself is reported, not "aborted".
+  const failureController = new AbortController();
+  let writerFailure: Error | null = null;
+  const noteWriterFailure = (err: Error): void => {
+    writerFailure ??= err;
+    failureController.abort();
+  };
+  const signal = input.signal ? AbortSignal.any([input.signal, failureController.signal]) : failureController.signal;
 
   const ownsDirectory = input.spoolDirectory === undefined;
   const directory = input.spoolDirectory ?? (await mkdtemp(join(tmpdir(), 'as4-mime-')));
@@ -209,7 +241,7 @@ export async function parseMultipartMessage(input: {
       builder.spoolPath = join(directory, `part-${partIndex}.bin`);
       // Register ownership when creation starts, so a failure mid-part still cleans up.
       ownedSpools.add(builder.spoolPath);
-      builder.spool = openSpool(builder.spoolPath);
+      builder.spool = openSpool(builder.spoolPath, noteWriterFailure);
     }
     return builder;
   };
@@ -217,13 +249,14 @@ export async function parseMultipartMessage(input: {
   const appendBody = async (builder: PartBuilder, chunk: Buffer): Promise<void> => {
     if (chunk.length === 0) return;
     builder.size += chunk.length;
+    // The per-part bound applies to every part, including the SOAP part.
+    if (builder.size > limits.maxPartBytes) fault('mime.part-too-large', 'part body exceeds the limit');
     if (builder.soap) {
       if (builder.size > envelopeBudget) fault('xml.too-large', 'the SOAP envelope exceeds the limit');
       builder.buffer.push(Buffer.from(chunk));
       return;
     }
-    if (builder.size > limits.maxPartBytes) fault('mime.part-too-large', 'part body exceeds the limit');
-    await abortableAwait(builder.spool!.write(chunk), input.signal);
+    await abortableAwait(builder.spool!.write(chunk), signal);
   };
 
   const finishPart = (builder: PartBuilder): void => {
@@ -250,11 +283,15 @@ export async function parseMultipartMessage(input: {
   };
 
   const dispose = async (): Promise<void> => {
+    // Wait for writers to actually close before unlinking, so a delayed file open
+    // cannot recreate a spool after cleanup. destroy() abandons pending writes
+    // without a graceful flush.
+    const closings: Promise<void>[] = [];
     if (current?.spool) {
-      // Destroy rather than a graceful end(): cleanup must not wait on a flush.
-      current.spool.destroy();
+      closings.push(current.spool.destroy());
       current = null;
     }
+    await Promise.all(closings);
     for (const path of [...ownedSpools]) {
       try {
         await rm(path, { force: true });
@@ -303,7 +340,6 @@ export async function parseMultipartMessage(input: {
       if (state === 'headers') {
         const separator = pending.indexOf('\r\n\r\n');
         if (separator < 0) {
-          // Do not count a possible partial terminator against the header budget.
           if (pending.length > limits.maxHeaderBytes + MAX_PARTIAL_TERMINATOR) {
             fault('mime.header-too-large', 'part header exceeds the limit');
           }
@@ -327,8 +363,9 @@ export async function parseMultipartMessage(input: {
         }
         await appendBody(builder, pending.subarray(0, index));
         if (builder.spool) {
-          await abortableAwait(builder.spool.close(), input.signal);
-          if (builder.spool.failure()) throw builder.spool.failure()!;
+          await abortableAwait(builder.spool.close(), signal);
+          const failure = builder.spool.failure();
+          if (failure) throw failure;
         }
         finishPart(builder);
         current = null;
@@ -340,18 +377,21 @@ export async function parseMultipartMessage(input: {
   };
 
   try {
-    for await (const raw of abortableStream(input.body, input.signal)) {
+    for await (const raw of abortableStream(input.body, signal)) {
       const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
       total += chunk.length;
       if (total > limits.maxRequestBytes) fault('body.too-large', 'request body exceeds the limit');
       // The epilogue after the closing boundary is discarded as it arrives; it is
       // still accounted for against the request budget.
-      if (isDone()) continue;
-      pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
-      await pump();
+      if (!isDone()) {
+        pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
+        await pump();
+      }
+      multipartHooks.onRetained?.(pending.length);
     }
   } catch (err) {
     await dispose();
+    if (writerFailure) throw writerFailure;
     if (isAbortError(err)) throw new MimeFault('aborted', 'request body read aborted');
     throw err;
   }
@@ -369,15 +409,10 @@ export async function parseMultipartMessage(input: {
       if (!source || part.contentId !== expectedContentId) return null;
       if (!ownedSpools.has(source)) return null;
       try {
+        // A single rename; both directories must share a filesystem. No copy.
         await rename(source, destination);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'EXDEV') return null; // keep ownership
-        try {
-          await copyFile(source, destination);
-          await rm(source, { force: true });
-        } catch {
-          return null; // keep ownership; the caller cleans its workspace
-        }
+      } catch {
+        return null; // keep ownership; the spool stays readable via part.read()
       }
       ownedSpools.delete(source);
       return destination;

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
@@ -52,6 +52,14 @@ const attachment = (body: Buffer): Part => ({
   headers: { 'Content-Type': 'application/octet-stream', 'Content-ID': '<att@x>' },
   body,
 });
+
+/** The request body through the attachment's header terminator, with no body bytes. */
+function headersOnly(): Buffer {
+  const full = multipart([soapPart(), attachment(Buffer.alloc(0))]);
+  const first = full.indexOf('\r\n\r\n');
+  const second = full.indexOf('\r\n\r\n', first + 4);
+  return full.subarray(0, second + 4);
+}
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<Uint8Array> {
   return typeof (value as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator] === 'function';
@@ -294,32 +302,51 @@ test('rejects a missing closing boundary', async () => {
 });
 
 test('discards a large epilogue without retaining it', async () => {
-  const epilogue = 'x'.repeat(1024 * 1024);
-  const message = await parse(multipart([soapPart(), attachment(Buffer.from('body'))], epilogue));
+  let maxRetained = 0;
+  multipartHooks.onRetained = (bytes) => {
+    maxRetained = Math.max(maxRetained, bytes);
+  };
   try {
-    assert.equal(message.parts.length, 2);
-  } finally {
+    const epilogue = 'x'.repeat(1024 * 1024);
+    const full = multipart([soapPart(), attachment(Buffer.from('body'))], epilogue);
+    async function* chunked() {
+      for (let offset = 0; offset < full.length; offset += 4096) yield full.subarray(offset, offset + 4096);
+    }
+    const message = await parse(chunked());
     await message.dispose();
+    assert.equal(message.parts.length, 2);
+    assert.ok(maxRetained < 16 * 1024, `retained bytes stayed bounded (peaked at ${maxRetained})`);
+  } finally {
+    delete multipartHooks.onRetained;
   }
 });
 
-test('accepts a delimiter with long transport padding', async () => {
-  const padding = ' '.repeat(64 * 1024);
-  const body = Buffer.concat([
-    Buffer.from(`--${BOUNDARY}\r\nContent-Type: application/soap+xml\r\nContent-ID: <soap@x>\r\n\r\n`, 'latin1'),
-    SOAP_XML,
-    Buffer.from(
-      `\r\n--${BOUNDARY}${padding}\r\nContent-Type: application/octet-stream\r\nContent-ID: <att@x>\r\n\r\n`,
-      'latin1',
-    ),
-    Buffer.from('body'),
-    Buffer.from(`\r\n--${BOUNDARY}${padding}--\r\n`, 'latin1'),
-  ]);
-  const message = await parse(body);
+test('accepts long transport padding without retaining it', async () => {
+  let maxRetained = 0;
+  multipartHooks.onRetained = (bytes) => {
+    maxRetained = Math.max(maxRetained, bytes);
+  };
   try {
-    assert.equal(message.parts.length, 2);
-  } finally {
+    const padding = ' '.repeat(64 * 1024);
+    const body = Buffer.concat([
+      Buffer.from(`--${BOUNDARY}\r\nContent-Type: application/soap+xml\r\nContent-ID: <soap@x>\r\n\r\n`, 'latin1'),
+      SOAP_XML,
+      Buffer.from(
+        `\r\n--${BOUNDARY}${padding}\r\nContent-Type: application/octet-stream\r\nContent-ID: <att@x>\r\n\r\n`,
+        'latin1',
+      ),
+      Buffer.from('body'),
+      Buffer.from(`\r\n--${BOUNDARY}${padding}--\r\n`, 'latin1'),
+    ]);
+    async function* chunked() {
+      for (let offset = 0; offset < body.length; offset += 4096) yield body.subarray(offset, offset + 4096);
+    }
+    const message = await parse(chunked());
     await message.dispose();
+    assert.equal(message.parts.length, 2);
+    assert.ok(maxRetained < 16 * 1024, `retained bytes stayed bounded (peaked at ${maxRetained})`);
+  } finally {
+    delete multipartHooks.onRetained;
   }
 });
 
@@ -499,6 +526,93 @@ test('backpressure bounds read-ahead until storage resumes', async () => {
     const message = await pending;
     await message.dispose();
     assert.equal(pulled, totalChunks, 'the source is drained once storage resumes');
+  } finally {
+    delete multipartHooks.createSpoolWriter;
+  }
+});
+
+test('the per-part bound applies to the SOAP part, in both limit orderings', async () => {
+  const soap = (size: number): Part => ({
+    headers: { 'Content-Type': 'application/soap+xml', 'Content-ID': '<soap@x>' },
+    body: Buffer.alloc(size, 0x20),
+  });
+  const withAttachment = (soapSize: number): Buffer => multipart([soap(soapSize), attachment(Buffer.from('x'))]);
+
+  // maxPartBytes is the tighter bound.
+  await assert.rejects(
+    parse(withAttachment(20), { maxPartBytes: 8 }, { maxEnvelopeBytes: 1024 }),
+    (err) => err instanceof MimeFault && err.reason === 'mime.part-too-large',
+  );
+  // maxEnvelopeBytes is the tighter bound.
+  await assert.rejects(
+    parse(withAttachment(20), { maxPartBytes: 1024 }, { maxEnvelopeBytes: 8 }),
+    (err) => err instanceof MimeFault && err.reason === 'xml.too-large',
+  );
+  // Exact boundaries: size == cap passes, size == cap + 1 fails.
+  const atLimit = await parse(withAttachment(16), { maxPartBytes: 16 }, { maxEnvelopeBytes: 1024 });
+  await atLimit.dispose();
+  await assert.rejects(
+    parse(withAttachment(17), { maxPartBytes: 16 }, { maxEnvelopeBytes: 1024 }),
+    (err) => err instanceof MimeFault && err.reason === 'mime.part-too-large',
+  );
+  const atEnvelope = await parse(withAttachment(16), { maxPartBytes: 1024 }, { maxEnvelopeBytes: 16 });
+  await atEnvelope.dispose();
+  await assert.rejects(
+    parse(withAttachment(17), { maxPartBytes: 1024 }, { maxEnvelopeBytes: 16 }),
+    (err) => err instanceof MimeFault && err.reason === 'xml.too-large',
+  );
+});
+
+test('cleanup unlinks only after the writer has actually closed (delayed open)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'as4-mp-'));
+  multipartHooks.createSpoolWriter = (path) =>
+    new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+      // Simulate an open that completes only on destroy, creating the file late.
+      destroy(error, callback) {
+        setTimeout(() => {
+          try {
+            writeFileSync(path, 'late');
+          } catch {
+            // ignore
+          }
+          callback(error ?? null);
+        }, 30);
+      },
+    });
+  try {
+    const stream = manualStream();
+    const controller = new AbortController();
+    const pending = parse(stream.body, {}, { spoolDirectory: dir, signal: controller.signal });
+    stream.push(headersOnly());
+    setTimeout(() => controller.abort(), 10);
+    await assert.rejects(pending, (err) => err instanceof MimeFault && err.reason === 'aborted');
+    await new Promise((resolve) => setTimeout(resolve, 80)); // let the late open/close complete
+    assert.deepEqual(readdirSync(dir), [], 'a late-created spool is unlinked after the writer closes');
+  } finally {
+    delete multipartHooks.createSpoolWriter;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a writer failure with no pending write interrupts the parser', async () => {
+  multipartHooks.createSpoolWriter = () => {
+    const writer = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+    setTimeout(() => writer.destroy(new Error('storage failed')), 10);
+    return writer;
+  };
+  try {
+    const stream = manualStream();
+    const pending = parse(stream.body); // no caller signal: the failure must interrupt
+    stream.push(headersOnly());
+    await assert.rejects(pending, (err) => err instanceof Error && /storage failed/.test(err.message));
+    assert.ok(stream.wasReturned(), 'the source was signalled for cleanup');
   } finally {
     delete multipartHooks.createSpoolWriter;
   }
