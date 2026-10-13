@@ -68,6 +68,7 @@ export const AS4_COMPRESSION_TYPE = 'application/gzip';
 export const EBBP_SIGNALS_NS = 'http://docs.oasis-open.org/ebxml-bp/ebbp-signals-2.0';
 
 // ebMS error meta. [EBMS3CORE] §6.2.
+export const EBMS_ERROR_CODE_NOT_SERVICED = 'EBMS:0004';
 export const EBMS_ERROR_CODE_NOT_SERVICED_DETAIL = 'PEPPOL:NOT_SERVICED';
 
 export const SOAP_XML_MEDIA_TYPE = 'application/soap+xml';

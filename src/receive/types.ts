@@ -347,7 +347,19 @@ export interface RespondSuccess {
   readonly body: Uint8Array;
 }
 
-export type RespondResult = RespondSuccess | { readonly ok: false; readonly reason: string };
+/**
+ * A response that could not be produced. Expected failures are values, never
+ * throws: an invalid input, an unusable persisted receipt context, a signing
+ * failure, a self-check failure and cancellation are all distinguishable by
+ * `reason`.
+ */
+export interface RespondFailure {
+  readonly ok: false;
+  readonly reason: string;
+  readonly detail?: string;
+}
+
+export type RespondResult = RespondSuccess | RespondFailure;
 
 // ---------------------------------------------------------------------------
 // Phase 2: receiving primitives

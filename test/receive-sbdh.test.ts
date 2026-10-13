@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { checkSbdh, documentTypeFromAction, readSbdh } from '../src/receive/sbdh.js';
 import { defaultXmlLimits, parseStrictXml } from '../src/receive/xml.js';
 
-const SBDH_NS = 'http://www.unece.org/ebusiness/2010/MDA/StandardBusinessDocumentHeader';
+const SBDH_NS = 'http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader';
 const SENDER = { scheme: 'iso6523-actorid-upis', value: '0192:111111111' };
 const RECEIVER = { scheme: 'iso6523-actorid-upis', value: '0192:222222222' };
 const PROCESS = { scheme: 'cenbii-procid-ubl', value: 'urn:fdc:peppol.eu:2017:poacc:billing:01:1.0' };
@@ -78,6 +78,11 @@ test('a mismatched value is inconsistent', () => {
 test('a header in the wrong namespace is missing, not consistent', () => {
   const wrong = header().replace(SBDH_NS, 'urn:unrelated:namespace');
   assert.deepEqual(check(wrong), { status: 'missing' });
+});
+
+test('the ebusiness/2010/MDA namespace is not the Peppol SBDH namespace', () => {
+  const mda = header().replace(SBDH_NS, 'http://www.unece.org/ebusiness/2010/MDA/StandardBusinessDocumentHeader');
+  assert.deepEqual(check(mda), { status: 'missing' });
 });
 
 test('a header nested inside an unrelated document is missing, not consistent', () => {

@@ -1,6 +1,7 @@
 import { ALGO_EXC_C14N, DS_NS, EBBP_SIGNALS_NS } from '../constants.js';
 import { defaultEntropy, hexToken, type Entropy } from '../entropy.js';
 import type { Signer } from '../types.js';
+import { safeMessage } from '../util.js';
 import { canonicalizeDigest } from '../xml/c14n.js';
 import {
   append,
@@ -14,7 +15,8 @@ import {
 import { addSignature, createSecurityHeader, type SignedPart } from '../xml/security.js';
 import { parseSignal, type ParsedSignal } from '../xml/signal.js';
 import { verifyWsSecuritySignature } from '../xml/ws-security.js';
-import type { ReceiptContext, RespondAs4MessageInput, RespondResult, RespondSuccess } from './types.js';
+import { abortError, isAbortError } from './streams.js';
+import type { ReceiptContext, RespondAs4MessageInput, RespondFailure, RespondResult, RespondSuccess } from './types.js';
 
 /**
  * Build the signed response to an inbound AS4 message (Phase 4). An accepted
@@ -22,6 +24,12 @@ import type { ReceiptContext, RespondAs4MessageInput, RespondResult, RespondSucc
  * verified references exactly; a rejected one gets a signed `eb:Error` signal
  * built only from the recovered correlation. The serialised output is verified
  * before it is returned, so a caller can persist and replay exactly these bytes.
+ *
+ * Both signals use HTTP 200 and plain `application/soap+xml; charset=UTF-8`: an
+ * ebMS Error is carried in a normal SOAP response (SOAP Faults have separate
+ * HTTP mappings), and payload-free ebMS messages may use plain SOAP. The HTTP
+ * adapter must set `Content-Type` from `contentType` and transmit `body`
+ * unchanged.
  */
 const SKELETON =
   '<env:Envelope ' +
@@ -34,6 +42,12 @@ const SKELETON =
   'xmlns:ebbp="http://docs.oasis-open.org/ebxml-bp/ebbp-signals-2.0"/>';
 
 const RESPONSE_CONTENT_TYPE = 'application/soap+xml; charset=UTF-8';
+
+const refuse = (reason: string, detail?: string): RespondFailure => ({
+  ok: false,
+  reason,
+  ...(detail ? { detail } : {}),
+});
 
 interface SignalParts {
   readonly doc: Document;
@@ -129,28 +143,66 @@ function buildErrorSignal(
   append(signalMessage, node);
 }
 
+/**
+ * Await `operation`, but stop waiting as soon as `signal` aborts. The operation
+ * itself is not cancelled here (that is the signer's concern); a late rejection
+ * is still observed so it cannot become an unhandled rejection.
+ */
+async function abortableAwait<T>(operation: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return operation;
+  if (signal.aborted) throw abortError();
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    operation.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (err) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
+type SignOutcome = { readonly ok: true; readonly xml: string } | RespondFailure;
+
 /** Sign the SOAP Body and eb:Messaging of a response, then serialise it. */
 async function signSignal(
   parts: SignalParts,
   signer: Signer,
   signal: AbortSignal | undefined,
   entropy: Entropy,
-): Promise<string> {
+): Promise<SignOutcome> {
   const { doc, header, body, messaging, messagingId, bodyId } = parts;
   const security = createSecurityHeader(doc);
   const references: SignedPart[] = [
     { uri: `#${bodyId}`, transform: ALGO_EXC_C14N, digest: canonicalizeDigest(body) },
     { uri: `#${messagingId}`, transform: ALGO_EXC_C14N, digest: canonicalizeDigest(messaging) },
   ];
-  await addSignature(
-    doc,
-    security,
-    { signingTokenId: `X509-SIG-${hexToken(entropy, 16)}`, signatureId: `SIG-${hexToken(entropy, 16)}`, references },
-    signer,
-    signal,
-  );
+  try {
+    await abortableAwait(
+      addSignature(
+        doc,
+        security,
+        {
+          signingTokenId: `X509-SIG-${hexToken(entropy, 16)}`,
+          signatureId: `SIG-${hexToken(entropy, 16)}`,
+          references,
+        },
+        signer,
+        signal,
+      ),
+      signal,
+    );
+  } catch (err) {
+    if (isAbortError(err) || signal?.aborted) return refuse('aborted');
+    return refuse('respond.signing-failed', safeMessage(err));
+  }
   append(header, security);
-  return `<?xml version="1.0" encoding="UTF-8"?>${serializeXml(doc)}`;
+  return { ok: true, xml: `<?xml version="1.0" encoding="UTF-8"?>${serializeXml(doc)}` };
 }
 
 function coversMessaging(signal: ParsedSignal): boolean {
@@ -187,55 +239,136 @@ function acknowledgesExactly(signal: ParsedSignal, ctx: ReceiptContext): boolean
   });
 }
 
-const failure = (reason: string): RespondResult => ({ ok: false, reason });
-
 /** Wrap a serialised signal into the response the caller persists and replays. */
 function response(xml: string): RespondSuccess {
   return { ok: true, status: 200, contentType: RESPONSE_CONTENT_TYPE, headers: {}, body: Buffer.from(xml, 'utf8') };
 }
 
+/**
+ * Reject an unusable persisted receipt context before any signing: a receipt is
+ * only produced for a non-empty, unique set of well-formed references.
+ */
+function validateReceipt(receipt: ReceiptContext): RespondFailure | null {
+  if (!receipt || typeof receipt.messageId !== 'string' || receipt.messageId.length === 0) {
+    return refuse('respond.invalid-receipt', 'the receipt context has no message id');
+  }
+  const references = receipt.signedReferences;
+  if (!Array.isArray(references) || references.length === 0) {
+    return refuse('respond.invalid-receipt', 'the receipt context has no signed references');
+  }
+  const seen = new Set<string>();
+  for (const reference of references) {
+    if (!reference || typeof reference.uri !== 'string' || reference.uri.length === 0) {
+      return refuse('respond.invalid-receipt', 'a reference has no URI');
+    }
+    if (typeof reference.digest !== 'string' || reference.digest.length === 0) {
+      return refuse('respond.invalid-receipt', `reference ${reference.uri} has no digest`);
+    }
+    if (typeof reference.digestMethod !== 'string' || reference.digestMethod.length === 0) {
+      return refuse('respond.invalid-receipt', `reference ${reference.uri} has no digest method`);
+    }
+    if (!Array.isArray(reference.transforms) || reference.transforms.length === 0) {
+      return refuse('respond.invalid-receipt', `reference ${reference.uri} has no transforms`);
+    }
+    for (const transform of reference.transforms) {
+      if (!transform || typeof transform.algorithm !== 'string' || transform.algorithm.length === 0) {
+        return refuse('respond.invalid-receipt', `reference ${reference.uri} has an empty transform algorithm`);
+      }
+      if (!Array.isArray(transform.inclusivePrefixes)) {
+        return refuse('respond.invalid-receipt', `reference ${reference.uri} has invalid transform parameters`);
+      }
+    }
+    if (seen.has(reference.uri)) {
+      return refuse('respond.invalid-receipt', `duplicate reference ${reference.uri}`);
+    }
+    seen.add(reference.uri);
+  }
+  return null;
+}
+
+/** Validate the request before doing any work, so bad input is a value. */
+function validateInput(input: RespondAs4MessageInput): RespondFailure | null {
+  if (typeof input.now !== 'function') return refuse('respond.invalid-input', 'now must be a function');
+  if (!input.signer || typeof input.signer.sign !== 'function') {
+    return refuse('respond.invalid-input', 'a signer is required');
+  }
+  if (input.kind === 'accepted') {
+    if (input.decision !== 'committed' && input.decision !== 'already-committed') {
+      return refuse('respond.decision-required', 'an explicit acceptance decision is required');
+    }
+    return validateReceipt(input.receipt);
+  }
+  if (
+    !input.correlation ||
+    typeof input.correlation.messageId !== 'string' ||
+    input.correlation.messageId.length === 0
+  ) {
+    return refuse('respond.invalid-input', 'a correlation message id is required');
+  }
+  if (!input.error || typeof input.error.code !== 'string' || input.error.code.length === 0) {
+    return refuse('respond.invalid-input', 'an ebMS error code is required');
+  }
+  if (input.error.severity !== 'failure' && input.error.severity !== 'warning') {
+    return refuse('respond.invalid-input', 'error severity must be failure or warning');
+  }
+  return null;
+}
+
 export async function respondAs4Message(input: RespondAs4MessageInput): Promise<RespondResult> {
-  const entropy = defaultEntropy();
-  const timestamp = input.now().toISOString();
+  const invalid = validateInput(input);
+  if (invalid) return invalid;
+
+  let timestamp: string;
   try {
+    timestamp = input.now().toISOString();
+  } catch (err) {
+    return refuse('respond.invalid-input', safeMessage(err));
+  }
+
+  const entropy = defaultEntropy();
+  if (input.signal?.aborted) return refuse('aborted');
+
+  try {
+    const parts = buildSignalEnvelope(entropy);
     if (input.kind === 'accepted') {
-      const parts = buildSignalEnvelope(entropy);
       buildReceiptSignal(parts, input.receipt, timestamp, `_${hexToken(entropy, 16)}@as4ts`);
-      const xml = await signSignal(parts, input.signer, input.signal, entropy);
-      const signal = parseSignal(Buffer.from(xml, 'utf8'));
-      if (!signal || signal.kind !== 'receipt' || signal.refToMessageId !== input.receipt.messageId) {
-        return failure('internal.self-check-failed');
-      }
-      if (!coversMessaging(signal) || !acknowledgesExactly(signal, input.receipt)) {
-        return failure('internal.self-check-failed');
-      }
-      return response(xml);
+    } else {
+      buildErrorSignal(
+        parts,
+        input.correlation,
+        {
+          code: input.error.code,
+          severity: input.error.severity,
+          ...(input.error.shortDescription ? { shortDescription: input.error.shortDescription } : {}),
+          ...(input.error.detail ? { detail: input.error.detail } : {}),
+        },
+        timestamp,
+        `_${hexToken(entropy, 16)}@as4ts`,
+      );
     }
 
-    const parts = buildSignalEnvelope(entropy);
-    buildErrorSignal(
-      parts,
-      input.correlation,
-      {
-        code: input.error.code,
-        severity: input.error.severity,
-        ...(input.error.shortDescription ? { shortDescription: input.error.shortDescription } : {}),
-        ...(input.error.detail ? { detail: input.error.detail } : {}),
-      },
-      timestamp,
-      `_${hexToken(entropy, 16)}@as4ts`,
-    );
-    const xml = await signSignal(parts, input.signer, input.signal, entropy);
-    const signal = parseSignal(Buffer.from(xml, 'utf8'));
-    if (!signal || signal.kind !== 'error' || signal.refToMessageId !== input.correlation.messageId) {
-      return failure('internal.self-check-failed');
+    const signed = await signSignal(parts, input.signer, input.signal, entropy);
+    if (!signed.ok) return signed;
+    if (input.signal?.aborted) return refuse('aborted');
+
+    const signal = parseSignal(Buffer.from(signed.xml, 'utf8'));
+    if (!signal || signal.kind !== (input.kind === 'accepted' ? 'receipt' : 'error')) {
+      return refuse('respond.self-check-failed', 'the response signal did not parse as expected');
     }
-    if (!coversMessaging(signal)) return failure('internal.self-check-failed');
-    return response(xml);
+    const expectedRef = input.kind === 'accepted' ? input.receipt.messageId : input.correlation.messageId;
+    if (signal.refToMessageId !== expectedRef) {
+      return refuse('respond.self-check-failed', 'RefToMessageId does not match');
+    }
+    if (!coversMessaging(signal)) {
+      return refuse('respond.self-check-failed', 'the signature does not cover eb:Messaging');
+    }
+    if (input.kind === 'accepted' && !acknowledgesExactly(signal, input.receipt)) {
+      return refuse('respond.self-check-failed', 'the receipt does not echo the signed references');
+    }
+    if (input.signal?.aborted) return refuse('aborted');
+    return response(signed.xml);
   } catch (err) {
-    if (err instanceof Error && (err.name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ABORT_ERR')) {
-      return failure('aborted');
-    }
-    throw err;
+    if (isAbortError(err)) return refuse('aborted');
+    return refuse('respond.self-check-failed', safeMessage(err));
   }
 }

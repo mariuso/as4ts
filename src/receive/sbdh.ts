@@ -4,14 +4,14 @@ import { parseStrictXml, XmlFault, type XmlLimits } from './xml.js';
 
 /**
  * A focused, bounded reader for the Standard Business Document Header (SBDH
- * §2.4). Paths are rooted at a `StandardBusinessDocument` in the SBDH namespace
- * with a direct `StandardBusinessDocumentHeader` child; the process and document
- * identifiers live in `Scope/InstanceIdentifier` and their schemes in
+ * §2.4). Paths are rooted at a `StandardBusinessDocument` in the Peppol SBDH
+ * namespace with a direct `StandardBusinessDocumentHeader` child; the process and
+ * document identifiers live in `Scope/InstanceIdentifier` and their schemes in
  * `Scope/Identifier`, selected by `Scope/Type` = `PROCESSID` / `DOCUMENTID`.
  * Duplicate required fields are a structural error, and the specified default
  * schemes are applied before comparison.
  */
-const SBDH_NS = 'http://www.unece.org/ebusiness/2010/MDA/StandardBusinessDocumentHeader';
+const SBDH_NS = 'http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader';
 /** Default schemes the SBDH specifies for the standard scope types (UNVERIFIED). */
 const DEFAULT_PARTY_SCHEME = 'iso6523-actorid-upis';
 const DEFAULT_SCOPE_SCHEME: Readonly<Record<string, string>> = {

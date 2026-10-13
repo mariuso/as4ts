@@ -5,14 +5,25 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
-import { PEPPOL_PARTY_ID_TYPE } from '../src/constants.js';
+import {
+  EBMS_ERROR_CODE_NOT_SERVICED,
+  EBMS_ERROR_CODE_NOT_SERVICED_DETAIL,
+  PEPPOL_PARTY_ID_TYPE,
+} from '../src/constants.js';
 import { signerFromKey } from '../src/index.js';
 import { defaultEntropy, prepareAs4Internal } from '../src/internal.js';
 import { buildMultipartBody } from '../src/multipart.js';
 import { openAs4Message } from '../src/receive/open.js';
 import { respondAs4Message } from '../src/receive/respond.js';
 import { verifyReceipt } from '../src/receipt/verify.js';
-import type { InboundKeyHolder, OpenAs4MessageInput, OpenSuccess, ReceiptContext } from '../src/receive/types.js';
+import type {
+  AcceptResponseInput,
+  InboundKeyHolder,
+  OpenAs4MessageInput,
+  OpenSuccess,
+  ReceiptContext,
+} from '../src/receive/types.js';
+import type { Signer } from '../src/types.js';
 import { parseSignal } from '../src/xml/signal.js';
 import { createTestPki } from './helpers/pki.js';
 import { testValidator } from './helpers/input.js';
@@ -40,7 +51,7 @@ const holder: InboundKeyHolder = {
 async function openInbound(): Promise<{ opened: OpenSuccess; cleanup: () => Promise<void> }> {
   const dir = await mkdtemp(join(tmpdir(), 'as4-respond-'));
   const payload = Buffer.from(
-    `<StandardBusinessDocument xmlns="http://www.unece.org/ebusiness/2010/MDA/StandardBusinessDocumentHeader">` +
+    `<StandardBusinessDocument xmlns="http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader">` +
       '<StandardBusinessDocumentHeader><HeaderVersion>1.0</HeaderVersion></StandardBusinessDocumentHeader>' +
       '</StandardBusinessDocument>',
     'utf8',
@@ -138,11 +149,15 @@ test('builds a signed receipt that the sender verifies', async () => {
   }
 });
 
-test('builds a signed error signal correlated to the failed message', async () => {
+test('builds a signed Not-serviced error with EBMS:0004 and PEPPOL:NOT_SERVICED', async () => {
   const result = await respondAs4Message({
     kind: 'rejected',
     correlation: { messageId: AS4_MESSAGE_ID, senderId: 'x', receiverId: 'y' },
-    error: { code: 'EB:09', severity: 'failure', shortDescription: 'Not serviced', detail: 'PEPPOL:NOT_SERVICED' },
+    error: {
+      code: EBMS_ERROR_CODE_NOT_SERVICED,
+      severity: 'failure',
+      detail: EBMS_ERROR_CODE_NOT_SERVICED_DETAIL,
+    },
     signer: signerFromKey(pki.receiver.keyObject, pki.receiver.certPem),
     now: () => new Date(),
   });
@@ -152,8 +167,10 @@ test('builds a signed error signal correlated to the failed message', async () =
   assert.ok(signal, 'the response parses as a signal');
   assert.equal(signal.kind, 'error');
   assert.equal(signal.refToMessageId, AS4_MESSAGE_ID);
-  assert.equal(signal.errors[0]?.code, 'EB:09');
+  assert.equal(signal.errors[0]?.code, 'EBMS:0004');
   assert.equal(signal.errors[0]?.severity, 'failure');
+  assert.equal(signal.errors[0]?.detail, 'PEPPOL:NOT_SERVICED');
+  assert.match(Buffer.from(result.body).toString('utf8'), /PEPPOL:NOT_SERVICED/);
 });
 
 test('a rejected response needs no receipt facts', async () => {
@@ -209,6 +226,158 @@ test('a cancelled response is a value, not a throw', async () => {
       now: () => new Date(),
       signal: controller.signal,
     });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.reason, 'aborted');
+  } finally {
+    await cleanup();
+  }
+});
+
+test('requires an explicit acceptance decision before signing', async () => {
+  const { opened, cleanup } = await openInbound();
+  const signer = signerFromKey(pki.receiver.keyObject, pki.receiver.certPem);
+  try {
+    for (const decision of [undefined, '', 'rejected']) {
+      const result = await respondAs4Message({
+        kind: 'accepted',
+        receipt: opened.receipt,
+        decision,
+        signer,
+        now: () => new Date(),
+      } as unknown as AcceptResponseInput);
+      assert.equal(result.ok, false, `decision ${String(decision)} must be rejected`);
+      if (!result.ok) assert.equal(result.reason, 'respond.decision-required');
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
+test('rejects an empty or malformed persisted receipt context before signing', async () => {
+  const { opened, cleanup } = await openInbound();
+  const signer = signerFromKey(pki.receiver.keyObject, pki.receiver.certPem);
+  const now = () => new Date();
+  const attempt = (receipt: unknown) =>
+    respondAs4Message({
+      kind: 'accepted',
+      receipt,
+      decision: 'committed',
+      signer,
+      now,
+    } as unknown as AcceptResponseInput);
+  try {
+    const [first, ...rest] = opened.receipt.signedReferences;
+    const cases: unknown[] = [
+      { ...opened.receipt, signedReferences: [] },
+      { ...opened.receipt, messageId: '' },
+      { ...opened.receipt, signedReferences: [first, first, ...rest] },
+      { ...opened.receipt, signedReferences: [{ ...first, digest: '' }] },
+      { ...opened.receipt, signedReferences: [{ ...first, digestMethod: '' }] },
+      { ...opened.receipt, signedReferences: [{ ...first, transforms: [] }] },
+      { ...opened.receipt, signedReferences: [{ ...first, transforms: [{ algorithm: '', inclusivePrefixes: [] }] }] },
+    ];
+    for (const receipt of cases) {
+      const result = await attempt(receipt);
+      assert.equal(result.ok, false, `must reject ${JSON.stringify(receipt)}`);
+      if (!result.ok) assert.equal(result.reason, 'respond.invalid-receipt');
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
+test('a signing failure is a value, not a throw', async () => {
+  const { opened, cleanup } = await openInbound();
+  try {
+    const failing: Signer = {
+      certificate: pki.receiver.certPem,
+      sign(): Promise<Uint8Array> {
+        return Promise.reject(new Error('HSM unavailable'));
+      },
+    };
+    const result = await respondAs4Message({
+      kind: 'accepted',
+      receipt: opened.receipt,
+      decision: 'committed',
+      signer: failing,
+      now: () => new Date(),
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.reason, 'respond.signing-failed');
+      assert.match(result.detail ?? '', /HSM unavailable/);
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
+test('an invalid clock is a value, not a throw', async () => {
+  const { opened, cleanup } = await openInbound();
+  try {
+    const result = await respondAs4Message({
+      kind: 'accepted',
+      receipt: opened.receipt,
+      decision: 'committed',
+      signer: signerFromKey(pki.receiver.keyObject, pki.receiver.certPem),
+      now: () => new Date(Number.NaN),
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.reason, 'respond.invalid-input');
+  } finally {
+    await cleanup();
+  }
+});
+
+test('a signer that aborts the signal cannot produce a receipt', async () => {
+  const { opened, cleanup } = await openInbound();
+  try {
+    const controller = new AbortController();
+    const inner = signerFromKey(pki.receiver.keyObject, pki.receiver.certPem);
+    const aborter: Signer = {
+      certificate: inner.certificate,
+      async sign(data) {
+        // Abort the operation, then still return a valid signature: the response
+        // must not be issued after cancellation.
+        controller.abort();
+        return inner.sign(data);
+      },
+    };
+    const result = await respondAs4Message({
+      kind: 'accepted',
+      receipt: opened.receipt,
+      decision: 'committed',
+      signer: aborter,
+      now: () => new Date(),
+      signal: controller.signal,
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.reason, 'aborted');
+  } finally {
+    await cleanup();
+  }
+});
+
+test('a stalled signer is interrupted by cancellation', async () => {
+  const { opened, cleanup } = await openInbound();
+  try {
+    const controller = new AbortController();
+    const stalled: Signer = {
+      certificate: pki.receiver.certPem,
+      sign(): Promise<Uint8Array> {
+        return new Promise(() => {}); // never settles
+      },
+    };
+    const pending = respondAs4Message({
+      kind: 'accepted',
+      receipt: opened.receipt,
+      decision: 'committed',
+      signer: stalled,
+      now: () => new Date(),
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(), 10);
+    const result = await pending;
     assert.equal(result.ok, false);
     if (!result.ok) assert.equal(result.reason, 'aborted');
   } finally {

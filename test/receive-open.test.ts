@@ -47,7 +47,7 @@ const holder: InboundKeyHolder = {
 function sbdhDocument(senderIdentifier: string): Buffer {
   return Buffer.from(
     '<?xml version="1.0" encoding="UTF-8"?>' +
-      '<StandardBusinessDocument xmlns="http://www.unece.org/ebusiness/2010/MDA/StandardBusinessDocumentHeader">' +
+      '<StandardBusinessDocument xmlns="http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader">' +
       '<StandardBusinessDocumentHeader><HeaderVersion>1.0</HeaderVersion>' +
       `<Sender><Identifier Authority="${SENDER.scheme}">${senderIdentifier}</Identifier></Sender>` +
       `<Receiver><Identifier Authority="${RECEIVER.scheme}">${RECEIVER.value}</Identifier></Receiver>` +
