@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ALGO_EXC_C14N, SWA_TRANSFORM_SIGNATURE } from '../src/constants.js';
+import { ALGO_EXC_C14N, ALGO_SHA256, SWA_TRANSFORM_SIGNATURE } from '../src/constants.js';
 import { defaultRevocationPolicy } from '../src/certificate-validator.js';
 import { parseSignal } from '../src/xml/signal.js';
 import { verifyReceipt, type SignedReference } from '../src/receipt/verify.js';
+import type { VerifiedReference } from '../src/xml/ws-security.js';
 import { createTestPki } from './helpers/pki.js';
 import { buildSignedReceipt, unrelatedSelfSigned, type ReceiptReference } from './helpers/receipt.js';
 import { testValidator } from './helpers/input.js';
@@ -94,6 +95,57 @@ test('rejects an acknowledgement with altered transform parameters', async () =>
   const result = await check({
     references: [{ ...refs[0]!, inclusivePrefixes: ['env'] }, refs[1]!, refs[2]!],
   });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'receipt.digest-mismatch');
+});
+
+/** Full verified-reference expectations, with per-URI inclusive prefixes. */
+function verifiedReferences(prefixesByUri: Readonly<Record<string, readonly string[]>> = {}): VerifiedReference[] {
+  return refs.map((reference) => ({
+    uri: reference.uri,
+    digest: reference.digest,
+    digestMethod: ALGO_SHA256,
+    transforms: [{ algorithm: reference.transform, inclusivePrefixes: prefixesByUri[reference.uri] ?? [] }],
+  }));
+}
+
+async function checkWithVerified(
+  references: readonly ReceiptReference[],
+  signedReferences: readonly VerifiedReference[],
+) {
+  const { signal } = buildSignedReceipt({ signer: pki.receiver, refToMessageId: MESSAGE_ID, references });
+  return verifyReceipt({
+    signal,
+    as4MessageId: MESSAGE_ID,
+    receiverCertificatePem: pki.receiver.certPem,
+    signedReferences,
+    validateCertificate,
+    now: () => new Date(),
+  });
+}
+
+test('accepts a receipt that echoes recorded transform parameters', async () => {
+  // The receipt echoes the InclusiveNamespaces prefix list the recorded verified
+  // references declare; a peer that used supported canonicalisation parameters is
+  // not rejected for using them.
+  const result = await checkWithVerified(
+    [{ ...refs[0]!, inclusivePrefixes: ['env'] }, refs[1]!, refs[2]!],
+    verifiedReferences({ '#body-id': ['env'] }),
+  );
+  assert.equal(result.ok, true, JSON.stringify(result));
+});
+
+test('rejects a receipt that omits recorded transform parameters', async () => {
+  const result = await checkWithVerified(refs, verifiedReferences({ '#body-id': ['env'] }));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'receipt.digest-mismatch');
+});
+
+test('rejects a receipt with changed transform parameters', async () => {
+  const result = await checkWithVerified(
+    [{ ...refs[0]!, inclusivePrefixes: ['other'] }, refs[1]!, refs[2]!],
+    verifiedReferences({ '#body-id': ['env'] }),
+  );
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.reason, 'receipt.digest-mismatch');
 });

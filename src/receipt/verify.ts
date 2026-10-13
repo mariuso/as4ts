@@ -3,7 +3,7 @@ import type { ReceiptEvidence, ReceiptFailureReason, ValidateCertificate } from 
 import { commonNameOf, normalizePem, parseCertificate, sameCertificate } from '../util.js';
 import { elementsByLocalName, firstByLocalName, attrOf, textOf } from '../xml/nodes.js';
 import type { ParsedSignal } from '../xml/signal.js';
-import { verifyWsSecuritySignature, type SignedReference } from '../xml/ws-security.js';
+import { verifyWsSecuritySignature, type SignedReference, type VerifiedReference } from '../xml/ws-security.js';
 
 export type { SignedReference } from '../xml/ws-security.js';
 
@@ -11,8 +11,14 @@ export interface ReceiptCheckInput {
   readonly signal: ParsedSignal;
   readonly as4MessageId: string;
   readonly receiverCertificatePem: string;
-  /** The references we put in our own SignedInfo (Body, Messaging, attachment). */
-  readonly signedReferences: readonly SignedReference[];
+  /**
+   * The references to expect in the receipt. The sender's own outbound artifact
+   * passes URI/digest pairs, for which the fixed profile semantics apply; the
+   * receiving path passes fully verified references, whose recorded digest
+   * method, ordered transforms and inclusive-prefix parameters are compared
+   * directly.
+   */
+  readonly signedReferences: readonly (SignedReference | VerifiedReference)[];
   /** Required. Validates the receipt signer before the receipt is accepted. */
   readonly validateCertificate: ValidateCertificate;
   readonly now: () => Date;
@@ -109,12 +115,12 @@ function covers(elements: readonly Element[], target: Element): boolean {
 
 function verifyNonRepudiationInformation(
   signal: ParsedSignal,
-  signedReferences: readonly SignedReference[],
+  signedReferences: readonly (SignedReference | VerifiedReference)[],
 ): { reason: ReceiptFailureReason; detail: string } | null {
   const nri = firstByLocalName(signal.signalElement, EBBP_SIGNALS_NS, 'NonRepudiationInformation');
   if (!nri) return { reason: 'receipt.malformed', detail: 'no NonRepudiationInformation in the signed signal' };
 
-  const expectedDigest = new Map(signedReferences.map((r) => [r.uri, r.digest]));
+  const expectedByUri = new Map(signedReferences.map((reference) => [reference.uri, reference]));
   const partInfos = elementsByLocalName(nri, EBBP_SIGNALS_NS, 'MessagePartNRInformation');
   if (partInfos.length === 0) return { reason: 'receipt.malformed', detail: 'no MessagePartNRInformation' };
 
@@ -122,7 +128,7 @@ function verifyNonRepudiationInformation(
   for (const partInfo of partInfos) {
     for (const reference of elementsByLocalName(partInfo, DS_NS, 'Reference')) {
       const uri = attrOf(reference, 'URI') ?? '';
-      const want = expectedDigest.get(uri);
+      const want = expectedByUri.get(uri);
       if (!want) {
         return {
           reason: 'receipt.malformed',
@@ -137,7 +143,7 @@ function verifyNonRepudiationInformation(
       // AS4 receipts echo the original reference structure as evidence, so the
       // acknowledgement must carry the same processing semantics (digest method,
       // ordered transforms and their parameters), not only the same digest text.
-      if (!sameSemantics(actualSemantics(reference), expectedSemantics(uri))) {
+      if (!sameSemantics(actualSemantics(reference), expectedSemantics(want, uri))) {
         return {
           reason: 'receipt.digest-mismatch',
           detail: `NonRepudiationInformation reference semantics mismatch for ${uri}`,
@@ -145,7 +151,7 @@ function verifyNonRepudiationInformation(
       }
 
       const digest = textOf(firstByLocalName(reference, DS_NS, 'DigestValue'))?.trim();
-      if (!digest || digest !== want) {
+      if (!digest || digest !== want.digest) {
         return { reason: 'receipt.digest-mismatch', detail: `NonRepudiationInformation digest mismatch for ${uri}` };
       }
     }
@@ -172,13 +178,28 @@ interface ReferenceSemantics {
 }
 
 /**
- * The reference semantics the outbound artifact fixes for a URI kind: SOAP parts
- * are signed with SHA-256 over exclusive C14N, attachments with SHA-256 over the
- * SwA content-signature transform, and neither reference declares additional
- * namespace parameters. A receipt that acknowledges one of our references with
- * anything else is not acknowledging what we signed.
+ * The reference semantics a receipt must echo for one acknowledgement.
+ *
+ * When the caller supplies the full verified semantics (the receiving path), the
+ * recorded digest method, ordered transforms and inclusive-prefix parameters are
+ * compared directly, so a peer that used supported canonicalisation parameters is
+ * not rejected for using them. When the caller supplies only URI/digest pairs
+ * (the sender's own outbound artifact), the fixed profile expectations apply: SOAP
+ * parts are signed with SHA-256 over exclusive C14N, attachments with SHA-256 over
+ * the SwA content-signature transform, and neither declares namespace parameters.
+ * A receipt that acknowledges such a reference with anything else is not
+ * acknowledging what we signed.
  */
-function expectedSemantics(uri: string): ReferenceSemantics {
+function expectedSemantics(reference: SignedReference | VerifiedReference, uri: string): ReferenceSemantics {
+  if (isVerifiedReference(reference)) {
+    return {
+      digestMethod: reference.digestMethod,
+      transforms: reference.transforms.map((transform) => ({
+        algorithm: transform.algorithm,
+        inclusivePrefixes: [...transform.inclusivePrefixes].sort(),
+      })),
+    };
+  }
   return {
     digestMethod: ALGO_SHA256,
     transforms: [
@@ -188,6 +209,11 @@ function expectedSemantics(uri: string): ReferenceSemantics {
       },
     ],
   };
+}
+
+function isVerifiedReference(reference: SignedReference | VerifiedReference): reference is VerifiedReference {
+  const candidate = reference as VerifiedReference;
+  return typeof candidate.digestMethod === 'string' && Array.isArray(candidate.transforms);
 }
 
 function actualSemantics(reference: Element): ReferenceSemantics {
