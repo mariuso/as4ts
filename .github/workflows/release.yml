@@ -1,0 +1,115 @@
+name: Release
+
+# Build from the pushed tag and attach `npm pack` output to the GitHub release.
+# The tag must match package.json (v<version>); tags with a `-` are published as
+# pre-releases. Releases are immutable: an existing asset is never replaced.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Writing the release needs contents:write; nothing else is escalated.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify the tag matches package.json
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          if [ "v${version}" != "${TAG}" ]; then
+            echo "::error::tag ${TAG} does not match package.json version ${version} (expected v${version})"
+            exit 1
+          fi
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+          echo "TGZ=as4ts-${version}.tgz" >> "$GITHUB_ENV"
+          if [[ "${TAG}" == *-* ]]; then
+            echo "PRERELEASE=--prerelease" >> "$GITHUB_ENV"
+          else
+            echo "PRERELEASE=" >> "$GITHUB_ENV"
+          fi
+
+      # A tag is cut from a commit CI already tested; run the checks again so a
+      # release never depends on an unverified commit.
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+      - name: Pack
+        run: |
+          set -euo pipefail
+          npm pack
+          test -f "${TGZ}"
+
+      - name: Verify the packed manifest (no install scripts, npm ranges only)
+        run: |
+          set -euo pipefail
+          unpacked="$(mktemp -d)"
+          tar -xzf "${TGZ}" -C "${unpacked}"
+          manifest="${unpacked}/package/package.json"
+          for script in preinstall install postinstall prepare; do
+            if [ -n "$(jq -r --arg s "${script}" '.scripts[$s] // empty' "${manifest}")" ]; then
+              echo "::error::the packed manifest declares an install lifecycle script: ${script}"
+              exit 1
+            fi
+          done
+          bad="$(jq -r '.dependencies // {} | to_entries[] | select(.value | test("^(git|https?|file|link):"; "i")) | .key' "${manifest}")"
+          if [ -n "${bad}" ]; then
+            echo "::error::dependency is not an npm version range: ${bad}"
+            exit 1
+          fi
+          echo "packed manifest ok: $(jq -r '.name + " " + .version' "${manifest}")"
+
+      - name: Guard immutability (never replace an existing asset)
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" --json assets --jq '.assets[].name' 2>/dev/null | grep -qx "${TGZ}"; then
+            echo "::error::asset ${TGZ} already exists on release ${TAG}; releases are immutable — cut a new version instead"
+            exit 1
+          fi
+
+      - name: Compose release notes
+        run: |
+          set -euo pipefail
+          digest="$(sha256sum "${TGZ}" | awk '{print $1}')"
+          {
+            echo "as4ts ${TAG} — built from commit \`${SHA}\`."
+            echo
+            echo "- Commit: \`${SHA}\`"
+            echo "- Asset: \`${TGZ}\` — sha256 \`${digest}\`"
+            echo "- Built with \`npm ci && npm run build && npm pack\`; \`package.json\` version \`${VERSION}\` matches the tag."
+            echo "- No install scripts; runtime dependencies come from npm as ordinary version ranges."
+            echo
+            echo "This release is immutable: the asset is pinned by its hash, so a fix is a new version."
+          } > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            # A prior run created the release but not its asset; add it without clobbering.
+            gh release upload "${TAG}" "${TGZ}"
+          else
+            gh release create "${TAG}" "${TGZ}" \
+              --title "as4ts ${TAG}" \
+              --verify-tag \
+              ${PRERELEASE} \
+              --notes-file RELEASE_NOTES.md
+          fi

@@ -289,6 +289,16 @@ references in [src/constants.ts](src/constants.ts).
 The API may change between minor versions before 1.0. See the
 [changelog](CHANGELOG.md) for API and wire-behavior changes.
 
+### Releases
+
+Releases are cut from a tag. Set `package.json` to the release version, commit,
+and push a matching `v<version>` tag; the
+[Release workflow](.github/workflows/release.yml) verifies the tag matches
+`package.json`, runs the checks, builds and packs (`npm run build && npm pack`),
+and attaches `as4ts-<version>.tgz` to the GitHub release. A tag containing `-`
+(for example `v0.2.0-rc.1`) is published as a pre-release. Release assets are
+immutable: a fix is a new version, never a replaced file.
+
 Issues and pull requests are welcome. Add regression coverage for behavior
 changes and run the development checks before opening a PR. Report suspected
 vulnerabilities through [private vulnerability reporting](SECURITY.md).
