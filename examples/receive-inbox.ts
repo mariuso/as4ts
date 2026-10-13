@@ -11,12 +11,20 @@
  *   respondAs4Message  produce the exact signed receipt bytes
  *   persist            store those bytes, then write the HTTP response
  *
- * The inbox demonstrates: commit before acknowledging; atomic, fsynced
- * publication of the committed record and the response; per-MessageId
- * serialization so a concurrent duplicate is delivered once; rejection of
- * conflicting reuse of an id; replay of the stored receipt on a duplicate; and
- * regeneration from retained evidence when the response was lost — including
- * rebuilding the index from disk as a restart would.
+ * Durability model
+ * ----------------
+ * A message is committed by staging every file, fsyncing the file contents and
+ * the staging directory, then publishing the record directory with a single
+ * atomic rename and fsyncing the parent. The response is published the same way.
+ * A directory-sync failure is an error: `commit` and `saveResponse` only report
+ * success once the durability step has succeeded, so a receipt cannot be issued
+ * for bytes that are not yet durable. On a filesystem that cannot fsync a
+ * directory, construct the inbox with `{ directorySync: 'none' }` to select an
+ * explicitly weaker mode (documented as such); the default is `'fsync'`.
+ *
+ * On restart, `load` indexes only canonical published directories whose name is
+ * the hash of the record's MessageId; staging directories from an interrupted
+ * commit are never treated as committed, and `sweepStaging` removes them.
  *
  *   npm run examples:receive
  */
@@ -48,6 +56,7 @@ import { createTestPki, createTlsServerCert } from '../test/helpers/pki.js';
 
 const DEADLINE_MS = 15_000;
 const RECEIVER_IDENTITY_SCHEME = 'urn:fdc:peppol.eu:2017:identifiers:ap';
+const CANONICAL_DIR = /^[0-9a-f]{64}$/;
 
 /** The authenticated compressed/original representation metadata retained as evidence. */
 interface RepresentationFacts {
@@ -75,6 +84,24 @@ interface StoredResponse {
   readonly contentType: string;
   readonly headers: Record<string, string>;
   readonly body: Buffer;
+}
+
+/** Seams for the example's crash/failure scenarios. Production code has no hooks. */
+interface InboxHooks {
+  /** Runs after staging is fsynced but before the atomic rename (crash simulation). */
+  readonly beforePublish?: () => void | Promise<void>;
+  /** Runs before each directory fsync, to inject a sync failure. */
+  readonly beforeDirectorySync?: (path: string) => void | Promise<void>;
+}
+
+interface InboxOptions {
+  /**
+   * `fsync` (default) propagates directory-sync failures. `none` skips directory
+   * fsync entirely: an explicitly weaker durability mode for filesystems that
+   * cannot fsync a directory.
+   */
+  readonly directorySync?: 'fsync' | 'none';
+  readonly hooks?: InboxHooks;
 }
 
 /**
@@ -117,20 +144,6 @@ async function durableStream(dir: string, name: string, source: ReadableStream):
   }
 }
 
-/** fsync a directory so a rename survives a crash. Best-effort across platforms. */
-async function syncDir(path: string): Promise<void> {
-  try {
-    const handle = await open(path, 'r');
-    try {
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-  } catch {
-    // Some platforms/filesystems do not permit fsync on a directory handle.
-  }
-}
-
 /**
  * A durable inbox: payload, representation, evidence, receipt context and the
  * exact response bytes on disk, published atomically, with an in-memory index
@@ -140,10 +153,18 @@ async function syncDir(path: string): Promise<void> {
 class DurableInbox {
   private readonly index = new Map<string, InboxRecord>();
   private readonly locks = new Map<string, Promise<void>>();
+  private readonly directorySync: 'fsync' | 'none';
+  private readonly hooks: InboxHooks;
   deliveries = 0;
   conflicts = 0;
 
-  constructor(private readonly root: string) {}
+  constructor(
+    private readonly root: string,
+    options: InboxOptions = {},
+  ) {
+    this.directorySync = options.directorySync ?? 'fsync';
+    this.hooks = options.hooks ?? {};
+  }
 
   private dir(messageId: string): string {
     return join(this.root, createHash('sha256').update(messageId).digest('hex'));
@@ -153,13 +174,19 @@ class DurableInbox {
     return this.index.get(messageId);
   }
 
-  /** Rebuild the index from committed records (crash/restart recovery). */
+  /**
+   * Rebuild the index from committed records (crash/restart recovery). Only
+   * canonical published directories are considered, and a record is indexed only
+   * when its directory name is the hash of its own MessageId — an interrupted
+   * staging directory is never mistaken for a committed record.
+   */
   async load(): Promise<void> {
     const entries = await readdir(this.root, { withFileTypes: true }).catch(() => []);
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
+      if (!entry.isDirectory() || !CANONICAL_DIR.test(entry.name)) continue;
       try {
         const record = JSON.parse(await readFile(join(this.root, entry.name, 'inbox.json'), 'utf8')) as InboxRecord;
+        if (this.dir(record.messageId) !== join(this.root, entry.name)) continue;
         this.index.set(record.messageId, record);
       } catch {
         // Partial or unrelated directory: not a committed record.
@@ -167,10 +194,31 @@ class DurableInbox {
     }
   }
 
-  /** Drop the in-memory index and rebuild it from disk, as after a process restart. */
+  /** Rebuild the in-memory index from disk, as after a process restart. */
   async reload(): Promise<void> {
     this.index.clear();
     await this.load();
+  }
+
+  /** Remove abandoned staging directories left by an interrupted commit. */
+  async sweepStaging(): Promise<void> {
+    const entries = await readdir(this.root, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isDirectory() || CANONICAL_DIR.test(entry.name)) continue;
+      await rm(join(this.root, entry.name), { recursive: true, force: true });
+    }
+  }
+
+  /** fsync a directory so a rename survives a crash. Failures propagate. */
+  private async syncDir(path: string): Promise<void> {
+    if (this.directorySync === 'none') return; // explicitly weaker durability mode
+    await this.hooks.beforeDirectorySync?.(path);
+    const handle = await open(path, 'r');
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
   }
 
   /**
@@ -226,9 +274,10 @@ class DurableInbox {
       committedAt: new Date().toISOString(),
     };
     await durableWrite(join(staging, 'inbox.json'), JSON.stringify(record, null, 2));
-    await syncDir(staging);
+    await this.syncDir(staging);
+    await this.hooks.beforePublish?.();
     await rename(staging, dir);
-    await syncDir(this.root);
+    await this.syncDir(this.root);
     this.index.set(record.messageId, record);
     this.deliveries += 1;
     return record;
@@ -246,9 +295,9 @@ class DurableInbox {
       bodyBase64: Buffer.from(response.body).toString('base64'),
     });
     await durableWrite(join(staging, 'response.json'), published);
-    await syncDir(staging);
+    await this.syncDir(staging);
     await rename(join(staging, 'response.json'), join(dir, 'response.json'));
-    await syncDir(dir);
+    await this.syncDir(dir);
     await rm(staging, { recursive: true, force: true });
   }
 
@@ -278,7 +327,8 @@ class DurableInbox {
 }
 
 interface Deps {
-  readonly inbox: DurableInbox;
+  /** Swapped by the example's crash/failure scenarios. */
+  inbox: DurableInbox;
   readonly keyHolder: ReturnType<typeof keyHolderFromKey>;
   readonly validateCertificate: ReturnType<typeof testValidator>;
   readonly signer: ReturnType<typeof signerFromKey>;
@@ -457,9 +507,11 @@ async function main(): Promise<void> {
   const pki = createTestPki();
   const tls = createTlsServerCert();
   const root = await mkdtemp(join(tmpdir(), 'as4-inbox-'));
+  const inboxRoot = join(root, 'inbox');
 
-  await mkdir(join(root, 'inbox'), { recursive: true });
-  const inbox = new DurableInbox(join(root, 'inbox'));
+  await mkdir(inboxRoot, { recursive: true });
+  const inbox = new DurableInbox(inboxRoot);
+  await inbox.sweepStaging();
   await inbox.load();
 
   const deps: Deps = {
@@ -524,7 +576,56 @@ async function main(): Promise<void> {
     await Promise.all([transmit(c1, pki, tls.caPem), transmit(c2, pki, tls.caPem)]);
     console.log(`conflict:         rejected=${inbox.conflicts === 1}  (deliveries=${inbox.deliveries})`);
 
-    // 6. A malformed upload is a transport rejection, not an invented ebMS error.
+    // 6. Crash immediately before the commit rename: the staged record must not be
+    // loaded as committed on restart, and must be swept as abandoned. A retry
+    // then commits normally.
+    const d = await prepare(pki, url, tls.caPem, 'interrupt@as4-sender', '<?xml version="1.0"?><doc>d</doc>');
+    messages.push(d);
+    const crashing = new DurableInbox(inboxRoot, {
+      hooks: {
+        beforePublish: () => {
+          throw new Error('simulated crash before rename');
+        },
+      },
+    });
+    const previousInbox = deps.inbox;
+    deps.inbox = crashing;
+    const crashed = await transmit(d, pki, tls.caPem);
+    deps.inbox = previousInbox;
+    const restart = new DurableInbox(inboxRoot);
+    await restart.load();
+    const notCommitted = restart.get(d.as4MessageId) === undefined;
+    await restart.sweepStaging();
+    const stagingSwept = (await readdir(inboxRoot)).every((name) => CANONICAL_DIR.test(name));
+    const retried = await transmit(d, pki, tls.caPem);
+    const crashOk =
+      receiptBytes(crashed) === null && notCommitted && stagingSwept && retried.outcome === 'receipt-verified';
+    console.log(
+      `crash pre-rename: no-receipt=${receiptBytes(crashed) === null}  not-committed=${notCommitted}  staging-swept=${stagingSwept}  retry=${retried.outcome}  (deliveries=${inbox.deliveries})`,
+    );
+
+    // 7. A directory-sync failure must not produce a receipt: commit reports a
+    // failure, no delivery is recorded, and the sender gets no positive response.
+    const e = await prepare(pki, url, tls.caPem, 'fsync@as4-sender', '<?xml version="1.0"?><doc>e</doc>');
+    messages.push(e);
+    const failing = new DurableInbox(inboxRoot, {
+      hooks: {
+        beforeDirectorySync: () => {
+          throw new Error('simulated EIO');
+        },
+      },
+    });
+    const beforeDeliveries = inbox.deliveries;
+    deps.inbox = failing;
+    const syncFailed = await transmit(e, pki, tls.caPem);
+    deps.inbox = inbox;
+    const syncOk =
+      receiptBytes(syncFailed) === null && failing.deliveries === 0 && inbox.deliveries === beforeDeliveries;
+    console.log(
+      `dir-sync failure:  no-receipt=${receiptBytes(syncFailed) === null}  no-delivery=${inbox.deliveries === beforeDeliveries}  (deliveries=${inbox.deliveries})`,
+    );
+
+    // 8. A malformed upload is a transport rejection, not an invented ebMS error.
     const malformedStatus = await postRaw(url, tls.caPem, 'text/plain', 'not as4');
     console.log(`malformed upload: HTTP ${malformedStatus}`);
 
@@ -532,7 +633,9 @@ async function main(): Promise<void> {
       replayed &&
       recoveryOk &&
       concurrentOk &&
-      inbox.deliveries === 3 &&
+      crashOk &&
+      syncOk &&
+      inbox.deliveries === 4 &&
       inbox.conflicts === 1 &&
       malformedStatus === 400;
   } finally {

@@ -76,9 +76,15 @@ durable inbox: commit payload, evidence and receipt context, then respond,
 persist the response bytes, write the HTTP response, and replay or regenerate the
 receipt on a duplicate. Run it with `npm run examples:receive`. Its persistence
 is atomic and fsynced (staged files, an atomic rename, a parent-directory sync),
-so a receipt is only issued once the accepted bytes are durable. The in-process
-per-id lock is illustrative: a production store must additionally enforce a
-transactional unique constraint on the authenticated message identity.
+so a receipt is only issued once the accepted bytes are durable. A directory-sync
+failure propagates: the example refuses to acknowledge rather than claim a
+durability it did not establish, and an explicit `{ directorySync: 'none' }`
+constructor option selects a documented weaker mode for filesystems that cannot
+fsync a directory. On restart the index is rebuilt only from canonical published
+directories whose name matches the hash of their record's MessageId, so an
+interrupted staging directory is never mistaken for a committed record. The
+in-process per-id lock is illustrative: a production store must additionally
+enforce a transactional unique constraint on the authenticated message identity.
 
 ## Left to the caller
 
