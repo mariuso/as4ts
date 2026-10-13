@@ -8,7 +8,9 @@ import { parseMultipartRelated, type MimeLimits } from '../../src/receive/mime.j
 import { openAs4Message } from '../../src/receive/open.js';
 import { defaultInboundLimits } from '../../src/receive/types.js';
 import type { InboundLimits, OpenSuccess } from '../../src/receive/types.js';
-import type { ScopedId } from '../../src/types.js';
+import { verifyReceipt } from '../../src/receipt/verify.js';
+import type { ScopedId, ValidateCertificate } from '../../src/types.js';
+import { parseSignal } from '../../src/xml/signal.js';
 
 /**
  * Load and verify a recorded inbound capture through the real receiving path
@@ -92,6 +94,8 @@ export interface LoadedCapture {
   readonly intermediates: string[];
   /** The parsed sender-acceptance evidence, validated for coherence. */
   readonly senderAcceptance: SenderAcceptanceEvidence;
+  /** The exact response bytes the sender accepted, when an accepted exchange recorded them. */
+  readonly acceptanceResponse: Buffer | null;
 }
 
 export interface CaptureFacts {
@@ -136,6 +140,22 @@ export function splitPemCertificates(text: string): string[] {
   });
 }
 
+/**
+ * An explicitly zoned ISO 8601 timestamp. A naive or malformed string becomes an
+ * invalid `Date`, which would silently weaken certificate validation at
+ * verification time, so it is rejected up front.
+ */
+function requireZonedTimestamp(value: unknown, label: string): string {
+  if (
+    typeof value !== 'string' ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
+  ) {
+    throw new Error(`${label} must be an ISO 8601 timestamp with an explicit zone`);
+  }
+  if (Number.isNaN(new Date(value).getTime())) throw new Error(`${label} is not a valid date`);
+  return value;
+}
+
 /** Validate the required metadata centrally, so the suite and the gate agree. */
 export function validateCaptureMetadata(metadata: CaptureMetadata, dir = '<capture>'): void {
   const fail = (message: string): never => {
@@ -146,6 +166,7 @@ export function validateCaptureMetadata(metadata: CaptureMetadata, dir = '<captu
     fail('origin must be "independent" or "local"');
   }
   if (!metadata.capturedAt) fail('capturedAt is required');
+  requireZonedTimestamp(metadata.capturedAt, `${dir}: capturedAt`);
   if (!metadata.contentType) fail('contentType is required');
   if (!metadata.sender?.implementation) fail('sender.implementation is required');
   if (!metadata.sender?.version) fail('sender.version is required');
@@ -184,7 +205,11 @@ export function validateCaptureMetadata(metadata: CaptureMetadata, dir = '<captu
   }
 }
 
-function readSenderAcceptance(dir: string, name: string, metadata: CaptureMetadata): SenderAcceptanceEvidence {
+function readSenderAcceptance(
+  dir: string,
+  name: string,
+  metadata: CaptureMetadata,
+): { evidence: SenderAcceptanceEvidence; response: Buffer | null } {
   const raw = readRequired(dir, metadata.senderAcceptance.evidenceFile);
   let evidence: SenderAcceptanceEvidence;
   try {
@@ -202,9 +227,19 @@ function readSenderAcceptance(dir: string, name: string, metadata: CaptureMetada
   if (evidence.version !== undefined) {
     assert.equal(evidence.version, metadata.sender.version, `${name}: evidence version`);
   }
-  assert.ok(evidence.recordedAt, `${name}: evidence.recordedAt is required`);
+  requireZonedTimestamp(evidence.recordedAt, `${name}: evidence.recordedAt`);
+
+  if (evidence.accepted) {
+    // An accepted exchange must preserve the exact response bytes and their hash;
+    // a boolean is only an assertion. That the bytes are a receipt for this
+    // request is checked against the opened message in `assertFacts`.
+    assert.ok(evidence.responseFile, `${name}: an accepted exchange must record the accepted response file`);
+    assert.ok(evidence.responseSha256Base64, `${name}: an accepted exchange must record the response hash`);
+  }
+
+  let response: Buffer | null = null;
   if (evidence.responseFile) {
-    const response = readRequired(dir, evidence.responseFile);
+    response = readRequired(dir, evidence.responseFile);
     assert.ok(response.length > 0, `${name}: the recorded response must not be empty`);
     if (evidence.responseSha256Base64) {
       assert.equal(
@@ -214,7 +249,7 @@ function readSenderAcceptance(dir: string, name: string, metadata: CaptureMetada
       );
     }
   }
-  return evidence;
+  return { evidence, response };
 }
 
 export function loadCapture(dir: string, name = dir): LoadedCapture {
@@ -224,6 +259,7 @@ export function loadCapture(dir: string, name = dir): LoadedCapture {
   const intermediates = splitPemCertificates(readPem(dir, 'trust-intermediates.pem'));
   if (roots.length === 0) throw new Error(`capture ${dir}: trust-roots.pem contains no certificate`);
   if (intermediates.length === 0) throw new Error(`capture ${dir}: trust-intermediates.pem contains no certificate`);
+  const acceptance = readSenderAcceptance(dir, name, metadata);
   return {
     dir,
     name,
@@ -233,7 +269,8 @@ export function loadCapture(dir: string, name = dir): LoadedCapture {
     receiverKeyPem: readPem(dir, 'receiver-key.pem'),
     roots,
     intermediates,
-    senderAcceptance: readSenderAcceptance(dir, name, metadata),
+    senderAcceptance: acceptance.evidence,
+    acceptanceResponse: acceptance.response,
   };
 }
 
@@ -295,14 +332,18 @@ export async function verifyCapture(
   if (!opened.ok) throw new Error('unreachable');
 
   try {
-    return await assertFacts(capture, opened);
+    return await assertFacts(capture, opened, (input) => validator.validate(input));
   } finally {
     // Dispose every returned handle, on success or on an assertion failure.
     await opened.dispose();
   }
 }
 
-async function assertFacts(capture: LoadedCapture, opened: OpenSuccess): Promise<CaptureFacts> {
+async function assertFacts(
+  capture: LoadedCapture,
+  opened: OpenSuccess,
+  validateCertificate: ValidateCertificate,
+): Promise<CaptureFacts> {
   const { metadata, name } = capture;
 
   // Identity binding: the signer is the sender AP, and the message was addressed
@@ -373,6 +414,28 @@ async function assertFacts(capture: LoadedCapture, opened: OpenSuccess): Promise
     opened.messageId,
     `${name}: recorded sender acceptance must reference this message`,
   );
+
+  // For an accepted exchange, the recorded response must be a receipt that
+  // verifies against this request — signature, signer identity, correlation and
+  // NRI. The recorded peer result separately establishes that the sender
+  // accepted those bytes; here we prove the bytes are the right receipt.
+  if (metadata.senderAcceptance.accepted) {
+    assert.ok(capture.acceptanceResponse, `${name}: an accepted exchange must record the accepted response bytes`);
+    const response = capture.acceptanceResponse ?? Buffer.alloc(0);
+    const signal = parseSignal(response);
+    assert.ok(signal, `${name}: the recorded response must be an AS4 signal`);
+    if (signal) {
+      const check = await verifyReceipt({
+        signal,
+        as4MessageId: opened.messageId,
+        receiverCertificatePem: capture.receiverCertPem,
+        signedReferences: opened.receipt.signedReferences,
+        validateCertificate,
+        now: () => new Date(metadata.capturedAt),
+      });
+      assert.equal(check.ok, true, `${name}: the recorded receipt must verify: ${JSON.stringify(check)}`);
+    }
+  }
 
   return {
     name,

@@ -13,8 +13,10 @@ import { buildMultipartBody } from '../src/multipart.js';
 import { keyHolderFromKey } from '../src/receive/key-holder.js';
 import { openAs4Message } from '../src/receive/open.js';
 import { respondAs4Message } from '../src/receive/respond.js';
+import { verifyReceipt } from '../src/receipt/verify.js';
 import { PACKAGE_VERSION } from '../src/version.js';
 import { parseXml } from '../src/xml/nodes.js';
+import { parseSignal } from '../src/xml/signal.js';
 import { verifyWsSecuritySignature } from '../src/xml/ws-security.js';
 import type { CaptureMetadata, CaptureReference } from './helpers/capture.js';
 import { loadCapture, splitPemCertificates, verifyCapture } from './helpers/capture.js';
@@ -156,6 +158,19 @@ async function writeLocalCapture(dir: string, as4MessageId: string): Promise<voi
         });
         assert.equal(receipt.ok, true, JSON.stringify(receipt));
         if (!receipt.ok) throw new Error('unreachable');
+        // Run the sender's verifier before recording that the sender accepted the
+        // receipt: the recorded result must reflect a verified receipt.
+        const signal = parseSignal(Buffer.from(receipt.body));
+        assert.ok(signal, 'the generated receipt parses as a signal');
+        const check = await verifyReceipt({
+          signal: signal!,
+          as4MessageId,
+          receiverCertificatePem: pki.receiver.certPem,
+          signedReferences: opened.receipt.signedReferences,
+          validateCertificate: testValidator(pki),
+          now: () => now,
+        });
+        assert.equal(check.ok, true, `the sender must accept the receipt: ${JSON.stringify(check)}`);
         await writeFile(join(dir, 'sender-acceptance-response.bin'), receipt.body);
         await writeFile(
           join(dir, 'sender-acceptance.json'),
@@ -163,7 +178,7 @@ async function writeLocalCapture(dir: string, as4MessageId: string): Promise<voi
             {
               implementation: 'as4ts',
               version: PACKAGE_VERSION,
-              accepted: true,
+              accepted: check.ok,
               refToMessageId: opened.messageId,
               recordedAt: capturedAt,
               responseFile: 'sender-acceptance-response.bin',
@@ -245,4 +260,60 @@ test('splitPemCertificates keeps every block and rejects a malformed one', () =>
   assert.equal(blocks.length, 2);
   assert.notEqual(blocks[0], blocks[1]);
   assert.throws(() => splitPemCertificates('-----BEGIN CERTIFICATE-----\nbm90LWEtY2VydA==\n-----END CERTIFICATE-----'));
+});
+
+async function patchJson(dir: string, file: string, patch: (value: Record<string, unknown>) => void): Promise<void> {
+  const value = JSON.parse(readFileSync(join(dir, file), 'utf8')) as Record<string, unknown>;
+  patch(value);
+  await writeFile(join(dir, file), JSON.stringify(value, null, 2));
+}
+
+test('an invalid capturedAt is rejected before verification', async () => {
+  await withCapture(async (dir) => {
+    await patchJson(dir, 'metadata.json', (metadata) => {
+      metadata.capturedAt = 'not-a-date';
+    });
+    assert.throws(() => loadCapture(dir, 'bad-time'), /capturedAt/);
+  });
+});
+
+test('a naive (unzoned) capturedAt is rejected', async () => {
+  await withCapture(async (dir) => {
+    await patchJson(dir, 'metadata.json', (metadata) => {
+      metadata.capturedAt = '2026-01-01T00:00:00';
+    });
+    assert.throws(() => loadCapture(dir, 'naive-time'), /capturedAt/);
+  });
+});
+
+test('an invalid acceptance recordedAt is rejected', async () => {
+  await withCapture(async (dir) => {
+    await patchJson(dir, 'sender-acceptance.json', (evidence) => {
+      evidence.recordedAt = '2026-01-01 00:00:00';
+    });
+    assert.throws(() => loadCapture(dir, 'bad-recorded-at'), /recordedAt/);
+  });
+});
+
+test('an accepted exchange without response evidence is rejected', async () => {
+  await withCapture(async (dir) => {
+    await patchJson(dir, 'sender-acceptance.json', (evidence) => {
+      delete evidence.responseFile;
+      delete evidence.responseSha256Base64;
+    });
+    assert.throws(() => loadCapture(dir, 'no-response'), /response file/);
+  });
+});
+
+test('a recorded response that is not an AS4 receipt is rejected', async () => {
+  await withCapture(async (dir) => {
+    const junk = Buffer.from('this is not an AS4 receipt', 'utf8');
+    await writeFile(join(dir, 'sender-acceptance-response.bin'), junk);
+    await patchJson(dir, 'sender-acceptance.json', (evidence) => {
+      evidence.responseSha256Base64 = createHash('sha256').update(junk).digest('base64');
+    });
+    // The hash matches, so loading succeeds, but the bytes are not a verifying
+    // receipt for this request.
+    await assert.rejects(verifyCapture(loadCapture(dir, 'junk-response')));
+  });
 });

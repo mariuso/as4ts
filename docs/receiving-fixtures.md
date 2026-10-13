@@ -56,6 +56,18 @@ alone is only an assertion:
 }
 ```
 
+For an `accepted` exchange, `responseFile` and `responseSha256Base64` are
+required. The harness verifies the recorded response as a receipt for the
+captured request — signature, signer identity, correlation (`RefToMessageId`) and
+`NonRepudiationInformation` — using the sender's own receipt verifier. The
+recorded peer result is kept separately: it establishes that the independent
+sender accepted those bytes, while the receipt verification proves the bytes are
+the right receipt.
+
+`capturedAt` and the acceptance `recordedAt` must be ISO 8601 timestamps with an
+explicit zone (`Z` or `±HH:MM`); a naive or malformed value is rejected before
+verification, so a capture always demonstrates verification at a meaningful time.
+
 `metadata.json`:
 
 ```json
@@ -118,11 +130,12 @@ signer validation against the recorded trust chain, session-key unwrap with the
 captured receiver credential, decryption and payload recovery; then it compares
 the recovered payload hash, the declared process, document type and MIME part
 count, and the complete reference set (an exact URI set with matching digest,
-digest method and ordered transforms including inclusive prefixes), checks the
-recorded sender acceptance, and disposes every handle. The required metadata is
-validated centrally, so the ordinary suite and the gate enforce the same
-contract; a capture with a duplicate expected URI, an incorrect
-process/document-type/part count, or an unrelated reference set fails.
+digest method and ordered transforms including inclusive prefixes), verifies the
+recorded receipt against the captured request, and disposes every handle. The
+required metadata is validated centrally, so the ordinary suite and the gate
+enforce the same contract; a capture with a duplicate expected URI, an incorrect
+process/document-type/part count, an unrelated reference set, an unzoned
+timestamp, or an accepted exchange without a verifying receipt fails.
 
 - The ordinary suite (`npm test`) verifies whatever captures are present and
   skips when the directory holds none, so day-to-day work stays green.
