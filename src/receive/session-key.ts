@@ -145,13 +145,19 @@ export async function unwrapSessionKey(input: UnwrapSessionKeyInput): Promise<Un
       key.fill(0);
       throw new SessionKeyFault('aborted', 'aborted while unwrapping the session key');
     }
-    if (key.byteLength !== SESSION_KEY_BYTES) {
-      throw new SessionKeyFault(
-        'decrypt.bad-key-length',
-        `unwrapped key is ${key.byteLength} bytes, expected ${SESSION_KEY_BYTES}`,
-      );
+    // The provider's buffer is cleared in `finally`; the returned copy is owned
+    // by the payload pipeline, which clears it after both decrypt passes.
+    try {
+      if (key.byteLength !== SESSION_KEY_BYTES) {
+        throw new SessionKeyFault(
+          'decrypt.bad-key-length',
+          `unwrapped key is ${key.byteLength} bytes, expected ${SESSION_KEY_BYTES}`,
+        );
+      }
+      return { sessionKey: Buffer.from(key), credentialCertificate: holder.certificate };
+    } finally {
+      key.fill(0);
     }
-    return { sessionKey: Buffer.from(key), credentialCertificate: holder.certificate };
   }
 
   if (providerUnavailable) {

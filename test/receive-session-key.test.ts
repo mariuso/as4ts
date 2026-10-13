@@ -17,18 +17,20 @@ function holder(certificate: string, result: Uint8Array | Error, onCall?: () => 
   };
 }
 
-const KEY = Buffer.alloc(16, 7);
 const reason = (r: string) => (err: unknown) => err instanceof SessionKeyFault && err.reason === r;
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const zeroed = (buffer: Uint8Array): boolean => buffer.every((byte) => byte === 0);
 
-test('returns the 16-byte session key and the credential that produced it', async () => {
+test('returns an owned copy and clears the provider buffer', async () => {
+  const providerKey = Buffer.alloc(16, 7);
   const result = await unwrapSessionKey({
     wrappedKey: new Uint8Array([1]),
-    holders: [holder(pki.receiver.certPem, KEY)],
+    holders: [holder(pki.receiver.certPem, providerKey)],
     maxCandidates: 4,
   });
-  assert.deepEqual(result.sessionKey, KEY);
+  assert.deepEqual(result.sessionKey, Buffer.alloc(16, 7));
   assert.equal(result.credentialCertificate, pki.receiver.certPem);
+  assert.ok(zeroed(providerKey), 'the provider buffer is cleared');
 });
 
 test('prefers the credential named by the EncryptedKey', async () => {
@@ -47,7 +49,6 @@ test('prefers the credential named by the EncryptedKey', async () => {
 });
 
 test('orders the named credential before applying the cap', async () => {
-  // holders = [new, old], recipient names old, cap = 1 -> old must be the one tried.
   const result = await unwrapSessionKey({
     wrappedKey: new Uint8Array([1]),
     recipientCertificate: pki.receiver.certPem,
@@ -68,11 +69,13 @@ test('falls back to the candidate list when no certificate matches', async () =>
   assert.deepEqual(result.sessionKey, Buffer.alloc(16, 9));
 });
 
-test('rejects a malformed key length', async () => {
+test('clears the buffer of a malformed key before throwing', async () => {
+  const tooShort = Buffer.alloc(12, 3);
   await assert.rejects(
-    unwrapSessionKey({ wrappedKey: new Uint8Array([1]), holders: [holder('x', Buffer.alloc(12))], maxCandidates: 4 }),
+    unwrapSessionKey({ wrappedKey: new Uint8Array([1]), holders: [holder('x', tooShort)], maxCandidates: 4 }),
     reason('decrypt.bad-key-length'),
   );
+  assert.ok(zeroed(tooShort), 'the rejected buffer is cleared');
 });
 
 test('reports exhaustion when wrong credentials are tried', async () => {
@@ -99,7 +102,7 @@ test('a non-positive candidate bound attempts no credential', async () => {
   await assert.rejects(
     unwrapSessionKey({
       wrappedKey: new Uint8Array([1]),
-      holders: [holder('a', KEY, () => (calls += 1))],
+      holders: [holder('a', Buffer.alloc(16, 7), () => (calls += 1))],
       maxCandidates: 0,
     }),
     reason('decrypt.key-unwrap'),
@@ -115,7 +118,7 @@ test('bounds the number of credentials tried', async () => {
       holders: [
         holder('a', new Error('no'), () => (calls += 1)),
         holder('b', new Error('no'), () => (calls += 1)),
-        holder('c', KEY, () => (calls += 1)),
+        holder('c', Buffer.alloc(16, 7), () => (calls += 1)),
       ],
       maxCandidates: 2,
     }),
@@ -154,17 +157,14 @@ test('cancels a stalled provider and clears the abandoned result', async () => {
   release(late);
   await delay(10);
   assert.equal(await settled, 'rejected');
-  assert.ok(
-    late.every((byte) => byte === 0),
-    'the abandoned session key is cleared',
-  );
+  assert.ok(zeroed(late), 'the abandoned session key is cleared');
 });
 
 test('attaches handlers when the provider aborts synchronously', async () => {
   const controller = new AbortController();
   const unhandled: unknown[] = [];
-  const onUnhandled = (reason: unknown): void => {
-    unhandled.push(reason);
+  const onUnhandled = (reason2: unknown): void => {
+    unhandled.push(reason2);
   };
   process.on('unhandledRejection', onUnhandled);
   try {
