@@ -1,5 +1,7 @@
 import { createDecipheriv, createHash } from 'node:crypto';
+import type { DecipherGCM } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
+import type { WriteStream } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { Readable, Transform, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -8,6 +10,7 @@ import { createTempWorkspace, type TempWorkspace } from '../temp-file.js';
 import { safeMessage } from '../util.js';
 import { attachmentDigestBase64 } from './attachment.js';
 import { MessageBudget } from './budget.js';
+import { payloadHooks } from './payload-hooks.js';
 import { SessionKeyFault, unwrapSessionKey } from './session-key.js';
 import { XmlFault, defaultXmlLimits } from './xml.js';
 import type {
@@ -54,6 +57,7 @@ const PAYLOAD_FILE = 'payload.bin';
 
 class PayloadTooLarge extends Error {}
 class GcmFailure extends Error {}
+class DecompressFault extends Error {}
 
 function emit(onEvent: OnInboundEvent | undefined, event: InboundEvent): void {
   if (!onEvent) return;
@@ -114,13 +118,9 @@ async function* abortableStream(
 ): AsyncGenerator<Uint8Array> {
   const iterator = source[Symbol.asyncIterator]();
   let onAbort: (() => void) | null = null;
-  let aborted = false;
   const abortPromise = signal
     ? new Promise<never>((_resolve, reject) => {
-        const fail = (): void => {
-          aborted = true;
-          reject(abortError());
-        };
+        const fail = (): void => reject(abortError());
         if (signal.aborted) fail();
         else {
           onAbort = fail;
@@ -136,13 +136,16 @@ async function* abortableStream(
     }
   } finally {
     if (onAbort && signal) signal.removeEventListener('abort', onAbort);
-    if (aborted || onAbort) {
-      // Signal cleanup without blocking on it.
-      const returned = iterator.return?.();
-      if (returned) void Promise.resolve(returned).catch(() => {});
-    } else {
-      await iterator.return?.().catch(() => {});
+    // Signal the producer to stop without blocking on its cleanup: an external
+    // iterator's return() may stall or throw. This is non-blocking on every
+    // early-exit path, whether or not a signal was supplied.
+    let returned: unknown;
+    try {
+      returned = iterator.return?.();
+    } catch {
+      returned = null;
     }
+    if (returned) void Promise.resolve(returned).catch(() => {});
   }
 }
 
@@ -152,6 +155,12 @@ function discardingSink(): Writable {
       callback();
     },
   });
+}
+
+/** Open a private write stream, observable by tests through the hook. */
+function openWrite(path: string): WriteStream {
+  payloadHooks.onWriteStream?.(path);
+  return createWriteStream(path, { mode: 0o600 });
 }
 
 async function readRange(path: string, start: number, length: number): Promise<Buffer> {
@@ -194,7 +203,7 @@ async function spoolCiphertext(
       else callback(null, chunk);
     },
   });
-  await pipeline(abortableStream(source, signal), count, createWriteStream(filePath, { mode: 0o600 }), { signal });
+  await pipeline(abortableStream(source, signal), count, openWrite(filePath), { signal });
   return bytes;
 }
 
@@ -214,7 +223,7 @@ async function decryptPass(input: {
   const { ciphertextPath, size, sessionKey, maxBytes, signal, sinkPath } = input;
   const iv = await readRange(ciphertextPath, 0, IV_BYTES);
   const tag = await readRange(ciphertextPath, size - TAG_BYTES, TAG_BYTES);
-  const decipher = createDecipheriv('aes-128-gcm', sessionKey, iv);
+  const decipher = (payloadHooks.createDecipher ?? createDecipheriv)('aes-128-gcm', sessionKey, iv) as DecipherGCM;
   decipher.setAuthTag(tag);
   const hash = createHash('sha256');
   let bytes = 0;
@@ -249,7 +258,7 @@ async function decryptPass(input: {
     cipherEnd >= cipherStart
       ? createReadStream(ciphertextPath, { start: cipherStart, end: cipherEnd })
       : Readable.from([]);
-  const sink = sinkPath ? createWriteStream(sinkPath, { mode: 0o600 }) : discardingSink();
+  const sink = sinkPath ? openWrite(sinkPath) : discardingSink();
   await pipeline(source, consume, sink, { signal });
   return { bytes, digestBase64: hash.digest('base64') };
 }
@@ -257,6 +266,7 @@ async function decryptPass(input: {
 /** Decompress a gzip representation into the payload file, bounded and cancellable. */
 async function gunzipToFile(
   sourcePath: string,
+  representationSize: number,
   destPath: string,
   maxBytes: number,
   signal: AbortSignal | undefined,
@@ -274,9 +284,20 @@ async function gunzipToFile(
       callback(null, chunk);
     },
   });
-  await pipeline(createReadStream(sourcePath), createGunzip(), count, createWriteStream(destPath, { mode: 0o600 }), {
+  const gunzip = createGunzip();
+  await pipeline(createReadStream(sourcePath), gunzip, count, openWrite(destPath), {
     signal,
   });
+  // Enforce the policy: after the last decoded gzip member only NUL padding may
+  // remain. `gunzip.bytesWritten` is the input consumed by the decoder, so the
+  // rest of the representation is scanned for nonzero bytes.
+  const consumed = gunzip.bytesWritten;
+  if (consumed < representationSize) {
+    const trailing = await readRange(sourcePath, consumed, representationSize - consumed);
+    if (trailing.some((byte) => byte !== 0)) {
+      throw new DecompressFault('trailing data after the gzip stream');
+    }
+  }
   return { bytes, digestBase64: hash.digest('base64') };
 }
 
@@ -336,6 +357,8 @@ function mapFailure(err: unknown): InboundFailure {
   if (err instanceof PayloadTooLarge) return fail('payload', 'payload.too-large', err.message);
   if (err instanceof GcmFailure) return fail('decrypt', 'decrypt.gcm-auth', err.message);
   if (err instanceof XmlFault) return fail('xml', err.reason, err.message);
+  if (err instanceof DecompressFault) return fail('decompress', 'decompress.failed', err.message);
+  if (err instanceof RangeError) return fail('payload', 'limits.invalid', err.message);
   if (isAbortError(err)) return fail('transport', 'aborted');
   if (isDecompressError(err)) return fail('decompress', 'decompress.failed', safeMessage(err));
   if (isFileSystemError(err)) return fail('payload', 'payload.spool-failed', safeMessage(err));
@@ -363,11 +386,13 @@ export async function recoverInboundPayload(input: RecoverInboundPayloadInput): 
     );
   }
 
-  const budget = input.budget ?? new MessageBudget(limits.maxAggregateOutputBytes);
   let workspace: TempWorkspace | null = null;
   let sessionKey: Buffer | null = null;
   let keep = false;
   try {
+    // Validate the aggregate configuration inside the protected boundary, so an
+    // invalid limit returns a failure fact rather than throwing.
+    const budget = input.budget ?? new MessageBudget(limits.maxAggregateOutputBytes);
     workspace = await createTempWorkspace({
       ...(input.spoolDirectory ? { directory: input.spoolDirectory } : {}),
     });
@@ -467,6 +492,7 @@ export async function recoverInboundPayload(input: RecoverInboundPayloadInput): 
       const out = await timed(onEvent, 'decompress', () =>
         gunzipToFile(
           representationPath,
+          pass2.bytes,
           workspace!.path(PAYLOAD_FILE),
           Math.min(limits.maxDecompressedBytes, budget.remaining()),
           signal,

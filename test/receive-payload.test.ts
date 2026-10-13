@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createCipheriv, constants, privateDecrypt, publicEncrypt, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, constants, privateDecrypt, publicEncrypt, randomBytes } from 'node:crypto';
+import type { DecipherGCM } from 'node:crypto';
 import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,6 +22,7 @@ import {
 } from '../src/receive/types.js';
 import { MessageBudget } from '../src/receive/budget.js';
 import { attachmentDigestBase64 } from '../src/receive/attachment.js';
+import { payloadHooks } from '../src/receive/payload-hooks.js';
 import { createTestPki } from './helpers/pki.js';
 
 const pki = createTestPki();
@@ -412,6 +414,106 @@ test('gzip policy: concatenated members decode together; NUL padding is tolerate
   const garbageResult = await recoverInboundPayload(inputFor(garbage));
   assert.equal(garbageResult.ok, false);
   if (!garbageResult.ok) assert.equal(garbageResult.reason, 'decompress.failed');
+
+  // A NUL followed by non-padding data is not NUL-only padding.
+  const nulThenGarbage = await makeInbound(Buffer.concat([member, Buffer.from([0]), Buffer.from('garbage')]));
+  const nulThenGarbageResult = await recoverInboundPayload(inputFor(nulThenGarbage));
+  assert.equal(nulThenGarbageResult.ok, false);
+  if (!nulThenGarbageResult.ok) assert.equal(nulThenGarbageResult.reason, 'decompress.failed');
+
+  // ...and a NUL followed by a second member is not a valid concatenation.
+  const nulThenMember = await makeInbound(Buffer.concat([member, Buffer.from([0]), extra]));
+  const nulThenMemberResult = await recoverInboundPayload(inputFor(nulThenMember));
+  assert.equal(nulThenMemberResult.ok, false);
+  if (!nulThenMemberResult.ok) assert.equal(nulThenMemberResult.reason, 'decompress.failed');
+});
+
+test('an invalid aggregate limit is returned as a failure fact', async () => {
+  const built = await makeInbound(gzipSync(DOCUMENT));
+  const result = await recoverInboundPayload(
+    inputFor(built, { limits: { ...defaultInboundLimits, maxAggregateOutputBytes: Number.NaN } }),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'limits.invalid');
+});
+
+test('a limit failure returns promptly even when source cleanup stalls and no signal is given', async () => {
+  let returned = false;
+  const source: AsyncIterable<Uint8Array> = {
+    [Symbol.asyncIterator]() {
+      let sent = false;
+      return {
+        next(): Promise<IteratorResult<Uint8Array>> {
+          if (sent) return Promise.resolve({ value: undefined, done: true });
+          sent = true;
+          return Promise.resolve({ value: gzipSync(DOCUMENT), done: false });
+        },
+        return(): Promise<IteratorResult<Uint8Array>> {
+          returned = true;
+          return new Promise(() => {}); // never resolves
+        },
+      };
+    },
+  };
+  const built = await makeInbound(gzipSync(DOCUMENT));
+  const result = await recoverInboundPayload(
+    inputFor(built, {
+      attachment: { contentId: built.encryption.attachmentHref.slice(4), source },
+      limits: { ...defaultInboundLimits, maxPartBytes: 4 },
+    }),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'payload.too-large');
+  assert.ok(returned, 'the stalled source was signalled for cleanup');
+});
+
+test('no plaintext is written before pass-one authentication', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'as4-writes-'));
+  const writes: string[] = [];
+  payloadHooks.onWriteStream = (path) => writes.push(path);
+  try {
+    // A wrong digest fails in pass 1, so pass 2 must never open a writer.
+    const built = await makeInbound(gzipSync(DOCUMENT), { digest: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' });
+    const result = await recoverInboundPayload(inputFor(built, { spoolDirectory: dir }));
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.reason, 'signature.attachment-digest');
+    assert.deepEqual(
+      writes.map((path) => path.split('/').pop()),
+      ['ciphertext.bin'],
+    );
+  } finally {
+    payloadHooks.onWriteStream = undefined;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a second-pass finalization failure yields gcm-auth and removes partial files', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'as4-pass2-'));
+  let calls = 0;
+  payloadHooks.createDecipher = (algorithm, key, iv) => {
+    calls += 1;
+    if (calls === 2) {
+      return {
+        setAuthTag: () => {},
+        update: () => Buffer.alloc(0),
+        final: () => {
+          throw new Error('forced second-pass finalization failure');
+        },
+      } as unknown as DecipherGCM;
+    }
+    return createDecipheriv(algorithm, key, iv) as DecipherGCM;
+  };
+  try {
+    const built = await makeInbound(gzipSync(DOCUMENT));
+    const result = await recoverInboundPayload(inputFor(built, { spoolDirectory: dir }));
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.reason, 'decrypt.gcm-auth');
+    assert.equal(calls, 2, 'each pass used a fresh decipher');
+    assert.deepEqual(await readdir(dir), [], 'partial outputs are removed');
+  } finally {
+    payloadHooks.createDecipher = undefined;
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('a failed disposal is reported, retryable and idempotent', async (t) => {

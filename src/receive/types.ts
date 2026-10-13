@@ -95,7 +95,8 @@ export type InboundFailureReason =
   | 'addressing.unsupported'
   | 'addressing.mpc'
   | 'addressing.sbdh-mismatch'
-  // local
+  /** local */
+  | 'limits.invalid'
   | 'payload.spool-failed'
   | 'payload.too-large'
   | 'internal.error';
