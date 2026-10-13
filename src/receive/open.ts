@@ -251,7 +251,7 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
     }
     correlation = { messageId: headers.messageId, senderId: headers.fromPartyId, receiverId: headers.toPartyId };
     if (!isSupportedCompression(headers.compressionType)) {
-      return fail('addressing', 'addressing.unsupported', `unsupported compression ${headers.compressionType}`);
+      return fail('addressing', 'addressing.pmode-mismatch', `unsupported compression ${headers.compressionType}`);
     }
 
     const encryption = parseInboundEncryption(document);

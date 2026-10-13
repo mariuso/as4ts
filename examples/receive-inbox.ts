@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Example: a durable AS4 inbox with lost-response recovery.
+ * Example: a durable AS4 inbox with duplicate suppression and lost-response
+ * recovery.
  *
  * This file is an example, not part of the published package. It shows the
  * receiving contract end to end against a local sender:
@@ -10,21 +11,24 @@
  *   respondAs4Message  produce the exact signed receipt bytes
  *   persist            store those bytes, then write the HTTP response
  *
- * A second delivery of the same message plays the stored receipt back
- * byte-for-byte instead of delivering the document twice. If the process
- * committed the record but crashed before persisting the response, the receipt
- * is regenerated from the retained evidence with `decision: 'already-committed'`
- * and no second business delivery.
+ * The inbox demonstrates: commit before acknowledging; atomic, fsynced
+ * publication of the committed record and the response; per-MessageId
+ * serialization so a concurrent duplicate is delivered once; rejection of
+ * conflicting reuse of an id; replay of the stored receipt on a duplicate; and
+ * regeneration from retained evidence when the response was lost — including
+ * rebuilding the index from disk as a restart would.
  *
  *   npm run examples:receive
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readFile, readdir, rename, rm } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createServer, request as httpsRequest } from 'node:https';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
+import type { Readable as ReadableStream } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { prepareAs4, transmitAs4, type PreparedMessage, type SendAs4Result } from '../src/index.js';
 import {
@@ -45,6 +49,14 @@ import { createTestPki, createTlsServerCert } from '../test/helpers/pki.js';
 const DEADLINE_MS = 15_000;
 const RECEIVER_IDENTITY_SCHEME = 'urn:fdc:peppol.eu:2017:identifiers:ap';
 
+/** The authenticated compressed/original representation metadata retained as evidence. */
+interface RepresentationFacts {
+  readonly mediaType: string;
+  readonly byteLength: number;
+  readonly rawDigestBase64: string;
+  readonly transformDigestBase64: string;
+}
+
 /** A persisted inbox record: the durable acceptance a receipt attests to. */
 interface InboxRecord {
   readonly schema: 1;
@@ -53,8 +65,16 @@ interface InboxRecord {
   readonly receiverId: string;
   /** Stable identity of the verified signed content (not a hash of the wire bytes). */
   readonly contentKey: string;
+  readonly representation: RepresentationFacts;
   readonly receipt: ReceiptContext;
   readonly committedAt: string;
+}
+
+interface StoredResponse {
+  readonly status: number;
+  readonly contentType: string;
+  readonly headers: Record<string, string>;
+  readonly body: Buffer;
 }
 
 /**
@@ -74,15 +94,54 @@ function signedContentKey(receipt: ReceiptContext): string {
   return hash.digest('base64');
 }
 
+/** Write bytes to a fresh file, fsync its contents, then close it. */
+async function durableWrite(path: string, data: string | Uint8Array): Promise<void> {
+  const handle = await open(path, 'w', 0o600);
+  try {
+    await handle.writeFile(data);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Stream a source into `dir/name`, fsync its contents, then close it. */
+async function durableStream(dir: string, name: string, source: ReadableStream): Promise<void> {
+  const path = join(dir, name);
+  await pipeline(source, createWriteStream(path, { mode: 0o600 }));
+  const handle = await open(path, 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+/** fsync a directory so a rename survives a crash. Best-effort across platforms. */
+async function syncDir(path: string): Promise<void> {
+  try {
+    const handle = await open(path, 'r');
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    // Some platforms/filesystems do not permit fsync on a directory handle.
+  }
+}
+
 /**
- * A minimal durable inbox: payload, evidence, receipt context and the exact
- * response bytes on disk, with an in-memory index rebuilt from disk on restart.
- * The message id is hashed to a directory name so a hostile id cannot escape the
- * root.
+ * A durable inbox: payload, representation, evidence, receipt context and the
+ * exact response bytes on disk, published atomically, with an in-memory index
+ * rebuilt from disk on restart. The message id is hashed to a directory name so
+ * a hostile id cannot escape the root.
  */
 class DurableInbox {
   private readonly index = new Map<string, InboxRecord>();
+  private readonly locks = new Map<string, Promise<void>>();
   deliveries = 0;
+  conflicts = 0;
 
   constructor(private readonly root: string) {}
 
@@ -108,47 +167,105 @@ class DurableInbox {
     }
   }
 
+  /** Drop the in-memory index and rebuild it from disk, as after a process restart. */
+  async reload(): Promise<void> {
+    this.index.clear();
+    await this.load();
+  }
+
+  /**
+   * Serialize all work for one MessageId so lookup -> commit -> response
+   * persistence is atomic with respect to concurrent deliveries of the same
+   * message. A production store must also enforce a transactional unique
+   * constraint on the authenticated id.
+   */
+  async run<T>(messageId: string, task: () => Promise<T>): Promise<T> {
+    const key = this.dir(messageId);
+    const prior = this.locks.get(key) ?? Promise.resolve();
+    const result = prior.then(() => task());
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.locks.set(key, tail);
+    try {
+      return await result;
+    } finally {
+      if (this.locks.get(key) === tail) this.locks.delete(key);
+    }
+  }
+
+  /**
+   * Stage the whole record, fsync it, then publish it with a single atomic
+   * rename and fsync the parent. The record only becomes visible to a restart
+   * once every byte it references is durable.
+   */
   async commit(opened: OpenSuccess, contentKey: string): Promise<InboxRecord> {
     const dir = this.dir(opened.messageId);
-    await mkdir(dir, { recursive: true });
-    await pipeline(opened.payload.read(), createWriteStream(join(dir, 'payload.bin'), { mode: 0o600 }));
-    await writeFile(join(dir, 'envelope.bin'), opened.evidence.envelopeBytes);
-    await writeFile(join(dir, 'signer.pem'), opened.evidence.signerCertificate, { mode: 0o600 });
+    const staging = `${dir}.staging-${randomUUID()}`;
+    await mkdir(staging, { recursive: true });
+    await durableStream(staging, 'payload.bin', opened.payload.read());
+    // The signature authenticates these bytes; recompressing the payload cannot
+    // reproduce them, so retain the original representation verbatim.
+    await durableStream(staging, 'representation.bin', opened.representation.read());
+    await durableWrite(join(staging, 'envelope.bin'), opened.evidence.envelopeBytes);
+    await durableWrite(join(staging, 'signer.pem'), opened.evidence.signerCertificate);
     const record: InboxRecord = {
       schema: 1,
       messageId: opened.messageId,
       senderId: opened.senderId,
       receiverId: opened.receiverId,
       contentKey,
+      representation: {
+        mediaType: opened.representation.mediaType,
+        byteLength: opened.representation.byteLength,
+        rawDigestBase64: opened.representation.rawDigestBase64,
+        transformDigestBase64: opened.representation.transformDigestBase64,
+      },
       receipt: opened.receipt,
       committedAt: new Date().toISOString(),
     };
-    await writeFile(join(dir, 'inbox.json'), JSON.stringify(record, null, 2));
+    await durableWrite(join(staging, 'inbox.json'), JSON.stringify(record, null, 2));
+    await syncDir(staging);
+    await rename(staging, dir);
+    await syncDir(this.root);
     this.index.set(record.messageId, record);
     this.deliveries += 1;
     return record;
   }
 
+  /** Publish the exact response bytes as one atomic file, fsynced. */
   async saveResponse(messageId: string, response: RespondSuccess): Promise<void> {
     const dir = this.dir(messageId);
-    await writeFile(join(dir, 'response.body'), response.body, { mode: 0o600 });
-    await writeFile(
-      join(dir, 'response.json'),
-      JSON.stringify({ status: response.status, contentType: response.contentType, headers: response.headers }),
-    );
+    const staging = `${dir}.response-${randomUUID()}`;
+    await mkdir(staging, { recursive: true });
+    const published = JSON.stringify({
+      status: response.status,
+      contentType: response.contentType,
+      headers: response.headers,
+      bodyBase64: Buffer.from(response.body).toString('base64'),
+    });
+    await durableWrite(join(staging, 'response.json'), published);
+    await syncDir(staging);
+    await rename(join(staging, 'response.json'), join(dir, 'response.json'));
+    await syncDir(dir);
+    await rm(staging, { recursive: true, force: true });
   }
 
-  async response(
-    messageId: string,
-  ): Promise<{ status: number; contentType: string; headers: Record<string, string>; body: Buffer } | null> {
+  async response(messageId: string): Promise<StoredResponse | null> {
     try {
-      const meta = JSON.parse(await readFile(join(this.dir(messageId), 'response.json'), 'utf8')) as {
+      const parsed = JSON.parse(await readFile(join(this.dir(messageId), 'response.json'), 'utf8')) as {
         status: number;
         contentType: string;
         headers: Record<string, string>;
+        bodyBase64: string;
       };
-      const body = await readFile(join(this.dir(messageId), 'response.body'));
-      return { ...meta, body };
+      return {
+        status: parsed.status,
+        contentType: parsed.contentType,
+        headers: parsed.headers,
+        body: Buffer.from(parsed.bodyBase64, 'base64'),
+      };
     } catch {
       return null;
     }
@@ -156,7 +273,6 @@ class DurableInbox {
 
   /** Simulate losing the persisted response (e.g. a crash between respond and write). */
   async forgetResponse(messageId: string): Promise<void> {
-    await rm(join(this.dir(messageId), 'response.body'), { force: true });
     await rm(join(this.dir(messageId), 'response.json'), { force: true });
   }
 }
@@ -208,50 +324,58 @@ async function reject(res: ServerResponse, failure: InboundFailure, deps: Deps):
 }
 
 async function accept(res: ServerResponse, opened: OpenSuccess, deps: Deps): Promise<void> {
+  const messageId = opened.messageId;
   const contentKey = signedContentKey(opened.receipt);
-  const existing = deps.inbox.get(opened.messageId);
+  try {
+    await deps.inbox.run(messageId, async () => {
+      const existing = deps.inbox.get(messageId);
+      if (existing) {
+        if (existing.contentKey !== contentKey) {
+          // Same id, different verified content: reject the conflicting reuse and
+          // do not substitute the earlier receipt.
+          deps.inbox.conflicts += 1;
+          send(res, 409, `conflicting reuse of ${messageId}`);
+          return;
+        }
+        const stored = await deps.inbox.response(messageId);
+        if (stored) {
+          res.writeHead(stored.status, { 'content-type': stored.contentType, ...stored.headers });
+          res.end(stored.body);
+          return;
+        }
+        // Committed, but the response was lost before it was persisted: regenerate
+        // from the retained evidence, with no second delivery.
+        const regenerated = await respondAs4Message({
+          kind: 'accepted',
+          receipt: existing.receipt,
+          decision: 'already-committed',
+          signer: deps.signer,
+          now: () => new Date(),
+        });
+        if (!regenerated.ok) return send(res, 500, `receipt recovery failed: ${regenerated.reason}`);
+        await deps.inbox.saveResponse(messageId, regenerated);
+        return write(res, regenerated);
+      }
 
-  if (existing) {
-    await opened.dispose();
-    if (existing.contentKey !== contentKey) {
-      // Same id, different verified content: reject the conflicting reuse and do
-      // not substitute the earlier receipt.
-      return send(res, 409, `conflicting reuse of ${opened.messageId}`);
-    }
-    const stored = await deps.inbox.response(opened.messageId);
-    if (stored) {
-      res.writeHead(stored.status, { 'content-type': stored.contentType, ...stored.headers });
-      res.end(stored.body);
-      return;
-    }
-    // Committed, but the response was lost before it was persisted: regenerate a
-    // receipt from the retained evidence, with no second delivery.
-    const regenerated = await respondAs4Message({
-      kind: 'accepted',
-      receipt: existing.receipt,
-      decision: 'already-committed',
-      signer: deps.signer,
-      now: () => new Date(),
+      // New message: commit before acknowledging, then acknowledge, then persist
+      // the exact response bytes before writing them.
+      const record = await deps.inbox.commit(opened, contentKey);
+      const generated = await respondAs4Message({
+        kind: 'accepted',
+        receipt: record.receipt,
+        decision: 'committed',
+        signer: deps.signer,
+        now: () => new Date(),
+      });
+      if (!generated.ok) return send(res, 500, `receipt generation failed: ${generated.reason}`);
+      await deps.inbox.saveResponse(messageId, generated);
+      write(res, generated);
     });
-    if (!regenerated.ok) return send(res, 500, `receipt recovery failed: ${regenerated.reason}`);
-    await deps.inbox.saveResponse(opened.messageId, regenerated);
-    return write(res, regenerated);
+  } finally {
+    // Every acceptance path — including a rejected commit or a conflict — releases
+    // the opened handles.
+    await opened.dispose();
   }
-
-  // New message: commit before acknowledging, then acknowledge, then persist the
-  // exact response bytes before writing them.
-  const record = await deps.inbox.commit(opened, contentKey);
-  const response = await respondAs4Message({
-    kind: 'accepted',
-    receipt: record.receipt,
-    decision: 'committed',
-    signer: deps.signer,
-    now: () => new Date(),
-  });
-  await opened.dispose();
-  if (!response.ok) return send(res, 500, `receipt generation failed: ${response.reason}`);
-  await deps.inbox.saveResponse(opened.messageId, response);
-  write(res, response);
 }
 
 function write(res: ServerResponse, response: RespondSuccess): void {
@@ -311,6 +435,24 @@ function postRaw(url: string, caPem: string, contentType: string, body: string):
   });
 }
 
+function receiptBytes(result: SendAs4Result): Buffer | null {
+  return result.outcome === 'receipt-verified' ? Buffer.from(result.receipt.raw) : null;
+}
+
+async function prepare(
+  pki: ReturnType<typeof createTestPki>,
+  url: string,
+  caPem: string,
+  as4MessageId: string,
+  payloadXml: string,
+): Promise<PreparedMessage> {
+  const prepared = await prepareAs4(
+    baseInput(pki, url, caPem, { as4MessageId, payload: Readable.from(Buffer.from(payloadXml, 'utf8')) }),
+  );
+  if (prepared.outcome !== 'prepared') throw new Error(`prepare failed: ${prepared.outcome} ${prepared.reason}`);
+  return prepared.message;
+}
+
 async function main(): Promise<void> {
   const pki = createTestPki();
   const tls = createTlsServerCert();
@@ -335,47 +477,70 @@ async function main(): Promise<void> {
   const url = `https://localhost:${port}/as4`;
   console.log(`durable inbox listening on ${url}`);
 
-  const prepared = await prepareAs4(baseInput(pki, url, tls.caPem, { as4MessageId: 'inbox-demo@as4-sender' }));
-  if (prepared.outcome !== 'prepared') {
-    console.error(`prepare failed: ${prepared.outcome} ${prepared.reason}`);
-    server.close();
-    await rm(root, { recursive: true, force: true });
-    process.exit(1);
-  }
-
+  const messages: PreparedMessage[] = [];
+  let ok = false;
   try {
+    const a = await prepare(pki, url, tls.caPem, 'inbox-demo@as4-sender', '<?xml version="1.0"?><doc>a</doc>');
+    messages.push(a);
+
     // 1. First delivery: verify, commit, respond, persist.
-    const first = await transmit(prepared.message, pki, tls.caPem);
+    const first = await transmit(a, pki, tls.caPem);
     console.log(`first delivery:   ${first.outcome}  (deliveries=${inbox.deliveries})`);
 
     // 2. Same message again: the stored receipt is replayed byte-for-byte.
-    const second = await transmit(prepared.message, pki, tls.caPem);
-    const replayed =
-      first.outcome === 'receipt-verified' &&
-      second.outcome === 'receipt-verified' &&
-      Buffer.from(first.receipt.raw).equals(Buffer.from(second.receipt.raw));
+    const second = await transmit(a, pki, tls.caPem);
+    const firstBytes = receiptBytes(first);
+    const replayed = firstBytes !== null && firstBytes.equals(receiptBytes(second) ?? Buffer.alloc(0));
     console.log(`duplicate:        ${second.outcome}  replay=${replayed}  (deliveries=${inbox.deliveries})`);
 
-    // 3. Committed but response lost: regenerate from retained evidence.
-    await inbox.forgetResponse(prepared.message.as4MessageId);
-    const third = await transmit(prepared.message, pki, tls.caPem);
-    console.log(`lost response:    ${third.outcome}  recovered  (deliveries=${inbox.deliveries})`);
+    // 3. Restart + lost response: rebuild the index from disk and regenerate the
+    // receipt from retained evidence. Two concurrent deliveries must still
+    // deliver once and replay the same recovered receipt.
+    await inbox.forgetResponse(a.as4MessageId);
+    await inbox.reload();
+    const recovered = await Promise.all([transmit(a, pki, tls.caPem), transmit(a, pki, tls.caPem)]);
+    const recoveredBytes = recovered.map(receiptBytes);
+    const recoveryOk = recoveredBytes.every((bytes) => bytes !== null) && recoveredBytes[0]!.equals(recoveredBytes[1]!);
+    console.log(
+      `lost response:    ${recovered[0]!.outcome}/${recovered[1]!.outcome}  concurrent-recovery=${recoveryOk}  (deliveries=${inbox.deliveries})`,
+    );
 
-    // 4. A malformed request is a transport rejection, not an invented ebMS error.
+    // 4. Concurrent first delivery of a new message: serialized to one commit.
+    const b = await prepare(pki, url, tls.caPem, 'concurrent@as4-sender', '<?xml version="1.0"?><doc>b</doc>');
+    messages.push(b);
+    const concurrent = await Promise.all([transmit(b, pki, tls.caPem), transmit(b, pki, tls.caPem)]);
+    const concurrentBytes = concurrent.map(receiptBytes);
+    const concurrentOk =
+      concurrentBytes.every((bytes) => bytes !== null) && concurrentBytes[0]!.equals(concurrentBytes[1]!);
+    console.log(
+      `concurrent new:   ${concurrent[0]!.outcome}/${concurrent[1]!.outcome}  single-delivery=${concurrentOk}  (deliveries=${inbox.deliveries})`,
+    );
+
+    // 5. Concurrent conflicting reuse of an id with different signed content: the
+    // first commitment wins and the other is rejected.
+    const c1 = await prepare(pki, url, tls.caPem, 'conflict@as4-sender', '<?xml version="1.0"?><doc>one</doc>');
+    const c2 = await prepare(pki, url, tls.caPem, 'conflict@as4-sender', '<?xml version="1.0"?><doc>two</doc>');
+    messages.push(c1, c2);
+    await Promise.all([transmit(c1, pki, tls.caPem), transmit(c2, pki, tls.caPem)]);
+    console.log(`conflict:         rejected=${inbox.conflicts === 1}  (deliveries=${inbox.deliveries})`);
+
+    // 6. A malformed upload is a transport rejection, not an invented ebMS error.
     const malformedStatus = await postRaw(url, tls.caPem, 'text/plain', 'not as4');
     console.log(`malformed upload: HTTP ${malformedStatus}`);
 
-    const ok = replayed && inbox.deliveries === 1 && malformedStatus === 400;
-    await prepared.message.dispose();
+    ok =
+      replayed &&
+      recoveryOk &&
+      concurrentOk &&
+      inbox.deliveries === 3 &&
+      inbox.conflicts === 1 &&
+      malformedStatus === 400;
+  } finally {
+    for (const message of messages) await message.dispose().catch(() => {});
     server.close();
     await rm(root, { recursive: true, force: true });
-    process.exit(ok ? 0 : 1);
-  } catch (err) {
-    await prepared.message.dispose().catch(() => {});
-    server.close();
-    await rm(root, { recursive: true, force: true });
-    throw err;
   }
+  process.exit(ok ? 0 : 1);
 }
 
 await main();

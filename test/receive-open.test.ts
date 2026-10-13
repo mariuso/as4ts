@@ -355,7 +355,7 @@ test('rejects a duplicated UserMessage (re-signed end to end)', async () => {
       assert.equal(result.ok, false);
       if (!result.ok) {
         assert.equal(result.stage, 'addressing');
-        assert.equal(result.reason, 'addressing.unsupported');
+        assert.equal(result.reason, 'addressing.invalid-header');
       }
     },
     duplicateUserMessage,

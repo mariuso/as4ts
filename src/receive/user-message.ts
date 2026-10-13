@@ -50,14 +50,14 @@ function directChildren(node: Element | null | undefined, ns: string, localName:
 
 function exactly(node: Element | null | undefined, ns: string, localName: string, what: string): Element {
   const matches = directChildren(node, ns, localName);
-  if (matches.length === 0) throw new AddressingFault('addressing.unsupported', `missing ${what}`);
-  if (matches.length > 1) throw new AddressingFault('addressing.unsupported', `more than one ${what}`);
+  if (matches.length === 0) throw new AddressingFault('addressing.invalid-header', `missing ${what}`);
+  if (matches.length > 1) throw new AddressingFault('addressing.invalid-header', `more than one ${what}`);
   return matches[0]!;
 }
 
 function atMostOne(node: Element | null | undefined, ns: string, localName: string, what: string): Element | null {
   const matches = directChildren(node, ns, localName);
-  if (matches.length > 1) throw new AddressingFault('addressing.unsupported', `more than one ${what}`);
+  if (matches.length > 1) throw new AddressingFault('addressing.invalid-header', `more than one ${what}`);
   return matches[0] ?? null;
 }
 
@@ -68,7 +68,7 @@ function text(element: Element | null): string | null {
 
 function requiredText(node: Element | null | undefined, ns: string, localName: string, what: string): string {
   const value = text(exactly(node, ns, localName, what));
-  if (value === null) throw new AddressingFault('addressing.unsupported', `empty ${what}`);
+  if (value === null) throw new AddressingFault('addressing.invalid-header', `empty ${what}`);
   return value;
 }
 
@@ -77,8 +77,8 @@ function namedProperties(properties: Element | null | undefined, what: string): 
   const map = new Map<string, Element>();
   for (const property of directChildren(properties, EBMS_NS, 'Property')) {
     const name = property.getAttribute('name');
-    if (!name) throw new AddressingFault('addressing.unsupported', `a ${what} Property has no name`);
-    if (map.has(name)) throw new AddressingFault('addressing.unsupported', `duplicate ${what} Property ${name}`);
+    if (!name) throw new AddressingFault('addressing.invalid-header', `a ${what} Property has no name`);
+    if (map.has(name)) throw new AddressingFault('addressing.invalid-header', `duplicate ${what} Property ${name}`);
     map.set(name, property);
   }
   return map;
@@ -106,19 +106,19 @@ export function readUserMessage(envelope: Document, profile: Profile): UserMessa
     [toPartyIdElement, 'To/PartyId'],
   ] as const) {
     if (element.getAttribute('type') !== profile.partyIdType) {
-      throw new AddressingFault('addressing.unsupported', `${what} type is not the profile party id type`);
+      throw new AddressingFault('addressing.pmode-mismatch', `${what} type is not the profile party id type`);
     }
   }
   const fromPartyId = text(fromPartyIdElement);
   const toPartyId = text(toPartyIdElement);
   if (fromPartyId === null || toPartyId === null) {
-    throw new AddressingFault('addressing.unsupported', 'empty PartyId');
+    throw new AddressingFault('addressing.invalid-header', 'empty PartyId');
   }
   if (text(exactly(from, EBMS_NS, 'Role', 'From/Role')) !== profile.initiatorRole) {
-    throw new AddressingFault('addressing.unsupported', 'From/Role is not the initiator role');
+    throw new AddressingFault('addressing.pmode-mismatch', 'From/Role is not the initiator role');
   }
   if (text(exactly(to, EBMS_NS, 'Role', 'To/Role')) !== profile.responderRole) {
-    throw new AddressingFault('addressing.unsupported', 'To/Role is not the responder role');
+    throw new AddressingFault('addressing.pmode-mismatch', 'To/Role is not the responder role');
   }
 
   const collaboration = exactly(userMessage, EBMS_NS, 'CollaborationInfo', 'CollaborationInfo');
@@ -126,12 +126,12 @@ export function readUserMessage(envelope: Document, profile: Profile): UserMessa
   const serviceScheme = serviceElement.getAttribute('type');
   const serviceValue = text(serviceElement);
   if (!serviceScheme || !serviceValue) {
-    throw new AddressingFault('addressing.unsupported', 'missing CollaborationInfo/Service');
+    throw new AddressingFault('addressing.invalid-header', 'missing CollaborationInfo/Service');
   }
   const action = requiredText(collaboration, EBMS_NS, 'Action', 'CollaborationInfo/Action');
   const agreement = text(atMostOne(collaboration, EBMS_NS, 'AgreementRef', 'AgreementRef'));
   if (agreement !== null && agreement !== profile.agreementRef) {
-    throw new AddressingFault('addressing.unsupported', 'AgreementRef is not the profile agreement');
+    throw new AddressingFault('addressing.pmode-mismatch', 'AgreementRef is not the profile agreement');
   }
   const conversationId = text(atMostOne(collaboration, EBMS_NS, 'ConversationId', 'ConversationId'));
 
@@ -147,7 +147,7 @@ export function readUserMessage(envelope: Document, profile: Profile): UserMessa
   const originalSenderElement = properties.get('originalSender');
   const finalRecipientElement = properties.get('finalRecipient');
   if (!originalSenderElement || !finalRecipientElement) {
-    throw new AddressingFault('addressing.unsupported', 'missing originalSender or finalRecipient property');
+    throw new AddressingFault('addressing.invalid-header', 'missing originalSender or finalRecipient property');
   }
   const originalSender = participantProperty(originalSenderElement, 'originalSender');
   const finalRecipient = participantProperty(finalRecipientElement, 'finalRecipient');
@@ -155,7 +155,7 @@ export function readUserMessage(envelope: Document, profile: Profile): UserMessa
   const payloadInfo = exactly(userMessage, EBMS_NS, 'PayloadInfo', 'PayloadInfo');
   const partInfo = exactly(payloadInfo, EBMS_NS, 'PartInfo', 'PayloadInfo/PartInfo');
   const partHref = partInfo.getAttribute('href');
-  if (!partHref) throw new AddressingFault('addressing.unsupported', 'missing PayloadInfo/PartInfo href');
+  if (!partHref) throw new AddressingFault('addressing.invalid-header', 'missing PayloadInfo/PartInfo href');
   const partProperties = atMostOne(partInfo, EBMS_NS, 'PartProperties', 'PartProperties');
   const compressionType = partProperties
     ? text(namedProperties(partProperties, 'Part').get('CompressionType') ?? null)
@@ -182,7 +182,7 @@ function participantProperty(property: Element, what: string): ScopedId {
   const scheme = property.getAttribute('type');
   const value = text(property);
   if (!scheme || value === null) {
-    throw new AddressingFault('addressing.unsupported', `${what} property has no type or value`);
+    throw new AddressingFault('addressing.invalid-header', `${what} property has no type or value`);
   }
   return { scheme, value };
 }

@@ -17,8 +17,11 @@ test('maps receiving failures to deliberate ebMS errors', () => {
   assert.equal(ebmsErrorFor(failure('decrypt.key-unavailable')).code, 'EBMS:0102');
   assert.equal(ebmsErrorFor(failure('signature.bad-signature')).code, 'EBMS:0101');
   assert.equal(ebmsErrorFor(failure('certificate.untrusted')).code, 'EBMS:0101');
-  assert.equal(ebmsErrorFor(failure('addressing.unsupported')).code, 'EBMS:0103');
-  assert.equal(ebmsErrorFor(failure('addressing.sbdh-mismatch')).code, 'EBMS:0103');
+  assert.equal(ebmsErrorFor(failure('addressing.party-mismatch')).code, 'EBMS:0103');
+  assert.equal(ebmsErrorFor(failure('addressing.invalid-header')).code, 'EBMS:0009');
+  assert.equal(ebmsErrorFor(failure('addressing.pmode-mismatch')).code, 'EBMS:0010');
+  assert.equal(ebmsErrorFor(failure('addressing.mpc')).code, 'EBMS:0010');
+  assert.equal(ebmsErrorFor(failure('addressing.sbdh-mismatch')).code, 'EBMS:0003');
   assert.equal(ebmsErrorFor(failure('mime.no-soap-part')).code, 'EBMS:0007');
   assert.equal(ebmsErrorFor(failure('xml.malformed')).code, 'EBMS:0009');
   assert.equal(ebmsErrorFor(failure('payload.spool-failed')).code, 'EBMS:0202');

@@ -43,10 +43,13 @@ function envelope(messaging: string): Document {
   );
 }
 
-function rejectAddressing(document: Document): boolean {
+function rejectAddressing(
+  document: Document,
+  reason: 'addressing.invalid-header' | 'addressing.pmode-mismatch',
+): boolean {
   assert.throws(
     () => readUserMessage(document, peppolProfile),
-    (err) => err instanceof AddressingFault && err.reason === 'addressing.unsupported',
+    (err) => err instanceof AddressingFault && err.reason === reason,
   );
   return true;
 }
@@ -63,17 +66,24 @@ test('reads a complete UserMessage into verified facts', () => {
 });
 
 test('rejects more than one UserMessage by cardinality, not first match', () => {
-  rejectAddressing(envelope(`<eb:Messaging>${userMessage()}${userMessage()}</eb:Messaging>`));
+  rejectAddressing(
+    envelope(`<eb:Messaging>${userMessage()}${userMessage()}</eb:Messaging>`),
+    'addressing.invalid-header',
+  );
 });
 
 test('rejects more than one eb:Messaging', () => {
   rejectAddressing(
     envelope(`<eb:Messaging>${userMessage()}</eb:Messaging><eb:Messaging>${userMessage()}</eb:Messaging>`),
+    'addressing.invalid-header',
   );
 });
 
-test('rejects a PartyId whose type is not the profile type', () => {
-  rejectAddressing(envelope(`<eb:Messaging>${userMessage({ partyIdType: 'urn:wrong' })}</eb:Messaging>`));
+test('rejects a PartyId whose type is not the profile type as a P-Mode mismatch', () => {
+  rejectAddressing(
+    envelope(`<eb:Messaging>${userMessage({ partyIdType: 'urn:wrong' })}</eb:Messaging>`),
+    'addressing.pmode-mismatch',
+  );
 });
 
 test('rejects duplicate Message properties', () => {
@@ -81,5 +91,5 @@ test('rejects duplicate Message properties', () => {
     '</eb:MessageProperties>',
     '<eb:Property name="originalSender" type="iso6523-actorid-upis">x</eb:Property></eb:MessageProperties>',
   );
-  rejectAddressing(envelope(`<eb:Messaging>${duplicated}</eb:Messaging>`));
+  rejectAddressing(envelope(`<eb:Messaging>${duplicated}</eb:Messaging>`), 'addressing.invalid-header');
 });

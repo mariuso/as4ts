@@ -74,7 +74,11 @@ validates the persisted context, but the assertion itself is the caller's.
 [`examples/receive-inbox.ts`](../examples/receive-inbox.ts) shows a concrete
 durable inbox: commit payload, evidence and receipt context, then respond,
 persist the response bytes, write the HTTP response, and replay or regenerate the
-receipt on a duplicate. Run it with `npm run examples:receive`.
+receipt on a duplicate. Run it with `npm run examples:receive`. Its persistence
+is atomic and fsynced (staged files, an atomic rename, a parent-directory sync),
+so a receipt is only issued once the accepted bytes are durable. The in-process
+per-id lock is illustrative: a production store must additionally enforce a
+transactional unique constraint on the authenticated message identity.
 
 ## Left to the caller
 

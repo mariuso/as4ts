@@ -92,7 +92,8 @@ export type InboundFailureReason =
   | 'decompress.too-large'
   // addressing / profile
   | 'addressing.party-mismatch'
-  | 'addressing.unsupported'
+  | 'addressing.invalid-header'
+  | 'addressing.pmode-mismatch'
   | 'addressing.mpc'
   | 'addressing.sbdh-mismatch'
   /** local */
