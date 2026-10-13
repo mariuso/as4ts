@@ -1,0 +1,268 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createCipheriv, constants, privateDecrypt, publicEncrypt, randomBytes } from 'node:crypto';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Readable } from 'node:stream';
+import { gzipSync } from 'node:zlib';
+import { ALGO_SHA256, AS4_COMPRESSION_TYPE, SWA_TRANSFORM_SIGNATURE, XENC_NS } from '../src/constants.js';
+import { buildEnvelope } from '../src/xml/envelope.js';
+import { firstByLocalName, parseXml } from '../src/xml/nodes.js';
+import { sha256Digest } from '../src/xml/c14n.js';
+import { signerFromKey, peppolProfile } from '../src/index.js';
+import { parseInboundEncryption } from '../src/receive/encryption.js';
+import { recoverInboundPayload } from '../src/receive/payload.js';
+import { defaultInboundLimits, type InboundKeyHolder, type RecoverInboundPayloadInput } from '../src/receive/types.js';
+import { MessageBudget } from '../src/receive/budget.js';
+import { attachmentDigestBase64 } from '../src/receive/attachment.js';
+import { createTestPki } from './helpers/pki.js';
+
+const pki = createTestPki();
+const DOCUMENT = Buffer.from(
+  '<?xml version="1.0" encoding="UTF-8"?><StandardBusinessDocument><Invoice>42</Invoice></StandardBusinessDocument>',
+  'utf8',
+);
+
+const holder: InboundKeyHolder = {
+  certificate: pki.receiver.certPem,
+  async unwrap(wrapped) {
+    return privateDecrypt(
+      { key: pki.receiver.keyObject, oaepHash: 'sha256', padding: constants.RSA_PKCS1_OAEP_PADDING },
+      Buffer.from(wrapped),
+    );
+  },
+};
+
+/** Encrypt `representation` and build the inbound encryption graph with a controlled digest. */
+async function makeInbound(representation: Buffer, options: { mediaType?: string; digest?: string } = {}) {
+  const sessionKey = randomBytes(16);
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-128-gcm', sessionKey, iv);
+  const ciphertext = Buffer.concat([cipher.update(representation), cipher.final()]);
+  const attachmentBytes = Buffer.concat([iv, ciphertext, cipher.getAuthTag()]);
+  const wrappedKey = publicEncrypt(
+    { key: pki.receiver.cert.publicKey, oaepHash: 'sha256', padding: constants.RSA_PKCS1_OAEP_PADDING },
+    sessionKey,
+  );
+  const built = await buildEnvelope({
+    userMessage: {
+      messageId: 'inbound@test',
+      timestamp: '2026-10-12T00:00:00.000Z',
+      fromPartyId: pki.sender.commonName,
+      toPartyId: pki.receiver.commonName,
+      profile: peppolProfile,
+      service: { scheme: 's', value: 'v' },
+      action: 'a::b',
+      originalSender: { scheme: 'iso6523-actorid-upis', value: '0192:1' },
+      finalRecipient: { scheme: 'iso6523-actorid-upis', value: '0192:2' },
+      payloadHref: 'cid:inbound@test',
+      compressionType: AS4_COMPRESSION_TYPE,
+    },
+    signer: signerFromKey(pki.sender.keyObject, pki.sender.certPem),
+    receiverCertificatePem: pki.receiver.certPem,
+    wrappedKey,
+    attachmentDigestBase64: sha256Digest(representation),
+  });
+  const doc = parseXml(built.xml);
+  if (options.mediaType) firstByLocalName(doc, XENC_NS, 'EncryptedData')!.setAttribute('MimeType', options.mediaType);
+  const encryption = parseInboundEncryption(doc);
+  return {
+    encryption,
+    attachmentBytes,
+    reference: {
+      uri: encryption.attachmentHref,
+      digest: options.digest ?? sha256Digest(representation),
+      digestMethod: ALGO_SHA256,
+      transforms: [{ algorithm: SWA_TRANSFORM_SIGNATURE, inclusivePrefixes: [] as string[] }],
+    },
+  };
+}
+
+function inputFor(
+  built: Awaited<ReturnType<typeof makeInbound>>,
+  overrides: Partial<RecoverInboundPayloadInput> = {},
+): RecoverInboundPayloadInput {
+  return {
+    encryption: built.encryption,
+    attachment: {
+      contentId: built.encryption.attachmentHref.slice('cid:'.length),
+      source: Readable.from([built.attachmentBytes]),
+      byteLength: built.attachmentBytes.length,
+    },
+    reference: built.reference,
+    compression: { kind: 'gzip', declaredBy: 'CompressionType' },
+    keyHolder: [holder],
+    limits: defaultInboundLimits,
+    ...overrides,
+  };
+}
+
+async function collect(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks);
+}
+
+test('recovers a gzip payload and retains the exact compressed evidence', async () => {
+  const representation = gzipSync(DOCUMENT);
+  const built = await makeInbound(representation);
+  const result = await recoverInboundPayload(inputFor(built));
+  assert.equal(result.ok, true, JSON.stringify(result));
+  if (!result.ok) return;
+  try {
+    assert.deepEqual(await collect(result.payload.read()), DOCUMENT);
+    assert.equal(result.representation.rawDigestBase64, sha256Digest(representation));
+    assert.equal(result.representation.transformDigestBase64, built.reference.digest);
+    assert.equal(result.representation.byteLength, representation.length);
+    assert.deepEqual(await collect(result.representation.read()), representation);
+    assert.equal(result.credential.certificate, pki.receiver.certPem);
+  } finally {
+    await result.dispose();
+  }
+});
+
+test('a wrong signed digest is rejected before decompression', async () => {
+  // The representation is not valid gzip, so if decompression ran first it would
+  // fail with decompress.failed. The digest check in pass 1 must win.
+  const representation = Buffer.from('not gzip at all', 'utf8');
+  const built = await makeInbound(representation, { digest: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' });
+  const result = await recoverInboundPayload(inputFor(built));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'signature.attachment-digest');
+});
+
+test('a tampered ciphertext fails GCM authentication', async () => {
+  const built = await makeInbound(gzipSync(DOCUMENT));
+  const index = built.attachmentBytes.length - 20;
+  built.attachmentBytes[index] = built.attachmentBytes[index]! ^ 0xff;
+  const result = await recoverInboundPayload(inputFor(built));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'decrypt.gcm-auth');
+});
+
+test('rejects a truncated ciphertext layout without unwrapping', async () => {
+  const built = await makeInbound(gzipSync(DOCUMENT));
+  const short = Buffer.concat([built.attachmentBytes.subarray(0, 20)]);
+  let unwraps = 0;
+  const result = await recoverInboundPayload(
+    inputFor(built, {
+      attachment: { contentId: built.encryption.attachmentHref.slice(4), source: Readable.from([short]) },
+      keyHolder: [
+        {
+          certificate: pki.receiver.certPem,
+          async unwrap() {
+            unwraps += 1;
+            return randomBytes(16);
+          },
+        },
+      ],
+    }),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'encryption.invalid');
+  assert.equal(unwraps, 0, 'the framing is checked before any credential is used');
+});
+
+test('recovers uncompressed XML and keeps the original bytes as the payload', async () => {
+  const built = await makeInbound(DOCUMENT, {
+    mediaType: 'application/xml',
+    digest: attachmentDigestBase64('application/xml', DOCUMENT),
+  });
+  const recovered = await recoverInboundPayload(inputFor(built, { compression: { kind: 'none' } }));
+  assert.equal(recovered.ok, true, JSON.stringify(recovered));
+  if (!recovered.ok) return;
+  try {
+    assert.deepEqual(await collect(recovered.payload.read()), DOCUMENT);
+    assert.equal(recovered.representation.rawDigestBase64, sha256Digest(DOCUMENT));
+    assert.equal(recovered.representation.transformDigestBase64, attachmentDigestBase64('application/xml', DOCUMENT));
+  } finally {
+    await recovered.dispose();
+  }
+});
+
+test('enforces the decompressed-size limit', async () => {
+  const built = await makeInbound(gzipSync(Buffer.alloc(4096, 0x61)));
+  const result = await recoverInboundPayload(
+    inputFor(built, { limits: { ...defaultInboundLimits, maxDecompressedBytes: 100 } }),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'payload.too-large');
+});
+
+test('enforces the message aggregate output budget', async () => {
+  const built = await makeInbound(gzipSync(DOCUMENT));
+  const result = await recoverInboundPayload(inputFor(built, { budget: new MessageBudget(1) }));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'payload.too-large');
+});
+
+test('handle disposal does not invalidate the other handle, and the bundle is idempotent', async () => {
+  const representation = gzipSync(DOCUMENT);
+  const built = await makeInbound(representation);
+  const result = await recoverInboundPayload(inputFor(built));
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  await result.payload.dispose();
+  assert.throws(() => result.payload.read(), /disposed/);
+  assert.deepEqual(await collect(result.representation.read()), representation);
+
+  await result.representation.dispose();
+  await result.dispose(); // idempotent
+  await result.dispose();
+});
+
+test('a failed recovery leaves no scratch files behind', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'as4-recover-'));
+  try {
+    const built = await makeInbound(gzipSync(DOCUMENT));
+    const index = built.attachmentBytes.length - 20;
+    built.attachmentBytes[index] = built.attachmentBytes[index]! ^ 0xff;
+    const result = await recoverInboundPayload(inputFor(built, { spoolDirectory: dir }));
+    assert.equal(result.ok, false);
+    assert.deepEqual(await readdir(dir), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an invalid gzip trailer is rejected after authentication', async () => {
+  const representation = gzipSync(DOCUMENT);
+  // Corrupt the CRC/length trailer while keeping the raw digest (pass 1) valid,
+  // so the failure can only come from decompression.
+  representation[representation.length - 8] = representation[representation.length - 8]! ^ 0xff;
+  const built = await makeInbound(representation);
+  const result = await recoverInboundPayload(inputFor(built));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'decompress.failed');
+});
+
+test('the decompressed-size limit is inclusive at its boundary', async () => {
+  const built = await makeInbound(gzipSync(DOCUMENT));
+  const ok = await recoverInboundPayload(
+    inputFor(built, { limits: { ...defaultInboundLimits, maxDecompressedBytes: DOCUMENT.length } }),
+  );
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+  if (ok.ok) await ok.dispose();
+
+  const built2 = await makeInbound(gzipSync(DOCUMENT));
+  const tooSmall = await recoverInboundPayload(
+    inputFor(built2, { limits: { ...defaultInboundLimits, maxDecompressedBytes: DOCUMENT.length - 1 } }),
+  );
+  assert.equal(tooSmall.ok, false);
+  if (!tooSmall.ok) assert.equal(tooSmall.reason, 'payload.too-large');
+});
+
+test('an observer that throws does not fail the recovery', async () => {
+  const built = await makeInbound(gzipSync(DOCUMENT));
+  const result = await recoverInboundPayload(
+    inputFor(built, {
+      onEvent: () => {
+        throw new Error('observer exploded');
+      },
+    }),
+  );
+  assert.equal(result.ok, true, JSON.stringify(result));
+  if (result.ok) await result.dispose();
+});

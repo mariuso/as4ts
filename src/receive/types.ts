@@ -170,11 +170,16 @@ export type InboundPhase =
   | 'validate-certificate'
   | 'decrypt'
   | 'decompress'
-  | 'build-receipt';
+  | 'materialize'
+  | 'build-receipt'
+  /** Emitted only when scratch cleanup fails, after the result is decided. */
+  | 'cleanup';
 
 export interface InboundEvent {
   readonly phase: InboundPhase;
   readonly durationMs: number;
+  /** Present on a `cleanup` event: the secret-free reason cleanup failed. */
+  readonly error?: string;
 }
 
 export type OnInboundEvent = (event: InboundEvent) => void;
@@ -401,6 +406,7 @@ export interface CredentialFacts {
  * releases everything, including active readers.
  */
 export interface InboundBundle {
+  readonly ok: true;
   readonly payload: PayloadHandle;
   readonly representation: RepresentationHandle;
   readonly credential: CredentialFacts;

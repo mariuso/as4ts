@@ -1,5 +1,5 @@
 import { canonicalize, sha256Digest } from '../xml/c14n.js';
-import { parseStrictXml } from './xml.js';
+import { parseStrictXml, type XmlLimits } from './xml.js';
 
 /**
  * The SwA content-signature transform digest for an attachment, chosen by media
@@ -13,11 +13,11 @@ import { parseStrictXml } from './xml.js';
  * unsupported encodings, and honours the declared encoding, so equivalent
  * documents in different encodings digest identically.
  */
-export function attachmentDigestBase64(mediaType: string, bytes: Buffer): string {
+export function attachmentDigestBase64(mediaType: string, bytes: Buffer, xmlLimits?: XmlLimits): string {
   const type = mediaType.split(';')[0]?.trim().toLowerCase() ?? '';
   const isXml = type === 'application/xml' || type === 'text/xml' || type.endsWith('+xml');
   if (isXml) {
-    return sha256Digest(Buffer.from(canonicalize(parseStrictXml(bytes)), 'utf8'));
+    return sha256Digest(Buffer.from(canonicalize(parseStrictXml(bytes, xmlLimits)), 'utf8'));
   }
   return sha256Digest(bytes);
 }
