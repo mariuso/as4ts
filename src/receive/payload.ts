@@ -7,6 +7,7 @@ import { createGunzip } from 'node:zlib';
 import { createTempWorkspace, type TempWorkspace } from '../temp-file.js';
 import { safeMessage } from '../util.js';
 import { attachmentDigestBase64 } from './attachment.js';
+import { MessageBudget } from './budget.js';
 import { SessionKeyFault, unwrapSessionKey } from './session-key.js';
 import { XmlFault, defaultXmlLimits } from './xml.js';
 import type {
@@ -38,6 +39,11 @@ import type {
  * before authentication. Canonicalization is used only to verify the reference;
  * the payload is always the original decrypted bytes. The session key is cleared
  * once both passes are done.
+ *
+ * Gzip policy: the representation must decode as one or more gzip members, which
+ * are decoded together with Node's per-member CRC/length validation; a trailing
+ * run of NUL padding is tolerated, and any other trailing data fails. The raw
+ * signature covers the whole representation regardless of how it decodes.
  */
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
@@ -97,43 +103,46 @@ function isXmlMediaType(mediaType: string): boolean {
   return type === 'application/xml' || type === 'text/xml' || type.endsWith('+xml');
 }
 
-/** Consume a source, honouring cancellation, and call `return()` on early exit. */
+/**
+ * Consume a producer, honouring cancellation. On abort it stops waiting for the
+ * producer's own cleanup: an external iterator's `return()` may itself stall, so
+ * it is signalled but never awaited indefinitely.
+ */
 async function* abortableStream(
   source: AsyncIterable<Uint8Array>,
   signal: AbortSignal | undefined,
 ): AsyncGenerator<Uint8Array> {
   const iterator = source[Symbol.asyncIterator]();
-  if (!signal) {
-    try {
-      for (;;) {
-        const result = await iterator.next();
-        if (result.done) break;
-        yield result.value;
-      }
-    } finally {
-      await iterator.return?.().catch(() => {});
-    }
-    return;
-  }
   let onAbort: (() => void) | null = null;
-  const aborted = new Promise<never>((_resolve, reject) => {
-    const fail = (): void => reject(abortError());
-    if (signal.aborted) {
-      fail();
-      return;
-    }
-    onAbort = fail;
-    signal.addEventListener('abort', onAbort, { once: true });
-  });
+  let aborted = false;
+  const abortPromise = signal
+    ? new Promise<never>((_resolve, reject) => {
+        const fail = (): void => {
+          aborted = true;
+          reject(abortError());
+        };
+        if (signal.aborted) fail();
+        else {
+          onAbort = fail;
+          signal.addEventListener('abort', fail, { once: true });
+        }
+      })
+    : null;
   try {
     for (;;) {
-      const result = await Promise.race([iterator.next(), aborted]);
+      const result = abortPromise ? await Promise.race([iterator.next(), abortPromise]) : await iterator.next();
       if (result.done) break;
       yield result.value;
     }
   } finally {
-    if (onAbort) signal.removeEventListener('abort', onAbort);
-    await iterator.return?.().catch(() => {});
+    if (onAbort && signal) signal.removeEventListener('abort', onAbort);
+    if (aborted || onAbort) {
+      // Signal cleanup without blocking on it.
+      const returned = iterator.return?.();
+      if (returned) void Promise.resolve(returned).catch(() => {});
+    } else {
+      await iterator.return?.().catch(() => {});
+    }
   }
 }
 
@@ -161,6 +170,15 @@ async function readRange(path: string, start: number, length: number): Promise<B
   }
 }
 
+async function cleanupQuietly(workspace: TempWorkspace, onEvent: OnInboundEvent | undefined): Promise<void> {
+  const start = performance.now();
+  try {
+    await workspace.cleanup();
+  } catch (err) {
+    emit(onEvent, { phase: 'cleanup', durationMs: performance.now() - start, error: safeMessage(err) });
+  }
+}
+
 /** Spool the ciphertext stream to a private file, bounded and cancellable. */
 async function spoolCiphertext(
   source: AsyncIterable<Uint8Array>,
@@ -176,7 +194,7 @@ async function spoolCiphertext(
       else callback(null, chunk);
     },
   });
-  await pipeline(abortableStream(source, signal), count, createWriteStream(filePath, { mode: 0o600 }));
+  await pipeline(abortableStream(source, signal), count, createWriteStream(filePath, { mode: 0o600 }), { signal });
   return bytes;
 }
 
@@ -227,12 +245,12 @@ async function decryptPass(input: {
   });
   const cipherStart = IV_BYTES;
   const cipherEnd = size - TAG_BYTES - 1;
-  const source: AsyncIterable<Uint8Array> =
+  const source: Readable =
     cipherEnd >= cipherStart
       ? createReadStream(ciphertextPath, { start: cipherStart, end: cipherEnd })
       : Readable.from([]);
   const sink = sinkPath ? createWriteStream(sinkPath, { mode: 0o600 }) : discardingSink();
-  await pipeline(abortableStream(source, signal), consume, sink);
+  await pipeline(source, consume, sink, { signal });
   return { bytes, digestBase64: hash.digest('base64') };
 }
 
@@ -256,18 +274,18 @@ async function gunzipToFile(
       callback(null, chunk);
     },
   });
-  await pipeline(
-    abortableStream(createReadStream(sourcePath), signal),
-    createGunzip(),
-    count,
-    createWriteStream(destPath, { mode: 0o600 }),
-  );
+  await pipeline(createReadStream(sourcePath), createGunzip(), count, createWriteStream(destPath, { mode: 0o600 }), {
+    signal,
+  });
   return { bytes, digestBase64: hash.digest('base64') };
 }
 
 /** Owns the scratch workspace and every reader opened from it. */
 class Owned {
-  private disposed = false;
+  /** Closed to new readers; set once, and independently of cleanup success. */
+  private closed = false;
+  /** The in-flight cleanup attempt shared by concurrent callers. */
+  private cleanup: Promise<void> | null = null;
   private readonly streams = new Set<Readable>();
 
   constructor(
@@ -276,23 +294,32 @@ class Owned {
   ) {}
 
   read(path: string): Readable {
-    if (this.disposed) throw new Error('the inbound result has been disposed');
+    if (this.closed) throw new Error('the inbound result has been disposed');
     const stream = createReadStream(path);
     this.streams.add(stream);
     stream.on('close', () => this.streams.delete(stream));
     return stream;
   }
 
+  /**
+   * Close to readers and remove the workspace. Never throws; a failed cleanup is
+   * reported as a diagnostic and left retryable, and concurrent callers await the
+   * same attempt.
+   */
   async dispose(): Promise<void> {
-    if (this.disposed) return;
-    this.disposed = true;
-    for (const stream of this.streams) stream.destroy();
-    this.streams.clear();
+    if (!this.closed) {
+      this.closed = true;
+      for (const stream of this.streams) stream.destroy();
+      this.streams.clear();
+    }
+    this.cleanup ??= this.workspace.cleanup();
+    const attempt = this.cleanup;
     const start = performance.now();
     try {
-      await this.workspace.cleanup();
+      await attempt;
     } catch (err) {
       emit(this.onEvent, { phase: 'cleanup', durationMs: performance.now() - start, error: safeMessage(err) });
+      if (this.cleanup === attempt) this.cleanup = null; // allow a later retry
     }
   }
 }
@@ -325,11 +352,18 @@ export async function recoverInboundPayload(input: RecoverInboundPayloadInput): 
     ...(detail ? { detail } : {}),
   });
 
-  // The authenticated reference must be the one for this attachment.
-  if (reference.uri !== encryption.attachmentHref && reference.uri !== `cid:${attachment.contentId}`) {
-    return fail('signature', 'signature.coverage', 'the reference is not for this attachment');
+  // The authenticated reference, the encryption href and the resolved attachment
+  // must all identify the same attachment. Reject before spooling or unwrapping.
+  const expectedHref = encryption.attachmentHref;
+  if (reference.uri !== expectedHref || `cid:${attachment.contentId}` !== expectedHref) {
+    return fail(
+      'signature',
+      'signature.coverage',
+      'the reference, encryption href and attachment ID do not identify the same attachment',
+    );
   }
 
+  const budget = input.budget ?? new MessageBudget(limits.maxAggregateOutputBytes);
   let workspace: TempWorkspace | null = null;
   let sessionKey: Buffer | null = null;
   let keep = false;
@@ -343,8 +377,25 @@ export async function recoverInboundPayload(input: RecoverInboundPayloadInput): 
     const ciphertextBytes = await timed(onEvent, 'decrypt', () =>
       spoolCiphertext(attachment.source, ciphertextPath, limits.maxPartBytes, signal),
     );
+    if (signal?.aborted) return fail('transport', 'aborted');
     if (ciphertextBytes < MIN_CIPHERTEXT_BYTES) {
       return fail('decrypt', 'encryption.invalid', 'ciphertext is shorter than IV + tag');
+    }
+
+    // The representation size is known before decryption (GCM preserves length).
+    const representationBytes = ciphertextBytes - MIN_CIPHERTEXT_BYTES;
+    if (representationBytes > limits.maxRepresentationBytes) {
+      return fail('payload', 'payload.too-large', 'decrypted representation exceeds the limit');
+    }
+    const isXml = isXmlMediaType(encryption.mediaType);
+    const willDecompress = compression.kind === 'gzip';
+    const maxOutput = Math.min(limits.maxDecompressedBytes, budget.remaining());
+    if (!willDecompress) {
+      // The payload is the representation; its size is known already.
+      if (representationBytes > maxOutput) return fail('payload', 'payload.too-large', 'output exceeds the limit');
+      if (isXml && representationBytes > limits.maxXmlBytes) {
+        return fail('xml', 'xml.too-large', 'XML exceeds the limit');
+      }
     }
 
     // Bounded credential selection and unwrap.
@@ -359,11 +410,9 @@ export async function recoverInboundPayload(input: RecoverInboundPayloadInput): 
     );
     sessionKey = unwrapped.sessionKey;
     const credential = { certificate: unwrapped.credentialCertificate };
+    if (signal?.aborted) return fail('transport', 'aborted');
 
-    const isXml = isXmlMediaType(encryption.mediaType);
-
-    // Pass 1: decrypt completely, authenticate, discard plaintext. When the
-    // transform streams (binary/gzip), check the signed digest here.
+    // Pass 1: decrypt completely, authenticate, discard plaintext.
     const pass1 = await timed(onEvent, 'decrypt', () =>
       decryptPass({
         ciphertextPath,
@@ -373,6 +422,7 @@ export async function recoverInboundPayload(input: RecoverInboundPayloadInput): 
         signal,
       }),
     );
+    if (signal?.aborted) return fail('transport', 'aborted');
     if (!isXml && pass1.digestBase64 !== reference.digest) {
       return fail('signature', 'signature.attachment-digest', 'attachment digest mismatch');
     }
@@ -389,6 +439,7 @@ export async function recoverInboundPayload(input: RecoverInboundPayloadInput): 
         sinkPath: representationPath,
       }),
     );
+    if (signal?.aborted) return fail('transport', 'aborted');
     sessionKey.fill(0);
     sessionKey = null;
 
@@ -398,6 +449,7 @@ export async function recoverInboundPayload(input: RecoverInboundPayloadInput): 
     let payloadDigestBase64: string;
 
     if (isXml) {
+      if (pass2.bytes > limits.maxXmlBytes) return fail('xml', 'xml.too-large', 'XML exceeds the limit');
       const bytes = await readRange(representationPath, 0, pass2.bytes);
       transformDigestBase64 = attachmentDigestBase64(encryption.mediaType, bytes, {
         ...defaultXmlLimits,
@@ -410,25 +462,28 @@ export async function recoverInboundPayload(input: RecoverInboundPayloadInput): 
       payloadPath = representationPath;
       payloadBytes = pass2.bytes;
       payloadDigestBase64 = pass2.digestBase64;
+    } else if (willDecompress) {
+      transformDigestBase64 = pass2.digestBase64;
+      const out = await timed(onEvent, 'decompress', () =>
+        gunzipToFile(
+          representationPath,
+          workspace!.path(PAYLOAD_FILE),
+          Math.min(limits.maxDecompressedBytes, budget.remaining()),
+          signal,
+        ),
+      );
+      payloadPath = workspace.path(PAYLOAD_FILE);
+      payloadBytes = out.bytes;
+      payloadDigestBase64 = out.digestBase64;
     } else {
       transformDigestBase64 = pass2.digestBase64;
-      const budgetRemaining = input.budget ? input.budget.remaining() : Number.MAX_SAFE_INTEGER;
-      const maxOutput = Math.min(limits.maxDecompressedBytes, budgetRemaining);
-      if (compression.kind === 'gzip') {
-        const out = await timed(onEvent, 'decompress', () =>
-          gunzipToFile(representationPath, workspace!.path(PAYLOAD_FILE), maxOutput, signal),
-        );
-        payloadPath = workspace.path(PAYLOAD_FILE);
-        payloadBytes = out.bytes;
-        payloadDigestBase64 = out.digestBase64;
-      } else {
-        payloadPath = representationPath;
-        payloadBytes = pass2.bytes;
-        payloadDigestBase64 = pass2.digestBase64;
-      }
+      payloadPath = representationPath;
+      payloadBytes = pass2.bytes;
+      payloadDigestBase64 = pass2.digestBase64;
     }
 
-    if (input.budget && !input.budget.reserve(payloadBytes)) {
+    if (signal?.aborted) return fail('transport', 'aborted');
+    if (!budget.reserve(payloadBytes)) {
       return fail('payload', 'payload.too-large', 'message aggregate output budget exceeded');
     }
 
@@ -476,13 +531,6 @@ export async function recoverInboundPayload(input: RecoverInboundPayloadInput): 
     return mapFailure(err);
   } finally {
     if (sessionKey) sessionKey.fill(0);
-    if (!keep && workspace) {
-      const start = performance.now();
-      try {
-        await workspace.cleanup();
-      } catch (err) {
-        emit(onEvent, { phase: 'cleanup', durationMs: performance.now() - start, error: safeMessage(err) });
-      }
-    }
+    if (!keep && workspace) await cleanupQuietly(workspace, onEvent);
   }
 }

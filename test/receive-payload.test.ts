@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createCipheriv, constants, privateDecrypt, publicEncrypt, randomBytes } from 'node:crypto';
-import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -13,7 +13,12 @@ import { sha256Digest } from '../src/xml/c14n.js';
 import { signerFromKey, peppolProfile } from '../src/index.js';
 import { parseInboundEncryption } from '../src/receive/encryption.js';
 import { recoverInboundPayload } from '../src/receive/payload.js';
-import { defaultInboundLimits, type InboundKeyHolder, type RecoverInboundPayloadInput } from '../src/receive/types.js';
+import {
+  defaultInboundLimits,
+  type InboundEvent,
+  type InboundKeyHolder,
+  type RecoverInboundPayloadInput,
+} from '../src/receive/types.js';
 import { MessageBudget } from '../src/receive/budget.js';
 import { attachmentDigestBase64 } from '../src/receive/attachment.js';
 import { createTestPki } from './helpers/pki.js';
@@ -265,4 +270,182 @@ test('an observer that throws does not fail the recovery', async () => {
   );
   assert.equal(result.ok, true, JSON.stringify(result));
   if (result.ok) await result.dispose();
+});
+
+test('rejects a mismatched attachment binding before spooling or unwrapping', async () => {
+  let unwraps = 0;
+  const spy: InboundKeyHolder = {
+    certificate: pki.receiver.certPem,
+    async unwrap(wrapped) {
+      unwraps += 1;
+      return privateDecrypt(
+        { key: pki.receiver.keyObject, oaepHash: 'sha256', padding: constants.RSA_PKCS1_OAEP_PADDING },
+        Buffer.from(wrapped),
+      );
+    },
+  };
+
+  const wrongReference = await makeInbound(gzipSync(DOCUMENT));
+  const refResult = await recoverInboundPayload(
+    inputFor(wrongReference, {
+      reference: { ...wrongReference.reference, uri: 'cid:someone-else@x' },
+      keyHolder: [spy],
+    }),
+  );
+  assert.equal(refResult.ok, false);
+  if (!refResult.ok) assert.equal(refResult.reason, 'signature.coverage');
+
+  const wrongContentId = await makeInbound(gzipSync(DOCUMENT));
+  const idResult = await recoverInboundPayload(
+    inputFor(wrongContentId, {
+      attachment: { contentId: 'someone-else@x', source: Readable.from([wrongContentId.attachmentBytes]) },
+      keyHolder: [spy],
+    }),
+  );
+  assert.equal(idResult.ok, false);
+  if (!idResult.ok) assert.equal(idResult.reason, 'signature.coverage');
+
+  assert.equal(unwraps, 0, 'no credential is used for an inconsistent binding');
+});
+
+test('applies the output limit to uncompressed and XML payloads', async () => {
+  const binary = Buffer.from('plain binary payload', 'utf8');
+  const binaryBuilt = await makeInbound(binary, { digest: sha256Digest(binary) });
+  const binaryResult = await recoverInboundPayload(
+    inputFor(binaryBuilt, {
+      compression: { kind: 'none' },
+      limits: { ...defaultInboundLimits, maxDecompressedBytes: 1 },
+    }),
+  );
+  assert.equal(binaryResult.ok, false);
+  if (!binaryResult.ok) assert.equal(binaryResult.reason, 'payload.too-large');
+
+  const xmlBuilt = await makeInbound(DOCUMENT, {
+    mediaType: 'application/xml',
+    digest: attachmentDigestBase64('application/xml', DOCUMENT),
+  });
+  const xmlResult = await recoverInboundPayload(
+    inputFor(xmlBuilt, { compression: { kind: 'none' }, limits: { ...defaultInboundLimits, maxDecompressedBytes: 1 } }),
+  );
+  assert.equal(xmlResult.ok, false);
+  if (!xmlResult.ok) assert.equal(xmlResult.reason, 'payload.too-large');
+});
+
+test('the aggregate limit applies even without an explicit budget', async () => {
+  const built = await makeInbound(gzipSync(DOCUMENT));
+  const result = await recoverInboundPayload(
+    inputFor(built, { limits: { ...defaultInboundLimits, maxAggregateOutputBytes: 1 } }),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'payload.too-large');
+});
+
+test('rejects an XML representation larger than maxXmlBytes before reading it', async () => {
+  const built = await makeInbound(DOCUMENT, {
+    mediaType: 'application/xml',
+    digest: attachmentDigestBase64('application/xml', DOCUMENT),
+  });
+  const result = await recoverInboundPayload(
+    inputFor(built, { compression: { kind: 'none' }, limits: { ...defaultInboundLimits, maxXmlBytes: 1 } }),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.reason, 'xml.too-large');
+});
+
+test('cancellation after materialization is observed (uncompressed and XML)', async () => {
+  const binary = Buffer.from('plain binary payload', 'utf8');
+  for (const [representation, options] of [
+    [binary, { digest: sha256Digest(binary) }],
+    [DOCUMENT, { mediaType: 'application/xml', digest: attachmentDigestBase64('application/xml', DOCUMENT) }],
+  ] as const) {
+    const built = await makeInbound(representation, options);
+    const controller = new AbortController();
+    const result = await recoverInboundPayload(
+      inputFor(built, {
+        compression: { kind: 'none' },
+        signal: controller.signal,
+        onEvent: (event) => {
+          if (event.phase === 'materialize') controller.abort();
+        },
+      }),
+    );
+    assert.equal(result.ok, false, JSON.stringify(result));
+    if (!result.ok) assert.equal(result.reason, 'aborted');
+  }
+});
+
+test('bundle disposal destroys an active reader', async () => {
+  const built = await makeInbound(gzipSync(DOCUMENT));
+  const result = await recoverInboundPayload(inputFor(built));
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  const stream = result.payload.read();
+  stream.on('error', () => {});
+  await result.dispose();
+  assert.equal(stream.destroyed, true);
+});
+
+test('gzip policy: concatenated members decode together; NUL padding is tolerated; other trailing data fails', async () => {
+  const member = gzipSync(DOCUMENT);
+  const extra = gzipSync(Buffer.from('<extra/>'));
+
+  const concatenated = await makeInbound(Buffer.concat([member, extra]));
+  const concatenatedResult = await recoverInboundPayload(inputFor(concatenated));
+  assert.equal(concatenatedResult.ok, true, JSON.stringify(concatenatedResult));
+  if (concatenatedResult.ok) {
+    assert.deepEqual(
+      await collect(concatenatedResult.payload.read()),
+      Buffer.concat([DOCUMENT, Buffer.from('<extra/>')]),
+    );
+    await concatenatedResult.dispose();
+  }
+
+  const padded = await makeInbound(Buffer.concat([member, Buffer.alloc(4)]));
+  const paddedResult = await recoverInboundPayload(inputFor(padded));
+  assert.equal(paddedResult.ok, true, JSON.stringify(paddedResult));
+  if (paddedResult.ok) {
+    assert.deepEqual(await collect(paddedResult.payload.read()), DOCUMENT);
+    await paddedResult.dispose();
+  }
+
+  const garbage = await makeInbound(Buffer.concat([member, Buffer.from('garbage')]));
+  const garbageResult = await recoverInboundPayload(inputFor(garbage));
+  assert.equal(garbageResult.ok, false);
+  if (!garbageResult.ok) assert.equal(garbageResult.reason, 'decompress.failed');
+});
+
+test('a failed disposal is reported, retryable and idempotent', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('permission-based cleanup failure requires POSIX permissions');
+    return;
+  }
+  const spool = await mkdtemp(join(tmpdir(), 'as4-dispose-'));
+  const events: InboundEvent[] = [];
+  try {
+    const built = await makeInbound(gzipSync(DOCUMENT));
+    const result = await recoverInboundPayload(
+      inputFor(built, { spoolDirectory: spool, onEvent: (e) => events.push(e) }),
+    );
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+
+    const [child] = await readdir(spool);
+    const locked = join(spool, child!, 'locked');
+    await mkdir(locked);
+    await writeFile(join(locked, 'f'), 'x');
+    await chmod(locked, 0o500);
+
+    await result.dispose(); // fails, reported, not thrown
+    assert.ok(
+      events.some((e) => e.phase === 'cleanup'),
+      'a cleanup diagnostic is emitted',
+    );
+    await result.dispose(); // retry while still locked
+
+    await chmod(locked, 0o700);
+    await result.dispose(); // retry now succeeds
+    assert.deepEqual(await readdir(spool), []);
+  } finally {
+    await rm(spool, { recursive: true, force: true });
+  }
 });
