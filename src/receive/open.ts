@@ -1,4 +1,5 @@
-import { AS4_COMPRESSION_TYPE, EBMS_NS, SOAP_11_NS, SOAP_ENV_NS } from '../constants.js';
+import { AS4_COMPRESSION_TYPE, EBMS_NS, SOAP_11_NS, SOAP_ENV_NS, WSSE_NS } from '../constants.js';
+import { elementsByLocalName } from '../xml/nodes.js';
 import { peppolProfile } from '../profile.js';
 import { commonNameOf, parseCertificate, safeMessage } from '../util.js';
 import { MessageBudget } from './budget.js';
@@ -57,16 +58,60 @@ async function timed<T>(
   }
 }
 
-function directChild(node: Element | null, ns: string, localName: string): Element | null {
+function directChildren(node: Element | null, ns: string, localName: string): Element[] {
+  const out: Element[] = [];
   const children = node?.childNodes;
-  if (!children) return null;
+  if (!children) return out;
   for (let i = 0; i < children.length; i += 1) {
     const child = children.item(i);
     if (!child || child.nodeType !== 1) continue;
     const element = child as Element;
-    if (element.namespaceURI === ns && element.localName === localName) return element;
+    if (element.namespaceURI === ns && element.localName === localName) out.push(element);
   }
-  return null;
+  return out;
+}
+
+interface SoapStructure {
+  readonly header: Element;
+  readonly body: Element;
+  readonly messaging: Element;
+  readonly security: Element;
+}
+
+/**
+ * Validate the whole SOAP structure *before* verification, so the elements used
+ * later are unambiguous: exactly one SOAP Header and Body, one eb:Messaging and
+ * one wsse:Security, each in its required position, and no wsse:Security
+ * anywhere outside the Header. Returns a detail string when the structure is
+ * not acceptable.
+ */
+function validateSoapStructure(document: Document): SoapStructure | { readonly detail: string } {
+  const envelope = document.documentElement;
+  if (
+    !envelope ||
+    envelope.localName !== 'Envelope' ||
+    (envelope.namespaceURI !== SOAP_ENV_NS && envelope.namespaceURI !== SOAP_11_NS)
+  ) {
+    return { detail: 'the document is not a SOAP envelope' };
+  }
+  const soapNamespace = envelope.namespaceURI ?? '';
+  const headers = directChildren(envelope, soapNamespace, 'Header');
+  if (headers.length !== 1) return { detail: `expected exactly one SOAP Header, got ${headers.length}` };
+  const bodies = directChildren(envelope, soapNamespace, 'Body');
+  if (bodies.length !== 1) return { detail: `expected exactly one SOAP Body, got ${bodies.length}` };
+  const header = headers[0]!;
+  const messaging = directChildren(header, EBMS_NS, 'Messaging');
+  if (messaging.length !== 1) {
+    return { detail: `expected exactly one eb:Messaging in the Header, got ${messaging.length}` };
+  }
+  const securities = directChildren(header, WSSE_NS, 'Security');
+  if (securities.length !== 1) {
+    return { detail: `expected exactly one wsse:Security in the Header, got ${securities.length}` };
+  }
+  if (elementsByLocalName(document, WSSE_NS, 'Security').length !== 1) {
+    return { detail: 'wsse:Security must appear only in the SOAP Header' };
+  }
+  return { header, body: bodies[0]!, messaging: messaging[0]!, security: securities[0]! };
 }
 
 function mapSignatureReason(reason: 'malformed' | 'bad-signature' | 'digest-mismatch'): InboundFailureReason {
@@ -141,13 +186,9 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
       Promise.resolve(parseStrictXml(soap.body, { ...defaultXmlLimits, maxBytes: limits.maxEnvelopeBytes })),
     );
 
-    const envelope = document.documentElement;
-    if (
-      envelope.localName !== 'Envelope' ||
-      (envelope.namespaceURI !== SOAP_ENV_NS && envelope.namespaceURI !== SOAP_11_NS)
-    ) {
-      return fail('xml', 'xml.malformed', 'the document is not a SOAP envelope');
-    }
+    const structure = validateSoapStructure(document);
+    if ('detail' in structure) return fail('xml', 'xml.malformed', structure.detail);
+    const { messaging, body: soapBody } = structure;
 
     const verification = verifyWsSecuritySignature(document);
     if (!verification.ok) return fail('signature', mapSignatureReason(verification.reason), verification.detail);
@@ -155,16 +196,7 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
     const signerPem = signature.signerCertificatePem;
 
     // Coverage: eb:Messaging and the SOAP Body must both be signed.
-    const soapNamespace = envelope.namespaceURI ?? '';
-    const header = directChild(envelope, soapNamespace, 'Header');
-    const soapBody = directChild(envelope, soapNamespace, 'Body');
-    const messaging = directChild(header, EBMS_NS, 'Messaging');
-    if (
-      !messaging ||
-      !soapBody ||
-      !signature.coveredElements.includes(messaging) ||
-      !signature.coveredElements.includes(soapBody)
-    ) {
+    if (!signature.coveredElements.includes(messaging) || !signature.coveredElements.includes(soapBody)) {
       return fail('signature', 'signature.coverage', 'the signature does not cover eb:Messaging and the SOAP Body');
     }
 

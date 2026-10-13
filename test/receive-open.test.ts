@@ -5,12 +5,14 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
-import { PEPPOL_PARTY_ID_TYPE } from '../src/constants.js';
+import { PEPPOL_PARTY_ID_TYPE, DS_NS, ALGO_SHA256, SWA_TRANSFORM_SIGNATURE } from '../src/constants.js';
 import { signerFromKey } from '../src/index.js';
 import { defaultEntropy, prepareAs4Internal } from '../src/internal.js';
 import { buildMultipartBody } from '../src/multipart.js';
 import { openAs4Message } from '../src/receive/open.js';
 import { payloadHooks } from '../src/receive/payload-hooks.js';
+import { signSignedInfo } from '../src/xml/security.js';
+import { append, element, firstByLocalName, parseXml, serializeXml } from '../src/xml/nodes.js';
 import type { InboundKeyHolder, OpenAs4MessageInput } from '../src/receive/types.js';
 import { createTestPki } from './helpers/pki.js';
 import { testValidator } from './helpers/input.js';
@@ -51,7 +53,11 @@ function sbdhDocument(senderIdentifier: string): Buffer {
   );
 }
 
-async function buildRequest(payload: Buffer, dir: string): Promise<{ contentType: string; body: Buffer }> {
+async function buildRequest(
+  payload: Buffer,
+  dir: string,
+  transformSoap?: (xml: string) => string | Promise<string>,
+): Promise<{ contentType: string; body: Buffer }> {
   const prepared = await prepareAs4Internal(
     {
       payload: Readable.from(payload),
@@ -74,8 +80,9 @@ async function buildRequest(payload: Buffer, dir: string): Promise<{ contentType
   if (prepared.outcome !== 'prepared') throw new Error('unreachable');
   const message = prepared.message;
   try {
+    const soapXml = transformSoap ? await transformSoap(message.soapXml) : message.soapXml;
     const multipart = buildMultipartBody({
-      soapXml: message.soapXml,
+      soapXml,
       attachmentHref: message.attachmentHref,
       attachmentFilePath: join(message.directory, 'attachment.bin'),
       attachmentByteLength: message.attachmentByteLength,
@@ -116,10 +123,11 @@ async function collect(stream: Readable): Promise<Buffer> {
 async function withRequest<T>(
   payload: Buffer,
   fn: (request: { contentType: string; body: Buffer }) => Promise<T>,
+  transformSoap?: (xml: string) => string | Promise<string>,
 ): Promise<T> {
   const dir = await mkdtemp(join(tmpdir(), 'as4-open-'));
   try {
-    return await fn(await buildRequest(payload, dir));
+    return await fn(await buildRequest(payload, dir, transformSoap));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -252,4 +260,84 @@ test('preserves an I/O failure during the payload read', async () => {
       payloadHooks.onReadPayload = undefined;
     }
   });
+});
+
+/** Rename the SOAP root to a non-envelope element (the signature is not re-checked). */
+function renameRoot(xml: string): string {
+  return xml.replace('<env:Envelope', '<env:NotEnvelope').replace('</env:Envelope>', '</env:NotEnvelope>');
+}
+
+test('rejects a document whose root is not a SOAP envelope', async () => {
+  await withRequest(
+    sbdhDocument(SENDER.value),
+    async (request) => {
+      const result = await openAs4Message(openInput(request));
+      assert.equal(result.ok, false);
+      if (!result.ok) {
+        assert.equal(result.stage, 'xml');
+        assert.equal(result.reason, 'xml.malformed');
+      }
+    },
+    renameRoot,
+  );
+});
+
+test('rejects a second, unsigned SOAP Body', async () => {
+  await withRequest(
+    sbdhDocument(SENDER.value),
+    async (request) => {
+      const result = await openAs4Message(openInput(request));
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.reason, 'xml.malformed');
+    },
+    (xml) => xml.replace('</env:Envelope>', '<env:Body/></env:Envelope>'),
+  );
+});
+
+test('rejects wsse:Security placed outside the SOAP Header', async () => {
+  await withRequest(
+    sbdhDocument(SENDER.value),
+    async (request) => {
+      const result = await openAs4Message(openInput(request));
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.reason, 'xml.malformed');
+    },
+    (xml) => {
+      const match = /<wsse:Security[\s\S]*?<\/wsse:Security>/.exec(xml);
+      assert.ok(match, 'the fixture has a wsse:Security element');
+      return xml.replace(match[0], '').replace('</env:Envelope>', `${match[0]}</env:Envelope>`);
+    },
+  );
+});
+
+test('rejects an additional signed cid: reference with no attachment', async () => {
+  await withRequest(
+    sbdhDocument(SENDER.value),
+    async (request) => {
+      const result = await openAs4Message(openInput(request));
+      assert.equal(result.ok, false);
+      if (!result.ok) {
+        assert.equal(result.stage, 'signature');
+        assert.equal(result.reason, 'signature.coverage');
+      }
+    },
+    async (xml) => {
+      const doc = parseXml(xml);
+      const signedInfo = firstByLocalName(doc, DS_NS, 'SignedInfo');
+      assert.ok(signedInfo, 'the fixture has ds:SignedInfo');
+      const reference = element(doc, 'ds', 'Reference', { URI: 'cid:missing@as4-sender.test' });
+      const transforms = element(doc, 'ds', 'Transforms');
+      append(transforms, element(doc, 'ds', 'Transform', { Algorithm: SWA_TRANSFORM_SIGNATURE }));
+      append(reference, transforms);
+      append(reference, element(doc, 'ds', 'DigestMethod', { Algorithm: ALGO_SHA256 }));
+      append(reference, element(doc, 'ds', 'DigestValue', {}, 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='));
+      append(signedInfo, reference);
+      const value = await signSignedInfo(signedInfo, signerFromKey(pki.sender.keyObject, pki.sender.certPem));
+      const signatureValue = firstByLocalName(doc, DS_NS, 'SignatureValue');
+      assert.ok(signatureValue, 'the fixture has ds:SignatureValue');
+      while (signatureValue.firstChild) signatureValue.removeChild(signatureValue.firstChild);
+      signatureValue.appendChild(doc.createTextNode(value));
+      return serializeXml(doc);
+    },
+  );
 });

@@ -4,11 +4,23 @@ import { parseStrictXml, XmlFault, type XmlLimits } from './xml.js';
 
 /**
  * A focused, bounded reader for the Standard Business Document Header (SBDH
- * §2.4). The process and document identifiers live in `Scope/InstanceIdentifier`
- * and their schemes in `Scope/Identifier`, selected by `Scope/Type` =
- * `PROCESSID` / `DOCUMENTID`; `DocumentIdentification/Type` is only the document
- * type name. Paths are rooted at `StandardBusinessDocumentHeader`.
+ * §2.4). Paths are rooted at a `StandardBusinessDocument` in the SBDH namespace
+ * with a direct `StandardBusinessDocumentHeader` child; the process and document
+ * identifiers live in `Scope/InstanceIdentifier` and their schemes in
+ * `Scope/Identifier`, selected by `Scope/Type` = `PROCESSID` / `DOCUMENTID`.
+ * Duplicate required fields are a structural error, and the specified default
+ * schemes are applied before comparison.
  */
+const SBDH_NS = 'http://www.unece.org/ebusiness/2010/MDA/StandardBusinessDocumentHeader';
+/** Default schemes the SBDH specifies for the standard scope types (UNVERIFIED). */
+const DEFAULT_PARTY_SCHEME = 'iso6523-actorid-upis';
+const DEFAULT_SCOPE_SCHEME: Readonly<Record<string, string>> = {
+  PROCESSID: 'cenbii-procid-ubl',
+  DOCUMENTID: 'busdox-docid-qns',
+};
+
+class SbdhStructureError extends Error {}
+
 export interface SbdhFacts {
   readonly sender: ScopedId | null;
   readonly receiver: ScopedId | null;
@@ -16,17 +28,7 @@ export interface SbdhFacts {
   readonly documentType: ScopedId | null;
 }
 
-function byLocalName(node: Document | Element, name: string): Element[] {
-  const out: Element[] = [];
-  const all = node.getElementsByTagName('*');
-  for (let i = 0; i < all.length; i += 1) {
-    const element = all.item(i);
-    if (element && element.localName === name) out.push(element);
-  }
-  return out;
-}
-
-function directByLocalName(parent: Element | null, name: string): Element[] {
+function directChildrenNs(parent: Element | null, ns: string, localName: string): Element[] {
   const out: Element[] = [];
   const children = parent?.childNodes;
   if (!children) return out;
@@ -34,40 +36,52 @@ function directByLocalName(parent: Element | null, name: string): Element[] {
     const child = children.item(i);
     if (!child || child.nodeType !== 1) continue;
     const element = child as Element;
-    if (element.localName === name) out.push(element);
+    if (element.namespaceURI === ns && element.localName === localName) out.push(element);
   }
   return out;
 }
 
-function directText(parent: Element | null, name: string): string | null {
-  const element = directByLocalName(parent, name)[0];
-  const value = element?.textContent;
-  return value === null || value === undefined || value === '' ? null : value.trim();
+function exactlyOne(parent: Element | null, ns: string, localName: string, what: string): Element | null {
+  const matches = directChildrenNs(parent, ns, localName);
+  if (matches.length > 1) throw new SbdhStructureError(`more than one ${what}`);
+  return matches[0] ?? null;
+}
+
+function text(element: Element | null): string | null {
+  const value = element?.textContent?.trim();
+  return value === null || value === undefined || value === '' ? null : value;
 }
 
 function participant(header: Element, role: 'Sender' | 'Receiver'): ScopedId | null {
-  const container = directByLocalName(header, role)[0] ?? null;
-  const identifier = directByLocalName(container, 'Identifier')[0] ?? null;
-  const value = identifier?.textContent?.trim();
-  if (!value) return null;
-  return { scheme: identifier?.getAttribute('Authority') ?? '', value };
+  const container = exactlyOne(header, SBDH_NS, role, role);
+  if (!container) return null;
+  const identifier = exactlyOne(container, SBDH_NS, 'Identifier', `${role}/Identifier`);
+  const value = text(identifier);
+  if (value === null) return null;
+  const authority = identifier?.getAttribute('Authority');
+  return { scheme: authority ? authority : DEFAULT_PARTY_SCHEME, value };
 }
 
-/** A Scope's Type/InstanceIdentifier/Identifier as a scheme/value pair. */
 function scopeByType(header: Element, type: string): ScopedId | null {
-  const businessScope = directByLocalName(header, 'BusinessScope')[0] ?? null;
-  for (const scope of directByLocalName(businessScope, 'Scope')) {
-    if ((directText(scope, 'Type') ?? '').toUpperCase() !== type) continue;
-    const value = directText(scope, 'InstanceIdentifier');
-    if (!value) return null;
-    return { scheme: directText(scope, 'Identifier') ?? '', value };
-  }
-  return null;
+  const businessScope = exactlyOne(header, SBDH_NS, 'BusinessScope', 'BusinessScope');
+  if (!businessScope) return null;
+  const matches = directChildrenNs(businessScope, SBDH_NS, 'Scope').filter(
+    (scope) => (text(exactlyOne(scope, SBDH_NS, 'Type', 'Scope/Type')) ?? '').toUpperCase() === type,
+  );
+  if (matches.length > 1) throw new SbdhStructureError(`more than one ${type} Scope`);
+  const scope = matches[0];
+  if (!scope) return null;
+  const value = text(exactlyOne(scope, SBDH_NS, 'InstanceIdentifier', 'Scope/InstanceIdentifier'));
+  if (value === null) return null;
+  const scheme = text(exactlyOne(scope, SBDH_NS, 'Identifier', 'Scope/Identifier')) ?? DEFAULT_SCOPE_SCHEME[type] ?? '';
+  return { scheme, value };
 }
 
-/** Read the SBDH facts, or null when there is no SBDH header at all. */
+/** Read the SBDH facts, or null when there is no proper SBDH header at the expected position. */
 export function readSbdh(document: Document): SbdhFacts | null {
-  const header = byLocalName(document, 'StandardBusinessDocumentHeader')[0];
+  const root = document.documentElement;
+  if (!root || root.localName !== 'StandardBusinessDocument' || root.namespaceURI !== SBDH_NS) return null;
+  const header = exactlyOne(root, SBDH_NS, 'StandardBusinessDocumentHeader', 'StandardBusinessDocumentHeader');
   if (!header) return null;
   return {
     sender: participant(header, 'Sender'),
@@ -77,34 +91,13 @@ export function readSbdh(document: Document): SbdhFacts | null {
   };
 }
 
-function compareScoped(what: string, actual: ScopedId | null, expected: ScopedId): string[] {
-  if (actual === null) return [];
+function compareScoped(what: string, actual: ScopedId, expected: ScopedId): string[] {
   const out: string[] = [];
   if (actual.value !== expected.value) out.push(`${what} ${expected.value} != SBDH ${actual.value}`);
-  if (actual.scheme !== '' && expected.scheme !== '' && actual.scheme !== expected.scheme) {
+  if (expected.scheme !== '' && actual.scheme !== expected.scheme) {
     out.push(`${what} scheme ${expected.scheme} != SBDH ${actual.scheme}`);
   }
   return out;
-}
-
-export function compareSbdh(
-  facts: SbdhFacts,
-  expected: {
-    readonly originalSender: ScopedId;
-    readonly finalRecipient: ScopedId;
-    readonly process: ScopedId;
-    readonly documentType: ScopedId | null;
-  },
-): string[] {
-  const mismatches = [
-    ...compareScoped('originalSender', facts.sender, expected.originalSender),
-    ...compareScoped('finalRecipient', facts.receiver, expected.finalRecipient),
-    ...compareScoped('process', facts.process, expected.process),
-  ];
-  if (expected.documentType) {
-    mismatches.push(...compareScoped('documentType', facts.documentType, expected.documentType));
-  }
-  return mismatches;
 }
 
 /** Parse and compare the SBDH, returning a distinct consistency status. */
@@ -128,9 +121,29 @@ export function checkSbdh(
     }
     throw err;
   }
-  const facts = readSbdh(document);
+
+  let facts: SbdhFacts | null;
+  try {
+    facts = readSbdh(document);
+  } catch (err) {
+    if (err instanceof SbdhStructureError) return { status: 'malformed', detail: err.message };
+    throw err;
+  }
   if (!facts) return { status: 'missing' };
-  const mismatches = compareSbdh(facts, expected);
+
+  // Every required comparison must be possible; a missing field is not a match.
+  const mismatches: string[] = [];
+  if (!facts.sender) mismatches.push('SBDH Sender identifier is missing');
+  else mismatches.push(...compareScoped('originalSender', facts.sender, expected.originalSender));
+  if (!facts.receiver) mismatches.push('SBDH Receiver identifier is missing');
+  else mismatches.push(...compareScoped('finalRecipient', facts.receiver, expected.finalRecipient));
+  if (!facts.process) mismatches.push('SBDH PROCESSID scope is missing');
+  else mismatches.push(...compareScoped('process', facts.process, expected.process));
+  if (expected.documentType) {
+    if (!facts.documentType) mismatches.push('SBDH DOCUMENTID scope is missing');
+    else mismatches.push(...compareScoped('documentType', facts.documentType, expected.documentType));
+  }
+
   return mismatches.length > 0 ? { status: 'inconsistent', mismatches } : { status: 'consistent' };
 }
 
