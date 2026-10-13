@@ -5,12 +5,16 @@ import type { InboundFailureReason, InboundKeyHolder } from './types.js';
  * Credential selection and session-key unwrap (Phase 2). The private-key
  * operation lives here, isolated from the structural parsing in `encryption.ts`.
  *
- * Selection prefers the credential the sender encrypted to (by certificate
- * fingerprint) and falls back to the supplied, bounded candidate list for
- * rollover. The unwrap contract is the empty-label RSA-OAEP(SHA-256,
- * MGF1-SHA-256) that `parseInboundEncryption` already validated — an inbound
- * identifier never selects an arbitrary remote key resource, and only a
- * configured holder is ever invoked.
+ * Selection orders the configured credentials (the one the EncryptedKey named
+ * first) and *then* caps the number of private-key attempts, so a bound never
+ * hides the preferred credential. The unwrap contract is the empty-label
+ * RSA-OAEP(SHA-256, MGF1-SHA-256) that `parseInboundEncryption` validated — only
+ * a configured holder is ever invoked. Waiting is cancellable even when a
+ * provider stalls, and a result that arrives after cancellation is discarded.
+ *
+ * A holder that cannot serve the request rejects with an error carrying
+ * `code === 'KEY_UNAVAILABLE'`; that is reported distinctly from exhausting
+ * credentials that were simply wrong.
  */
 export class SessionKeyFault extends Error {
   constructor(
@@ -37,12 +41,24 @@ export interface UnwrapSessionKeyInput {
   /** The certificate the sender encrypted to, when the EncryptedKey named one. */
   readonly recipientCertificate?: string;
   readonly holders: readonly InboundKeyHolder[];
+  /** Upper bound on private-key attempts; a non-positive/invalid value means none. */
   readonly maxCandidates: number;
   readonly signal?: AbortSignal;
 }
 
+function abortError(): Error {
+  const error = new Error('aborted');
+  error.name = 'AbortError';
+  (error as NodeJS.ErrnoException).code = 'ABORT_ERR';
+  return error;
+}
+
 function isAbortError(err: unknown): boolean {
   return err instanceof Error && (err.name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ABORT_ERR');
+}
+
+function isUnavailable(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === 'KEY_UNAVAILABLE';
 }
 
 function fingerprint(pem: string): string | null {
@@ -53,40 +69,70 @@ function fingerprint(pem: string): string | null {
   }
 }
 
+/** Resolve or reject as soon as `signal` aborts; a later result is ignored. */
+function raceWithSignal<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (err) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
 export async function unwrapSessionKey(input: UnwrapSessionKeyInput): Promise<UnwrappedSessionKey> {
-  const candidates = input.holders.slice(0, Math.max(1, input.maxCandidates));
-  if (candidates.length === 0) {
+  const bound = Number.isInteger(input.maxCandidates) && input.maxCandidates > 0 ? input.maxCandidates : 0;
+  if (bound === 0 || input.holders.length === 0) {
     throw new SessionKeyFault('decrypt.key-unwrap', 'no decryption credential configured');
   }
 
-  // Prefer the credential named by the EncryptedKey; otherwise try the bounded
-  // candidate list in order.
-  let ordered = candidates;
-  if (input.recipientCertificate) {
-    const wanted = fingerprint(input.recipientCertificate);
-    if (wanted) {
-      const preferred = candidates.filter((holder) => fingerprint(holder.certificate) === wanted);
-      if (preferred.length > 0) ordered = preferred;
-    }
-  }
+  // Order the configured credentials first (the referenced one at the front),
+  // then cap the attempts.
+  const wanted = input.recipientCertificate ? fingerprint(input.recipientCertificate) : null;
+  const ordered = wanted
+    ? [
+        ...input.holders.filter((holder) => fingerprint(holder.certificate) === wanted),
+        ...input.holders.filter((holder) => fingerprint(holder.certificate) !== wanted),
+      ]
+    : [...input.holders];
+  const candidates = ordered.slice(0, bound);
 
-  for (const holder of ordered) {
+  let providerUnavailable = false;
+  for (const holder of candidates) {
     if (input.signal?.aborted) throw new SessionKeyFault('aborted', 'aborted before unwrapping the session key');
     let key: Uint8Array;
     try {
-      key = await holder.unwrap(input.wrappedKey, input.signal);
+      key = await raceWithSignal(holder.unwrap(input.wrappedKey, input.signal), input.signal);
     } catch (err) {
       if (isAbortError(err)) throw new SessionKeyFault('aborted', 'aborted while unwrapping the session key');
+      if (isUnavailable(err)) providerUnavailable = true;
       continue; // wrong credential, or a provider that could not serve this request
     }
+    if (input.signal?.aborted) {
+      // Discard a result that arrived after cancellation.
+      key.fill(0);
+      throw new SessionKeyFault('aborted', 'aborted while unwrapping the session key');
+    }
     if (key.byteLength !== SESSION_KEY_BYTES) {
-      // A provider returned something that is not an AES-128 key: hard failure.
       throw new SessionKeyFault(
         'decrypt.bad-key-length',
         `unwrapped key is ${key.byteLength} bytes, expected ${SESSION_KEY_BYTES}`,
       );
     }
     return { sessionKey: Buffer.from(key), credentialCertificate: holder.certificate };
+  }
+
+  if (providerUnavailable) {
+    throw new SessionKeyFault('decrypt.key-unavailable', 'the key provider was unavailable');
   }
   throw new SessionKeyFault('decrypt.key-unwrap', 'no credential could unwrap the session key');
 }

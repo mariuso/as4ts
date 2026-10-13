@@ -225,6 +225,11 @@ Current limits:
   rather than followed, a CRL must carry a `nextUpdate`, and a delegated OCSP
   responder's own revocation is not checked. See
   [`docs/certificate-profile.md`](docs/certificate-profile.md).
+- **Sender conformance follow-up: attachment `ds:KeyInfo`.** The sender emits a
+  `ds:KeyInfo` inside the attachment's `xenc:EncryptedData`; SwA §5.5 prohibits it
+  when an `xenc:EncryptedKey` is used (the key is named by `ReferenceList`). The
+  receiver accepts both layouts and validates consistency; the redundant
+  `ds:KeyInfo` should be dropped.
 - **Discovery has open compatibility questions.** Wildcard document-type
   matching needs further specification validation, and SMP redirect
   `CertificateUID` matching is not implemented. Supply the correct SML zone

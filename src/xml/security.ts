@@ -77,7 +77,14 @@ function securityTokenReference(
   return str;
 }
 
-/** Append the X.509 encryption token, xenc:EncryptedKey and xenc:EncryptedData. */
+/**
+ * Append the X.509 encryption token, xenc:EncryptedKey and xenc:EncryptedData.
+ *
+ * Conformance follow-up: SwA §5.5 prohibits a `ds:KeyInfo` inside the
+ * attachment's `xenc:EncryptedData` when an `xenc:EncryptedKey` is used; the key
+ * is resolved through the EncryptedKey's `ReferenceList`. This sender currently
+ * emits the reverse `ds:KeyInfo` as well. It is redundant and should be dropped.
+ */
 export function addEncryption(doc: Document, security: Element, p: EncryptionParams): void {
   append(security, binarySecurityToken(doc, p.encryptionTokenId, p.receiverCertificatePem));
 

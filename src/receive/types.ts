@@ -1,6 +1,7 @@
 import type { Readable } from 'node:stream';
 import type { Profile, ScopedId, Signer, ValidateCertificate } from '../types.js';
 import type { VerifiedReference } from '../xml/ws-security.js';
+import type { MessageBudget } from './budget.js';
 
 /**
  * Receiving contracts (Phase 1). These are internal until the `as4ts/receive`
@@ -78,6 +79,7 @@ export type InboundFailureReason =
   | 'encryption.invalid'
   | 'decrypt.unsupported-algorithm'
   | 'decrypt.key-unwrap'
+  | 'decrypt.key-unavailable'
   | 'decrypt.bad-key-length'
   | 'decrypt.gcm-auth'
   // decompress
@@ -352,8 +354,13 @@ export interface InboundEncryption {
 export interface ResolvedAttachment {
   /** Content-ID without angle brackets. */
   readonly contentId: string;
-  readonly byteLength: number;
-  readonly bytes: Uint8Array;
+  /**
+   * The ciphertext source. A stream is accepted so the primitive bounds it while
+   * spooling, without requiring the whole ciphertext in memory.
+   */
+  readonly source: AsyncIterable<Uint8Array>;
+  /** Total ciphertext size when known (a stream may leave it undefined). */
+  readonly byteLength?: number;
 }
 
 /** The compression declared for the payload, from validated metadata. */
@@ -412,6 +419,12 @@ export interface RecoverInboundPayloadInput {
   /** Candidate decryption credentials, tried in order (rollover). */
   readonly keyHolder: readonly InboundKeyHolder[];
   readonly limits: InboundLimits;
+  /**
+   * Message-scoped aggregate output budget. A caller recovering several
+   * attachments passes the same instance so the total decompressed output across
+   * the message is bounded, which a per-call limit cannot express.
+   */
+  readonly budget?: MessageBudget;
   readonly spoolDirectory?: string;
   readonly signal?: AbortSignal;
   readonly onEvent?: OnInboundEvent;
