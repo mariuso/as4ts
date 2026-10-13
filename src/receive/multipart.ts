@@ -39,10 +39,11 @@ const MAX_PARTIAL_TERMINATOR = 3;
 
 const SOAP_MEDIA = /^(?:application\/soap\+xml|application\/xml)$/i;
 
-/** Test seams: inject a spool writer, and observe retained bytes. */
+/** Test seams: inject a spool writer, observe the spool directory, and observe retained bytes. */
 export const multipartHooks: {
   createSpoolWriter?: (path: string) => Writable;
   onRetained?: (pendingBytes: number) => void;
+  onDirectory?: (directory: string) => void;
 } = {};
 
 export interface MultipartPart {
@@ -222,6 +223,7 @@ export async function parseMultipartMessage(input: {
 
   const ownsDirectory = input.spoolDirectory === undefined;
   const directory = input.spoolDirectory ?? (await mkdtemp(join(tmpdir(), 'as4-mime-')));
+  multipartHooks.onDirectory?.(directory);
   const ownedSpools = new Set<string>();
   const parts: MultipartPart[] = [];
   const contentIds = new Set<string>();

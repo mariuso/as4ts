@@ -410,10 +410,17 @@ export interface ResolvedAttachment {
   /** Content-ID without angle brackets. */
   readonly contentId: string;
   /**
-   * The ciphertext source. A stream is accepted so the primitive bounds it while
-   * spooling, without requiring the whole ciphertext in memory.
+   * A parser-owned ciphertext spool to move into the recovery workspace. When
+   * present, recovery renames it (same filesystem) rather than copying; a failed
+   * rename is a local storage failure, never a silent re-spool. The parser owns
+   * the file until the rename succeeds.
    */
-  readonly source: AsyncIterable<Uint8Array>;
+  readonly spoolPath?: string;
+  /**
+   * The ciphertext source, when recovery spools it itself (for example a unit
+   * test that drives recovery directly). Mutually exclusive with `spoolPath`.
+   */
+  readonly source?: AsyncIterable<Uint8Array>;
   /** Total ciphertext size when known (a stream may leave it undefined). */
   readonly byteLength?: number;
 }

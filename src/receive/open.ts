@@ -4,7 +4,8 @@ import { peppolProfile } from '../profile.js';
 import { commonNameOf, parseCertificate, safeMessage } from '../util.js';
 import { MessageBudget } from './budget.js';
 import { EncryptionFault, parseInboundEncryption } from './encryption.js';
-import { MimeFault, parseMultipartRelated, selectSoapPart } from './mime.js';
+import { MimeFault } from './mime.js';
+import { parseMultipartMessage, selectSoapPart, type MultipartPart, type ParsedMultipartMessage } from './multipart.js';
 import { recoverInboundPayload } from './payload.js';
 import { payloadHooks } from './payload-hooks.js';
 import { checkSbdh, documentTypeFromAction } from './sbdh.js';
@@ -131,6 +132,13 @@ function isFileSystemError(err: unknown): boolean {
   return typeof code === 'string' && /^E[A-Z]+$/.test(code);
 }
 
+/** Read a bounded MIME part (the SOAP envelope) into memory. */
+async function readPart(part: MultipartPart, signal: AbortSignal | undefined): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of abortableStream(part.read(), signal)) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
 /** Read a payload up to `maxBytes`, cancelling on the signal and detecting overflow. */
 async function readPayload(
   handle: PayloadHandle,
@@ -165,9 +173,10 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
     ...(detail ? { detail } : {}),
   });
 
+  let mime: ParsedMultipartMessage | null = null;
   try {
-    const parsed = await timed(onEvent, 'parse-mime', () =>
-      parseMultipartRelated({
+    mime = await timed(onEvent, 'parse-mime', () =>
+      parseMultipartMessage({
         contentType: input.contentType,
         body: input.body,
         limits: {
@@ -177,13 +186,17 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
           maxPartBytes: limits.maxPartBytes,
           maxBoundaryLength: limits.maxBoundaryLength,
         },
+        // The envelope budget is passed explicitly; the parser must not fall back
+        // to maxPartBytes for the SOAP part.
+        maxEnvelopeBytes: limits.maxEnvelopeBytes,
         ...(abort ? { signal: abort } : {}),
       }),
     );
-    const soap = selectSoapPart(parsed);
+    const soap = selectSoapPart(mime);
+    const envelopeBytes = await readPart(soap, abort);
 
     const document = await timed(onEvent, 'parse-xml', () =>
-      Promise.resolve(parseStrictXml(soap.body, { ...defaultXmlLimits, maxBytes: limits.maxEnvelopeBytes })),
+      Promise.resolve(parseStrictXml(envelopeBytes, { ...defaultXmlLimits, maxBytes: limits.maxEnvelopeBytes })),
     );
 
     const structure = validateSoapStructure(document);
@@ -217,8 +230,8 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
         `expected exactly one attachment reference, got ${attachmentReferences.length}`,
       );
     }
-    if (parsed.parts.length !== 2) {
-      return fail('mime', 'mime.malformed', `expected exactly two MIME parts, got ${parsed.parts.length}`);
+    if (mime.parts.length !== 2) {
+      return fail('mime', 'mime.malformed', `expected exactly two MIME parts, got ${mime.parts.length}`);
     }
 
     const validation = await timed(onEvent, 'validate-certificate', () =>
@@ -260,8 +273,8 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
     if (attachmentReference.uri !== encryption.attachmentHref || headers.partHref !== encryption.attachmentHref) {
       return fail('signature', 'signature.coverage', 'the reference, PartInfo href and encryption descriptor differ');
     }
-    const part = parsed.parts.find((candidate) => candidate !== soap);
-    if (!part || part.contentId !== contentId) {
+    const part = mime.parts.find((candidate) => candidate !== soap);
+    if (!part || part.contentId !== contentId || !part.spoolPath) {
       return fail('mime', 'mime.malformed', 'the attachment Content-ID does not match the encryption reference');
     }
 
@@ -272,13 +285,9 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
 
     const recovered = await recoverInboundPayload({
       encryption,
-      attachment: {
-        contentId,
-        source: (async function* () {
-          yield part.body;
-        })(),
-        byteLength: part.body.length,
-      },
+      // Transfer boundary: the parser owns the ciphertext spool until recovery
+      // renames it into its own workspace; recovery owns it afterwards.
+      attachment: { contentId, byteLength: part.byteLength, spoolPath: part.spoolPath },
       reference: attachmentReference,
       compression,
       keyHolder: holders,
@@ -327,7 +336,7 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
       signedReferences: signature.references,
     };
     const evidence: EvidenceHandle = {
-      envelopeBytes: new Uint8Array(soap.body),
+      envelopeBytes: new Uint8Array(envelopeBytes),
       signedReferences: signature.references,
       signerCertificate: signerPem,
       dispose: async () => {},
@@ -363,5 +372,10 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
     if (err instanceof EncryptionFault) return fail('decrypt', err.reason, detail);
     if (err instanceof AddressingFault) return fail('addressing', err.reason, detail);
     return fail('internal', 'internal.error', detail);
+  } finally {
+    // The parser owns its spools until a successful transfer; dispose on every
+    // path (including each verification failure above) so nothing is left behind.
+    // A transferred ciphertext is recovery-owned and is not touched here.
+    await mime?.dispose();
   }
 }

@@ -4,7 +4,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createCertificateValidator, defaultRevocationPolicy } from '../../src/certificate-validator.js';
 import { keyHolderFromKey } from '../../src/receive/key-holder.js';
-import { parseMultipartRelated, type MimeLimits } from '../../src/receive/mime.js';
+import { parseMultipartMessage } from '../../src/receive/multipart.js';
+import { type MimeLimits } from '../../src/receive/mime.js';
 import { openAs4Message } from '../../src/receive/open.js';
 import { defaultInboundLimits } from '../../src/receive/types.js';
 import type { InboundLimits, OpenSuccess } from '../../src/receive/types.js';
@@ -365,15 +366,19 @@ async function assertFacts(
     `${name}: document type (Action)`,
   );
 
-  // Declared MIME structure.
-  const parsed = await parseMultipartRelated({
+  // Declared MIME structure: parse (streaming) only to count parts, then dispose.
+  const mime = await parseMultipartMessage({
     contentType: metadata.contentType,
     body: (async function* () {
       yield capture.body;
     })(),
     limits: mimeLimits(),
   });
-  assert.equal(parsed.parts.length, metadata.expectedParts, `${name}: MIME part count`);
+  try {
+    assert.equal(mime.parts.length, metadata.expectedParts, `${name}: MIME part count`);
+  } finally {
+    await mime.dispose();
+  }
 
   // Complete reference set: an exact URI set with no duplicates on either side,
   // and matching digest, digest method and ordered transforms (with inclusive

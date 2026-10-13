@@ -2,7 +2,7 @@ import { createDecipheriv, createHash } from 'node:crypto';
 import type { DecipherGCM } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import type { WriteStream } from 'node:fs';
-import { open } from 'node:fs/promises';
+import { open, rename, stat } from 'node:fs/promises';
 import { Readable, Transform, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createGunzip } from 'node:zlib';
@@ -344,12 +344,32 @@ export async function recoverInboundPayload(input: RecoverInboundPayloadInput): 
     workspace = await createTempWorkspace({
       ...(input.spoolDirectory ? { directory: input.spoolDirectory } : {}),
     });
+    payloadHooks.onWorkspace?.(workspace.dir);
     const ciphertextPath = workspace.path(CIPHERTEXT_FILE);
 
-    // Bounded, private ciphertext spool (no plaintext yet).
-    const ciphertextBytes = await timed(onEvent, 'decrypt', () =>
-      spoolCiphertext(attachment.source, ciphertextPath, limits.maxPartBytes, signal),
-    );
+    // Ciphertext ownership: a parser-owned spool is moved in with a single rename
+    // (the transfer boundary — before it the parser owns the file, after it
+    // recovery does); otherwise the stream is spooled here. A failed move is a
+    // local storage failure, never a silent re-spool.
+    let ciphertextBytes: number;
+    if (attachment.spoolPath) {
+      payloadHooks.onSpoolTransfer?.(attachment.spoolPath, ciphertextPath);
+      try {
+        await rename(attachment.spoolPath, ciphertextPath);
+      } catch (err) {
+        return fail('payload', 'payload.spool-failed', safeMessage(err));
+      }
+      ciphertextBytes = (await stat(ciphertextPath)).size;
+      if (ciphertextBytes > limits.maxPartBytes) {
+        return fail('mime', 'mime.part-too-large', 'ciphertext exceeds the limit');
+      }
+    } else if (attachment.source) {
+      ciphertextBytes = await timed(onEvent, 'decrypt', () =>
+        spoolCiphertext(attachment.source!, ciphertextPath, limits.maxPartBytes, signal),
+      );
+    } else {
+      return fail('payload', 'payload.spool-failed', 'no ciphertext source or spool to recover');
+    }
     if (signal?.aborted) return fail('transport', 'aborted');
     if (ciphertextBytes < MIN_CIPHERTEXT_BYTES) {
       return fail('decrypt', 'encryption.invalid', 'ciphertext is shorter than IV + tag');

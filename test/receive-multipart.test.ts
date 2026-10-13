@@ -61,6 +61,12 @@ function headersOnly(): Buffer {
   return full.subarray(0, second + 4);
 }
 
+/** Parse with an explicit content type (for parameter/validation cases). */
+function parseCt(contentType: string, body: AsyncIterable<Uint8Array> | Buffer, overrides: Partial<MimeLimits> = {}) {
+  const iterable = isAsyncIterable(body) ? body : Readable.from(body);
+  return parseMultipartMessage({ contentType, body: iterable, limits: { ...LIMITS, ...overrides } });
+}
+
 function isAsyncIterable(value: unknown): value is AsyncIterable<Uint8Array> {
   return typeof (value as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator] === 'function';
 }
@@ -673,4 +679,137 @@ test('a delayed failing close rejects parsing and cleans up', async () => {
     delete multipartHooks.createSpoolWriter;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('is byte-safe regardless of where the stream is split', async () => {
+  const attachmentBody = Buffer.from('the encrypted attachment bytes');
+  const full = multipart([soapPart(), attachment(attachmentBody)]);
+  for (let size = 1; size <= full.length; size += 1) {
+    async function* slices() {
+      for (let offset = 0; offset < full.length; offset += size) yield full.subarray(offset, offset + size);
+    }
+    const message = await parse(slices());
+    try {
+      assert.equal(message.parts.length, 2, `split size ${size}`);
+      const soap = selectSoapPart(message);
+      assert.deepEqual(await readAll(soap.read()), SOAP_XML, `split size ${size}`);
+      const part = message.parts.find((candidate) => candidate !== soap)!;
+      assert.deepEqual(await readAll(part.read()), attachmentBody, `split size ${size}`);
+    } finally {
+      await message.dispose();
+    }
+  }
+});
+
+test('does not split on boundary-like bytes that do not start a line', async () => {
+  const binary = Buffer.concat([
+    Buffer.from('prefix '),
+    Buffer.from(`--${BOUNDARY}`, 'latin1'),
+    Buffer.from(' suffix'),
+  ]);
+  const message = await parse(multipart([soapPart(), attachment(binary)]));
+  try {
+    const part = message.parts.find((candidate) => candidate.spoolPath !== null)!;
+    assert.deepEqual(await readAll(part.read()), binary);
+  } finally {
+    await message.dispose();
+  }
+});
+
+test('handles folded headers', async () => {
+  const body = multipart([soapPart()]);
+  const folded = Buffer.from(
+    body.toString('latin1').replace('Content-Type: application/soap+xml', 'Content-Type: application/\r\n soap+xml'),
+    'latin1',
+  );
+  const message = await parse(folded);
+  try {
+    assert.equal(message.parts[0]!.contentType, 'application/ soap+xml');
+  } finally {
+    await message.dispose();
+  }
+});
+
+test('rejects a non-multipart content type and a mis-named boundary', async () => {
+  await assert.rejects(
+    parseCt('application/soap+xml', multipart([soapPart()])),
+    (err) => err instanceof MimeFault && err.reason === 'mime.content-type-invalid',
+  );
+  await assert.rejects(
+    parseCt(`multipart/related; notboundary="${BOUNDARY}"`, multipart([soapPart()])),
+    (err) => err instanceof MimeFault && err.reason === 'mime.boundary-invalid',
+  );
+});
+
+test('rejects an ambiguous root and a start that is not a SOAP part', async () => {
+  const twoSoap = multipart([
+    { headers: { 'Content-Type': 'application/soap+xml', 'Content-ID': '<a@x>' }, body: SOAP_XML },
+    { headers: { 'Content-Type': 'application/soap+xml', 'Content-ID': '<b@x>' }, body: SOAP_XML },
+  ]);
+  const ambiguous = await parse(twoSoap);
+  try {
+    assert.throws(
+      () => selectSoapPart(ambiguous),
+      (err) => err instanceof MimeFault && err.reason === 'mime.ambiguous-root',
+    );
+  } finally {
+    await ambiguous.dispose();
+  }
+
+  const startedOnAttachment = await parseCt(
+    `multipart/related; boundary="${BOUNDARY}"; start="<att@x>"`,
+    multipart([soapPart(), attachment(Buffer.from('x'))]),
+  );
+  try {
+    assert.throws(
+      () => selectSoapPart(startedOnAttachment),
+      (err) => err instanceof MimeFault && err.reason === 'mime.no-soap-part',
+    );
+  } finally {
+    await startedOnAttachment.dispose();
+  }
+
+  const unmatched = await parseCt(
+    `multipart/related; boundary="${BOUNDARY}"; start="<missing@x>"`,
+    multipart([soapPart(), attachment(Buffer.from('x'))]),
+  );
+  try {
+    assert.equal(unmatched.startContentId, 'missing@x');
+    assert.throws(
+      () => selectSoapPart(unmatched),
+      (err) => err instanceof MimeFault && err.reason === 'mime.no-soap-part',
+    );
+  } finally {
+    await unmatched.dispose();
+  }
+});
+
+test('rejects a duplicate header within a part', async () => {
+  const body = Buffer.from(
+    `--${BOUNDARY}\r\nContent-Type: application/soap+xml\r\nContent-Type: text/plain\r\n\r\n<a/>\r\n--${BOUNDARY}--\r\n`,
+    'latin1',
+  );
+  await assert.rejects(parse(body), (err) => err instanceof MimeFault && err.reason === 'mime.duplicate-header');
+});
+
+test('stops at the closing delimiter and ignores a following part', async () => {
+  const withTrailingPart = Buffer.concat([
+    multipart([soapPart(), attachment(Buffer.from('body'))]),
+    Buffer.from(`\r\n--${BOUNDARY}\r\nContent-Type: text/plain\r\n\r\nignored`, 'latin1'),
+  ]);
+  const message = await parse(withTrailingPart);
+  try {
+    assert.equal(message.parts.length, 2);
+  } finally {
+    await message.dispose();
+  }
+});
+
+test('cancellation interrupts a stalled read before the first chunk', async () => {
+  const stream = manualStream();
+  const controller = new AbortController();
+  const pending = parse(stream.body, {}, { signal: controller.signal });
+  setTimeout(() => controller.abort(), 10);
+  await assert.rejects(pending, (err) => err instanceof MimeFault && err.reason === 'aborted');
+  assert.ok(stream.wasReturned(), 'the source is cleaned up on abort');
 });

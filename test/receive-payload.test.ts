@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createCipheriv, createDecipheriv, constants, privateDecrypt, publicEncrypt, randomBytes } from 'node:crypto';
 import type { DecipherGCM } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -549,5 +550,46 @@ test('a failed disposal is reported, retryable and idempotent', async (t) => {
     assert.deepEqual(await readdir(spool), []);
   } finally {
     await rm(spool, { recursive: true, force: true });
+  }
+});
+
+test('recovers from a transferred ciphertext spool without copying it', async () => {
+  const representation = gzipSync(DOCUMENT);
+  const built = await makeInbound(representation);
+  const dir = await mkdtemp(join(tmpdir(), 'as4-spool-'));
+  try {
+    const spool = join(dir, 'part-2.bin');
+    await writeFile(spool, built.attachmentBytes);
+    const result = await recoverInboundPayload(
+      inputFor(built, {
+        attachment: { contentId: built.encryption.attachmentHref.slice('cid:'.length), spoolPath: spool },
+      }),
+    );
+    assert.equal(result.ok, true, JSON.stringify(result));
+    if (result.ok) {
+      assert.deepEqual(await collect(result.payload.read()), DOCUMENT);
+      await result.dispose();
+    }
+    assert.equal(existsSync(spool), false, 'the source spool was moved, not copied');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a failed spool rename is a storage failure and leaves the source owned', async () => {
+  const representation = gzipSync(DOCUMENT);
+  const built = await makeInbound(representation);
+  const dir = await mkdtemp(join(tmpdir(), 'as4-spool-'));
+  try {
+    const missing = join(dir, 'missing.bin');
+    const result = await recoverInboundPayload(
+      inputFor(built, {
+        attachment: { contentId: built.encryption.attachmentHref.slice('cid:'.length), spoolPath: missing },
+      }),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.reason, 'payload.spool-failed');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });
