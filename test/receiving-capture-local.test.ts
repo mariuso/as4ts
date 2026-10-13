@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,20 +10,24 @@ import { PEPPOL_PARTY_ID_TYPE } from '../src/constants.js';
 import { signerFromKey } from '../src/index.js';
 import { defaultEntropy, prepareAs4Internal } from '../src/internal.js';
 import { buildMultipartBody } from '../src/multipart.js';
+import { keyHolderFromKey } from '../src/receive/key-holder.js';
+import { openAs4Message } from '../src/receive/open.js';
+import { respondAs4Message } from '../src/receive/respond.js';
 import { PACKAGE_VERSION } from '../src/version.js';
 import { parseXml } from '../src/xml/nodes.js';
 import { verifyWsSecuritySignature } from '../src/xml/ws-security.js';
 import type { CaptureMetadata, CaptureReference } from './helpers/capture.js';
-import { loadCapture, verifyCapture } from './helpers/capture.js';
+import { loadCapture, splitPemCertificates, verifyCapture } from './helpers/capture.js';
 import { createTestPki } from './helpers/pki.js';
 import { testValidator } from './helpers/input.js';
 
 /**
  * A locally generated capture: the same layout as an independent capture, but
  * `origin: "local"`. It exercises the whole capture harness (open, decrypt,
- * signer validation, payload-hash and reference comparison, disposal) without
- * committing any credential and without claiming interoperability evidence. The
- * Phase 6 validation command does not count local captures.
+ * signer validation, payload-hash, process/document-type/part and reference
+ * comparison, sender-acceptance evidence, disposal) without committing any
+ * credential and without claiming interoperability evidence. The Phase 6
+ * validation command does not count local captures.
  */
 const SENDER = { scheme: 'iso6523-actorid-upis', value: '0192:111111111' };
 const RECEIVER = { scheme: 'iso6523-actorid-upis', value: '0192:222222222' };
@@ -45,7 +50,7 @@ async function collect(stream: NodeJS.ReadableStream): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-/** Build a local capture (request + metadata + test-only credentials) on disk. */
+/** Build a local capture (request + metadata + credentials + acceptance evidence). */
 async function writeLocalCapture(dir: string, as4MessageId: string): Promise<void> {
   const now = new Date();
   const pki = createTestPki({ now });
@@ -116,7 +121,7 @@ async function writeLocalCapture(dir: string, as4MessageId: string): Promise<voi
         expectedCoverage: { messaging: true, body: true },
         expectedPayloadSha256Base64: createHash('sha256').update(PAYLOAD).digest('base64'),
         expectedSignedReferences: references,
-        senderAcceptsReceipt: true,
+        senderAcceptance: { accepted: true, evidenceFile: 'sender-acceptance.json' },
       };
 
       await mkdir(dir, { recursive: true });
@@ -126,6 +131,51 @@ async function writeLocalCapture(dir: string, as4MessageId: string): Promise<voi
       await writeFile(join(dir, 'receiver-key.pem'), pki.receiver.keyPem);
       await writeFile(join(dir, 'trust-roots.pem'), pki.root.certPem);
       await writeFile(join(dir, 'trust-intermediates.pem'), pki.intermediate.certPem);
+
+      // Record real acceptance evidence: open the capture and generate the
+      // receipt, storing the exact response bytes and its hash.
+      const opened = await openAs4Message({
+        contentType: multipart.contentType,
+        body: (async function* () {
+          yield body;
+        })(),
+        keyHolder: keyHolderFromKey(pki.receiver.keyObject, pki.receiver.certPem),
+        validateCertificate: testValidator(pki),
+        receiverIdentity: { scheme: PEPPOL_PARTY_ID_TYPE, value: pki.receiver.commonName },
+        now: () => now,
+      });
+      assert.equal(opened.ok, true, JSON.stringify(opened));
+      if (!opened.ok) throw new Error('unreachable');
+      try {
+        const receipt = await respondAs4Message({
+          kind: 'accepted',
+          receipt: opened.receipt,
+          decision: 'committed',
+          signer: signerFromKey(pki.receiver.keyObject, pki.receiver.certPem),
+          now: () => now,
+        });
+        assert.equal(receipt.ok, true, JSON.stringify(receipt));
+        if (!receipt.ok) throw new Error('unreachable');
+        await writeFile(join(dir, 'sender-acceptance-response.bin'), receipt.body);
+        await writeFile(
+          join(dir, 'sender-acceptance.json'),
+          JSON.stringify(
+            {
+              implementation: 'as4ts',
+              version: PACKAGE_VERSION,
+              accepted: true,
+              refToMessageId: opened.messageId,
+              recordedAt: capturedAt,
+              responseFile: 'sender-acceptance-response.bin',
+              responseSha256Base64: createHash('sha256').update(receipt.body).digest('base64'),
+            },
+            null,
+            2,
+          ),
+        );
+      } finally {
+        await opened.dispose();
+      }
     } finally {
       await message.dispose();
     }
@@ -150,6 +200,8 @@ test('a locally generated capture verifies end to end through openAs4Message', a
     assert.equal(capture.metadata.origin, 'local');
     const facts = await verifyCapture(capture);
     assert.equal(facts.origin, 'local');
+    assert.equal(facts.implementation, 'as4ts');
+    assert.equal(facts.senderAccepted, true);
     assert.equal(facts.messageId, 'local-capture@as4-sender');
     assert.equal(facts.senderId, capture.metadata.senderParticipant.value);
     assert.equal(facts.receiverId, capture.metadata.receiverParticipant.value);
@@ -172,4 +224,25 @@ test('a tampered capture is rejected before any success fact', async () => {
     await writeFile(join(dir, 'request.bin'), body);
     await assert.rejects(verifyCapture(loadCapture(dir, 'local-tampered')));
   });
+});
+
+test('a trust bundle whose required root is not the first block still verifies', async () => {
+  await withCapture(async (dir) => {
+    const decoy = createTestPki();
+    const realRoot = readFileSync(join(dir, 'trust-roots.pem'), 'utf8');
+    await writeFile(join(dir, 'trust-roots.pem'), `${decoy.root.certPem}\n${realRoot}`);
+    const capture = loadCapture(dir, 'local-bundle');
+    assert.equal(capture.roots.length, 2, 'both root certificates are loaded');
+    const facts = await verifyCapture(capture);
+    assert.equal(facts.senderAccepted, true);
+  });
+});
+
+test('splitPemCertificates keeps every block and rejects a malformed one', () => {
+  const first = createTestPki();
+  const second = createTestPki();
+  const blocks = splitPemCertificates(`${first.root.certPem}\n${second.root.certPem}`);
+  assert.equal(blocks.length, 2);
+  assert.notEqual(blocks[0], blocks[1]);
+  assert.throws(() => splitPemCertificates('-----BEGIN CERTIFICATE-----\nbm90LWEtY2VydA==\n-----END CERTIFICATE-----'));
 });

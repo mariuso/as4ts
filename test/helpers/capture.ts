@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { createHash, createPrivateKey } from 'node:crypto';
+import { createHash, createPrivateKey, X509Certificate } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createCertificateValidator, defaultRevocationPolicy } from '../../src/certificate-validator.js';
 import { keyHolderFromKey } from '../../src/receive/key-holder.js';
+import { parseMultipartRelated, type MimeLimits } from '../../src/receive/mime.js';
 import { openAs4Message } from '../../src/receive/open.js';
 import { defaultInboundLimits } from '../../src/receive/types.js';
 import type { InboundLimits, OpenSuccess } from '../../src/receive/types.js';
@@ -20,9 +21,10 @@ import type { ScopedId } from '../../src/types.js';
  * This runs the whole path: bounded MIME parse, strict XML, signature and
  * coverage, certificate validation against the supplied trust chain, session-key
  * unwrap with the captured receiver credential, decryption, and payload
- * recovery. It then compares the recovered payload hash and the complete
- * reference set (URI, digest, digest method, ordered transforms with inclusive
- * prefixes), and disposes every returned handle.
+ * recovery. It then compares the recovered payload hash, the declared process /
+ * document type / part count, and the complete reference set (an exact URI set,
+ * with digest, digest method and ordered transforms including inclusive
+ * prefixes), checks the recorded sender acceptance, and disposes every handle.
  */
 
 export type CaptureOrigin = 'independent' | 'local';
@@ -37,6 +39,18 @@ export interface CaptureReference {
   readonly digest: string;
   readonly digestMethod: string;
   readonly transforms: readonly CaptureTransform[];
+}
+
+/** The sender's recorded result for the receipt this receiver generated. */
+export interface SenderAcceptanceEvidence {
+  readonly implementation: string;
+  readonly version?: string;
+  readonly accepted: boolean;
+  readonly refToMessageId: string;
+  readonly recordedAt: string;
+  /** The actual response bytes the sender accepted, as evidence. */
+  readonly responseFile?: string;
+  readonly responseSha256Base64?: string;
 }
 
 export interface CaptureMetadata {
@@ -63,8 +77,8 @@ export interface CaptureMetadata {
   readonly expectedCoverage: { readonly messaging: boolean; readonly body: boolean };
   readonly expectedPayloadSha256Base64: string;
   readonly expectedSignedReferences: readonly CaptureReference[];
-  /** Whether the sender accepted the receipt this receiver generated for it. */
-  readonly senderAcceptsReceipt: boolean;
+  /** Whether the sender accepted the receipt, and where the supporting evidence is. */
+  readonly senderAcceptance: { readonly accepted: boolean; readonly evidenceFile: string };
 }
 
 export interface LoadedCapture {
@@ -76,11 +90,15 @@ export interface LoadedCapture {
   readonly receiverKeyPem: string;
   readonly roots: string[];
   readonly intermediates: string[];
+  /** The parsed sender-acceptance evidence, validated for coherence. */
+  readonly senderAcceptance: SenderAcceptanceEvidence;
 }
 
 export interface CaptureFacts {
   readonly name: string;
   readonly origin: CaptureOrigin;
+  readonly implementation: string;
+  readonly senderAccepted: boolean;
   readonly messageId: string;
   readonly senderId: string;
   readonly receiverId: string;
@@ -100,12 +118,112 @@ function readPem(dir: string, file: string): string {
   return readRequired(dir, file).toString('utf8').trim();
 }
 
+/**
+ * Split a PEM bundle into individual certificate blocks and reject any block
+ * that does not parse. The validator expects one certificate per array entry, so
+ * a bundle's additional certificates must not be dropped.
+ */
+export function splitPemCertificates(text: string): string[] {
+  const blocks = text.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) ?? [];
+  return blocks.map((block) => {
+    const pem = block.trim();
+    try {
+      void new X509Certificate(pem);
+    } catch {
+      throw new Error('a certificate block in the trust material does not parse');
+    }
+    return pem;
+  });
+}
+
+/** Validate the required metadata centrally, so the suite and the gate agree. */
+export function validateCaptureMetadata(metadata: CaptureMetadata, dir = '<capture>'): void {
+  const fail = (message: string): never => {
+    throw new Error(`${dir}: ${message}`);
+  };
+  if (metadata.schema !== 1) fail('unsupported metadata schema');
+  if (metadata.origin !== 'independent' && metadata.origin !== 'local') {
+    fail('origin must be "independent" or "local"');
+  }
+  if (!metadata.capturedAt) fail('capturedAt is required');
+  if (!metadata.contentType) fail('contentType is required');
+  if (!metadata.sender?.implementation) fail('sender.implementation is required');
+  if (!metadata.sender?.version) fail('sender.version is required');
+  for (const field of ['senderParticipant', 'receiverParticipant', 'documentType', 'process'] as const) {
+    const value = metadata[field];
+    if (!value?.scheme || !value?.value) fail(`${field} (scheme and value) is required`);
+  }
+  if (!Number.isInteger(metadata.expectedParts) || metadata.expectedParts < 2) {
+    fail('expectedParts must be an integer >= 2');
+  }
+  if (metadata.expectedCoverage?.messaging !== true || metadata.expectedCoverage?.body !== true) {
+    fail('expectedCoverage must require both messaging and body');
+  }
+  if (!metadata.expectedPayloadSha256Base64) fail('expectedPayloadSha256Base64 is required');
+  const references = metadata.expectedSignedReferences;
+  if (!Array.isArray(references) || references.length === 0) {
+    fail('expectedSignedReferences must be a non-empty array');
+  }
+  const seen = new Set<string>();
+  for (const reference of references) {
+    if (!reference?.uri || !reference?.digest || !reference?.digestMethod) {
+      fail('every expected reference needs uri, digest and digestMethod');
+    }
+    if (!Array.isArray(reference.transforms) || reference.transforms.length === 0) {
+      fail(`reference ${reference.uri} needs at least one transform`);
+    }
+    if (seen.has(reference.uri)) fail(`duplicate expected reference ${reference.uri}`);
+    seen.add(reference.uri);
+  }
+  if (
+    !metadata.senderAcceptance ||
+    typeof metadata.senderAcceptance.accepted !== 'boolean' ||
+    !metadata.senderAcceptance.evidenceFile
+  ) {
+    fail('senderAcceptance { accepted, evidenceFile } is required');
+  }
+}
+
+function readSenderAcceptance(dir: string, name: string, metadata: CaptureMetadata): SenderAcceptanceEvidence {
+  const raw = readRequired(dir, metadata.senderAcceptance.evidenceFile);
+  let evidence: SenderAcceptanceEvidence;
+  try {
+    evidence = JSON.parse(raw.toString('utf8')) as SenderAcceptanceEvidence;
+  } catch {
+    throw new Error(`${name}: sender-acceptance evidence is not valid JSON`);
+  }
+  assert.equal(typeof evidence.accepted, 'boolean', `${name}: evidence.accepted must be a boolean`);
+  assert.equal(
+    evidence.accepted,
+    metadata.senderAcceptance.accepted,
+    `${name}: evidence.accepted must match metadata.senderAcceptance.accepted`,
+  );
+  assert.equal(evidence.implementation, metadata.sender.implementation, `${name}: evidence implementation`);
+  if (evidence.version !== undefined) {
+    assert.equal(evidence.version, metadata.sender.version, `${name}: evidence version`);
+  }
+  assert.ok(evidence.recordedAt, `${name}: evidence.recordedAt is required`);
+  if (evidence.responseFile) {
+    const response = readRequired(dir, evidence.responseFile);
+    assert.ok(response.length > 0, `${name}: the recorded response must not be empty`);
+    if (evidence.responseSha256Base64) {
+      assert.equal(
+        createHash('sha256').update(response).digest('base64'),
+        evidence.responseSha256Base64,
+        `${name}: recorded response hash`,
+      );
+    }
+  }
+  return evidence;
+}
+
 export function loadCapture(dir: string, name = dir): LoadedCapture {
   const metadata = JSON.parse(readRequired(dir, 'metadata.json').toString('utf8')) as CaptureMetadata;
-  if (metadata.schema !== 1) throw new Error(`capture ${dir} has an unsupported metadata schema`);
-  if (metadata.origin !== 'independent' && metadata.origin !== 'local') {
-    throw new Error(`capture ${dir} must declare origin "independent" or "local"`);
-  }
+  validateCaptureMetadata(metadata, dir);
+  const roots = splitPemCertificates(readPem(dir, 'trust-roots.pem'));
+  const intermediates = splitPemCertificates(readPem(dir, 'trust-intermediates.pem'));
+  if (roots.length === 0) throw new Error(`capture ${dir}: trust-roots.pem contains no certificate`);
+  if (intermediates.length === 0) throw new Error(`capture ${dir}: trust-intermediates.pem contains no certificate`);
   return {
     dir,
     name,
@@ -113,8 +231,9 @@ export function loadCapture(dir: string, name = dir): LoadedCapture {
     body: readRequired(dir, 'request.bin'),
     receiverCertPem: readPem(dir, 'receiver-cert.pem'),
     receiverKeyPem: readPem(dir, 'receiver-key.pem'),
-    roots: [readPem(dir, 'trust-roots.pem')],
-    intermediates: [readPem(dir, 'trust-intermediates.pem')],
+    roots,
+    intermediates,
+    senderAcceptance: readSenderAcceptance(dir, name, metadata),
   };
 }
 
@@ -133,6 +252,16 @@ function normalizedTransforms(reference: {
   }));
 }
 
+function mimeLimits(): MimeLimits {
+  return {
+    maxRequestBytes: defaultInboundLimits.maxRequestBytes,
+    maxParts: defaultInboundLimits.maxParts,
+    maxHeaderBytes: defaultInboundLimits.maxHeaderBytes,
+    maxPartBytes: defaultInboundLimits.maxPartBytes,
+    maxBoundaryLength: defaultInboundLimits.maxBoundaryLength,
+  };
+}
+
 /**
  * Verify one capture end to end and return its facts. Throws (via `assert`) on
  * any mismatch, so both the test suite and the Phase 6 validation command can
@@ -143,11 +272,6 @@ export async function verifyCapture(
   limits: InboundLimits = defaultInboundLimits,
 ): Promise<CaptureFacts> {
   const { metadata } = capture;
-  // A capture that declares it does not cover the Body/Messaging conflicts with
-  // the selected coverage policy; surface it as a fixture/policy mismatch rather
-  // than letting the open failure speak for it.
-  assert.equal(metadata.expectedCoverage.messaging, true, `${capture.name}: capture must cover eb:Messaging`);
-  assert.equal(metadata.expectedCoverage.body, true, `${capture.name}: capture must cover the SOAP Body`);
 
   const keyHolder = keyHolderFromKey(createPrivateKey(capture.receiverKeyPem), capture.receiverCertPem);
   const validator = createCertificateValidator({
@@ -192,25 +316,48 @@ async function assertFacts(capture: LoadedCapture, opened: OpenSuccess): Promise
     assert.deepEqual(opened.finalRecipient, metadata.finalRecipient, `${name}: business finalRecipient`);
   }
 
-  // Complete reference set: URI, digest, digest method, ordered transforms and
-  // inclusive-prefix parameters. No expected reference may be missing and no
-  // unexpected reference may be present.
-  const actual = opened.receipt.signedReferences;
+  // Declared process and document type (the Action encodes the document type).
+  assert.deepEqual(opened.service, metadata.process, `${name}: process (CollaborationInfo/Service)`);
   assert.equal(
-    actual.length,
-    metadata.expectedSignedReferences.length,
-    `${name}: reference count (${actual.map((r) => r.uri).join(', ')})`,
+    opened.action,
+    `${metadata.documentType.scheme}::${metadata.documentType.value}`,
+    `${name}: document type (Action)`,
+  );
+
+  // Declared MIME structure.
+  const parsed = await parseMultipartRelated({
+    contentType: metadata.contentType,
+    body: (async function* () {
+      yield capture.body;
+    })(),
+    limits: mimeLimits(),
+  });
+  assert.equal(parsed.parts.length, metadata.expectedParts, `${name}: MIME part count`);
+
+  // Complete reference set: an exact URI set with no duplicates on either side,
+  // and matching digest, digest method and ordered transforms (with inclusive
+  // prefixes) for every URI.
+  const actual = opened.receipt.signedReferences;
+  const expected = metadata.expectedSignedReferences;
+  const expectedUris = new Set(expected.map((reference) => reference.uri));
+  assert.equal(expectedUris.size, expected.length, `${name}: duplicate expected reference URI`);
+  const actualUris = new Set(actual.map((reference) => reference.uri));
+  assert.deepEqual(
+    [...actualUris].sort(),
+    [...expectedUris].sort(),
+    `${name}: the signed reference URI set must match exactly`,
   );
   const byUri = new Map(actual.map((reference) => [reference.uri, reference]));
-  for (const expected of metadata.expectedSignedReferences) {
-    const reference = byUri.get(expected.uri);
-    assert.ok(reference, `${name}: expected reference ${expected.uri}`);
-    assert.equal(reference.digest, expected.digest, `${name}: digest for ${expected.uri}`);
-    assert.equal(reference.digestMethod, expected.digestMethod, `${name}: digest method for ${expected.uri}`);
+  for (const reference of expected) {
+    const found = byUri.get(reference.uri);
+    assert.ok(found, `${name}: expected reference ${reference.uri}`);
+    if (!found) continue;
+    assert.equal(found.digest, reference.digest, `${name}: digest for ${reference.uri}`);
+    assert.equal(found.digestMethod, reference.digestMethod, `${name}: digest method for ${reference.uri}`);
     assert.deepEqual(
+      normalizedTransforms(found),
       normalizedTransforms(reference),
-      normalizedTransforms(expected),
-      `${name}: transforms for ${expected.uri}`,
+      `${name}: transforms for ${reference.uri}`,
     );
   }
 
@@ -220,9 +367,18 @@ async function assertFacts(capture: LoadedCapture, opened: OpenSuccess): Promise
   assert.equal(payloadSha256Base64, metadata.expectedPayloadSha256Base64, `${name}: recovered payload hash`);
   assert.equal(opened.payload.digestBase64, metadata.expectedPayloadSha256Base64, `${name}: payload handle hash`);
 
+  // Recorded sender acceptance must reference this exchange.
+  assert.equal(
+    capture.senderAcceptance.refToMessageId,
+    opened.messageId,
+    `${name}: recorded sender acceptance must reference this message`,
+  );
+
   return {
     name,
     origin: metadata.origin,
+    implementation: metadata.sender.implementation,
+    senderAccepted: capture.senderAcceptance.accepted,
     messageId: opened.messageId,
     senderId: opened.senderId,
     receiverId: opened.receiverId,

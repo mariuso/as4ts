@@ -32,11 +32,29 @@ test/fixtures/inbound/<name>/
   receiver-key.pem        # its private key, so the test can decrypt (test-only)
   trust-roots.pem         # trust anchor(s) that validate the sender's signing certificate
   trust-intermediates.pem # intermediate CA certificate(s) for the sender's chain
+  sender-acceptance.json  # the sender's recorded result for the generated receipt
+  sender-acceptance-response.bin  # the exact response bytes the sender accepted
 ```
 
-`receiver-key.pem` is a throwaway test key whose only purpose is to let the test
-unwrap the session key and decrypt the payload. Never record production key
-material.
+A trust file may hold more than one certificate; every block is loaded (one per
+array entry), so an additional root or intermediate is not dropped. `receiver-key.pem`
+is a throwaway test key whose only purpose is to let the test unwrap the session
+key and decrypt the payload. Never record production key material.
+
+`sender-acceptance.json` is the evidence that the exchange completed — a boolean
+alone is only an assertion:
+
+```json
+{
+  "implementation": "oxalis",
+  "version": "...",
+  "accepted": true,
+  "refToMessageId": "...",
+  "recordedAt": "2026-01-01T00:00:00.000Z",
+  "responseFile": "sender-acceptance-response.bin",
+  "responseSha256Base64": "..."
+}
+```
 
 `metadata.json`:
 
@@ -76,7 +94,7 @@ material.
       ]
     }
   ],
-  "senderAcceptsReceipt": true
+  "senderAcceptance": { "accepted": true, "evidenceFile": "sender-acceptance.json" }
 }
 ```
 
@@ -98,14 +116,22 @@ parameters — not just URI and digest.
 (`openAs4Message`): bounded MIME parse, strict XML, signature and coverage,
 signer validation against the recorded trust chain, session-key unwrap with the
 captured receiver credential, decryption and payload recovery; then it compares
-the recovered payload hash and the complete reference set, and disposes every
-handle.
+the recovered payload hash, the declared process, document type and MIME part
+count, and the complete reference set (an exact URI set with matching digest,
+digest method and ordered transforms including inclusive prefixes), checks the
+recorded sender acceptance, and disposes every handle. The required metadata is
+validated centrally, so the ordinary suite and the gate enforce the same
+contract; a capture with a duplicate expected URI, an incorrect
+process/document-type/part count, or an unrelated reference set fails.
 
 - The ordinary suite (`npm test`) verifies whatever captures are present and
   skips when the directory holds none, so day-to-day work stays green.
-- The Phase 6 validation command (`npm run validate:receive`) **fails** unless at
-  least two **independent** captures are present and verify. A local capture is
-  never counted as independent evidence.
+- The Phase 6 validation command (`npm run validate:receive`) **fails** unless
+  there are successful, receipt-accepted captures from **two distinct sender
+  implementations**, with the sender's acceptance and the exact response bytes
+  preserved as evidence. A local capture — or two captures from the same
+  implementation, or a capture whose sender rejected the receipt — never
+  satisfies it.
 
 `test/receiving-capture-local.test.ts` generates a local capture with this
 project's sender and verifies it end to end, which exercises the harness without

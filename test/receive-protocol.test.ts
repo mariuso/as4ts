@@ -298,7 +298,9 @@ test('a tampered ciphertext is rejected at decryption', async () => {
     assert.equal(result.ok, false);
     if (!result.ok) {
       assert.equal(result.stage, 'decrypt');
-      assert.match(result.reason, /^(decrypt|signature)\./);
+      assert.equal(result.reason, 'decrypt.gcm-auth');
+      // Identity binding succeeded before decryption, so this is answerable.
+      assert.equal(result.answerable, true);
     }
   });
 });
@@ -321,7 +323,9 @@ test('an unsupported encryption algorithm is a decryption failure', async () => 
     assert.equal(result.ok, false);
     if (!result.ok) {
       assert.equal(result.stage, 'decrypt');
-      assert.match(result.reason, /^(decrypt|encryption)\./);
+      assert.equal(result.reason, 'decrypt.unsupported-algorithm');
+      // Identity binding succeeded before the encryption graph was parsed.
+      assert.equal(result.answerable, true);
     }
   }, changeEncryptionAlgorithm);
 });
@@ -332,18 +336,28 @@ test('size limits fail closed with size facts', async () => {
       openInput(request, { limits: { ...defaultInboundLimits, maxRequestBytes: 64 } }),
     );
     assert.equal(tooLarge.ok, false);
-    if (!tooLarge.ok) assert.equal(tooLarge.reason, 'body.too-large');
+    if (!tooLarge.ok) {
+      assert.equal(tooLarge.reason, 'body.too-large');
+      assert.equal(tooLarge.answerable, false);
+    }
 
     const xmlTooLarge = await openAs4Message(
       openInput(request, { limits: { ...defaultInboundLimits, maxEnvelopeBytes: 16 } }),
     );
     assert.equal(xmlTooLarge.ok, false);
-    if (!xmlTooLarge.ok) assert.equal(xmlTooLarge.reason, 'xml.too-large');
+    if (!xmlTooLarge.ok) {
+      assert.equal(xmlTooLarge.reason, 'xml.too-large');
+      assert.equal(xmlTooLarge.answerable, false);
+    }
 
     const decompressTooLarge = await openAs4Message(
       openInput(request, { limits: { ...defaultInboundLimits, maxDecompressedBytes: 4 } }),
     );
     assert.equal(decompressTooLarge.ok, false);
-    if (!decompressTooLarge.ok) assert.equal(decompressTooLarge.reason, 'payload.too-large');
+    if (!decompressTooLarge.ok) {
+      assert.equal(decompressTooLarge.reason, 'payload.too-large');
+      // Recovery runs after identity binding, so this is answerable.
+      assert.equal(decompressTooLarge.answerable, true);
+    }
   });
 });
