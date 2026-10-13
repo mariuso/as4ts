@@ -1,11 +1,13 @@
-import { AS4_COMPRESSION_TYPE, EBMS_NS } from '../constants.js';
+import { AS4_COMPRESSION_TYPE, EBMS_NS, SOAP_11_NS, SOAP_ENV_NS } from '../constants.js';
 import { peppolProfile } from '../profile.js';
-import { commonNameOf, parseCertificate } from '../util.js';
+import { commonNameOf, parseCertificate, safeMessage } from '../util.js';
 import { MessageBudget } from './budget.js';
 import { EncryptionFault, parseInboundEncryption } from './encryption.js';
 import { MimeFault, parseMultipartRelated, selectSoapPart } from './mime.js';
 import { recoverInboundPayload } from './payload.js';
-import { compareSbdh, documentTypeFromAction, parseSbdh } from './sbdh.js';
+import { payloadHooks } from './payload-hooks.js';
+import { checkSbdh, documentTypeFromAction } from './sbdh.js';
+import { abortableStream, isAbortError } from './streams.js';
 import { AddressingFault, isSupportedCompression, readUserMessage } from './user-message.js';
 import { defaultXmlLimits, parseStrictXml, XmlFault } from './xml.js';
 import { verifyWsSecuritySignature } from '../xml/ws-security.js';
@@ -21,6 +23,7 @@ import type {
   OpenResult,
   PayloadHandle,
   ReceiptContext,
+  SbdhConsistency,
 } from './types.js';
 import { defaultInboundLimits } from './types.js';
 
@@ -29,7 +32,7 @@ import { defaultInboundLimits } from './types.js';
  * acknowledgement and no storage: success means the message verified and the
  * payload was fully processed, and it returns verified facts plus owned handles
  * and an immutable receipt context. Every failure is a value with a stage, a
- * reason and — when the headers were trustworthy — the correlation needed to
+ * reason and — only once the AP identity is bound — the correlation needed to
  * build an ebMS error.
  */
 function emit(onEvent: OnInboundEvent | undefined, event: InboundEvent): void {
@@ -78,15 +81,26 @@ function certReason(status: 'invalid' | 'revoked' | 'unavailable'): InboundFailu
   return 'certificate.untrusted';
 }
 
-async function readPayload(handle: PayloadHandle, maxBytes: number): Promise<Buffer> {
+function isFileSystemError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === 'string' && /^E[A-Z]+$/.test(code);
+}
+
+/** Read a payload up to `maxBytes`, cancelling on the signal and detecting overflow. */
+async function readPayload(
+  handle: PayloadHandle,
+  maxBytes: number,
+  signal: AbortSignal | undefined,
+): Promise<{ bytes: Buffer; tooLarge: boolean }> {
+  payloadHooks.onReadPayload?.();
   const chunks: Buffer[] = [];
   let total = 0;
-  for await (const chunk of handle.read()) {
-    total += (chunk as Buffer).length;
-    if (total > maxBytes) break;
-    chunks.push(chunk as Buffer);
+  for await (const chunk of abortableStream(handle.read(), signal)) {
+    total += chunk.byteLength;
+    if (total > maxBytes) return { bytes: Buffer.alloc(0), tooLarge: true };
+    chunks.push(Buffer.from(chunk));
   }
-  return Buffer.concat(chunks);
+  return { bytes: Buffer.concat(chunks), tooLarge: false };
 }
 
 export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenResult> {
@@ -127,13 +141,20 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
       Promise.resolve(parseStrictXml(soap.body, { ...defaultXmlLimits, maxBytes: limits.maxEnvelopeBytes })),
     );
 
+    const envelope = document.documentElement;
+    if (
+      envelope.localName !== 'Envelope' ||
+      (envelope.namespaceURI !== SOAP_ENV_NS && envelope.namespaceURI !== SOAP_11_NS)
+    ) {
+      return fail('xml', 'xml.malformed', 'the document is not a SOAP envelope');
+    }
+
     const verification = verifyWsSecuritySignature(document);
     if (!verification.ok) return fail('signature', mapSignatureReason(verification.reason), verification.detail);
     const signature = verification.signature;
     const signerPem = signature.signerCertificatePem;
 
     // Coverage: eb:Messaging and the SOAP Body must both be signed.
-    const envelope = document.documentElement;
     const soapNamespace = envelope.namespaceURI ?? '';
     const header = directChild(envelope, soapNamespace, 'Header');
     const soapBody = directChild(envelope, soapNamespace, 'Body');
@@ -147,6 +168,27 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
       return fail('signature', 'signature.coverage', 'the signature does not cover eb:Messaging and the SOAP Body');
     }
 
+    // Every reference must be unique, and there must be exactly one attachment
+    // reference. Until multiple attachments are supported, extra parts or
+    // references are rejected rather than acknowledged.
+    const seenUris = new Set<string>();
+    for (const reference of signature.references) {
+      if (seenUris.has(reference.uri))
+        return fail('signature', 'signature.coverage', `duplicate reference ${reference.uri}`);
+      seenUris.add(reference.uri);
+    }
+    const attachmentReferences = signature.references.filter((reference) => reference.uri.startsWith('cid:'));
+    if (attachmentReferences.length !== 1) {
+      return fail(
+        'signature',
+        'signature.coverage',
+        `expected exactly one attachment reference, got ${attachmentReferences.length}`,
+      );
+    }
+    if (parsed.parts.length !== 2) {
+      return fail('mime', 'mime.malformed', `expected exactly two MIME parts, got ${parsed.parts.length}`);
+    }
+
     const validation = await timed(onEvent, 'validate-certificate', () =>
       input.validateCertificate({
         certificatePem: signerPem,
@@ -158,8 +200,8 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
     if (!validation.ok) return fail('certificate', certReason(validation.status), validation.reason);
 
     const headers = readUserMessage(document, profile);
-    correlation = { messageId: headers.messageId, senderId: headers.fromPartyId, receiverId: headers.toPartyId };
 
+    // AP identity binding. Correlation is only trusted once this succeeds.
     const signerCn = commonNameOf(parseCertificate(signerPem));
     if (headers.fromPartyId !== signerCn) {
       return fail(
@@ -175,16 +217,21 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
         `To/PartyId ${headers.toPartyId} != receiver identity ${input.receiverIdentity.value}`,
       );
     }
+    correlation = { messageId: headers.messageId, senderId: headers.fromPartyId, receiverId: headers.toPartyId };
     if (!isSupportedCompression(headers.compressionType)) {
       return fail('addressing', 'addressing.unsupported', `unsupported compression ${headers.compressionType}`);
     }
 
     const encryption = parseInboundEncryption(document);
     const contentId = encryption.attachmentHref.startsWith('cid:') ? encryption.attachmentHref.slice(4) : '';
-    const part = parsed.parts.find((candidate) => candidate.contentId === contentId);
-    if (!part) return fail('decrypt', 'encryption.invalid', 'the encrypted attachment is not present');
-    const reference = signature.references.find((candidate) => candidate.uri === encryption.attachmentHref);
-    if (!reference) return fail('signature', 'signature.coverage', 'the attachment is not covered by the signature');
+    const attachmentReference = attachmentReferences[0]!;
+    if (attachmentReference.uri !== encryption.attachmentHref || headers.partHref !== encryption.attachmentHref) {
+      return fail('signature', 'signature.coverage', 'the reference, PartInfo href and encryption descriptor differ');
+    }
+    const part = parsed.parts.find((candidate) => candidate !== soap);
+    if (!part || part.contentId !== contentId) {
+      return fail('mime', 'mime.malformed', 'the attachment Content-ID does not match the encryption reference');
+    }
 
     const compression =
       headers.compressionType === AS4_COMPRESSION_TYPE
@@ -200,7 +247,7 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
         })(),
         byteLength: part.body.length,
       },
-      reference,
+      reference: attachmentReference,
       compression,
       keyHolder: holders,
       limits,
@@ -210,30 +257,34 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
       ...(onEvent ? { onEvent } : {}),
     });
     if (!recovered.ok) {
-      return {
-        ...recovered,
-        answerable: correlation !== undefined,
-        ...(correlation ? { correlation } : {}),
-      };
+      return { ...recovered, answerable: correlation !== undefined, ...(correlation ? { correlation } : {}) };
     }
 
-    // SBDH consistency over the authenticated payload (facts, not a failure).
-    let sbdhMismatches: string[] | undefined;
+    // From here the recovered bundle is owned: any later failure must dispose it.
+    let sbdh: SbdhConsistency;
     try {
-      const payloadBytes = await readPayload(recovered.payload, limits.maxXmlBytes);
-      if (payloadBytes.length <= limits.maxXmlBytes) {
-        const facts = parseSbdh(payloadBytes, { ...defaultXmlLimits, maxBytes: limits.maxXmlBytes });
-        const documentType = documentTypeFromAction(headers.action);
-        const mismatches = compareSbdh(facts, {
-          originalSender: headers.originalSender,
-          finalRecipient: headers.finalRecipient,
-          process: headers.service.value,
-          documentType: documentType?.value ?? headers.action,
-        });
-        if (mismatches.length > 0) sbdhMismatches = mismatches;
-      }
-    } catch {
-      // An unreadable SBDH is not a receiving failure; it is reported by absence.
+      const payload = await readPayload(recovered.payload, limits.maxXmlBytes, abort);
+      sbdh = payload.tooLarge
+        ? { status: 'too-large' }
+        : checkSbdh(
+            payload.bytes,
+            { ...defaultXmlLimits, maxBytes: limits.maxXmlBytes },
+            {
+              originalSender: headers.originalSender,
+              finalRecipient: headers.finalRecipient,
+              process: headers.service,
+              documentType: documentTypeFromAction(headers.action),
+            },
+          );
+    } catch (err) {
+      await recovered.dispose();
+      if (isAbortError(err)) return fail('transport', 'aborted', 'aborted while reading the payload');
+      if (isFileSystemError(err)) return fail('payload', 'payload.spool-failed', safeMessage(err));
+      return fail('internal', 'internal.error', safeMessage(err));
+    }
+    if (abort?.aborted) {
+      await recovered.dispose();
+      return fail('transport', 'aborted');
     }
 
     const receipt: ReceiptContext = {
@@ -256,6 +307,8 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
       timestamp: headers.timestamp,
       senderId: headers.fromPartyId,
       receiverId: headers.toPartyId,
+      originalSender: headers.originalSender,
+      finalRecipient: headers.finalRecipient,
       service: headers.service,
       action: headers.action,
       ...(headers.agreement ? { agreement: headers.agreement } : {}),
@@ -268,7 +321,7 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
       representation: recovered.representation,
       evidence,
       receipt,
-      ...(sbdhMismatches ? { sbdhMismatches } : {}),
+      sbdh,
       dispose: () => recovered.dispose(),
     };
   } catch (err) {

@@ -10,6 +10,7 @@ import { signerFromKey } from '../src/index.js';
 import { defaultEntropy, prepareAs4Internal } from '../src/internal.js';
 import { buildMultipartBody } from '../src/multipart.js';
 import { openAs4Message } from '../src/receive/open.js';
+import { payloadHooks } from '../src/receive/payload-hooks.js';
 import type { InboundKeyHolder, OpenAs4MessageInput } from '../src/receive/types.js';
 import { createTestPki } from './helpers/pki.js';
 import { testValidator } from './helpers/input.js';
@@ -33,18 +34,20 @@ const holder: InboundKeyHolder = {
   },
 };
 
-function documentWith(senderIdentifier: string): Buffer {
+function sbdhDocument(senderIdentifier: string): Buffer {
   return Buffer.from(
     '<?xml version="1.0" encoding="UTF-8"?>' +
       '<StandardBusinessDocument xmlns="http://www.unece.org/ebusiness/2010/MDA/StandardBusinessDocumentHeader">' +
       '<StandardBusinessDocumentHeader><HeaderVersion>1.0</HeaderVersion>' +
-      `<Sender><Identifier Authority="iso6523-actorid-upis">${senderIdentifier}</Identifier></Sender>` +
-      `<Receiver><Identifier Authority="iso6523-actorid-upis">${RECEIVER.value}</Identifier></Receiver>` +
-      `<DocumentIdentification><Standard>urn:oasis</Standard><Type>${DOC_TYPE.value}</Type></DocumentIdentification>` +
-      `<BusinessScope><Scope><Type>${PROCESS.value}</Type></Scope></BusinessScope>` +
+      `<Sender><Identifier Authority="${SENDER.scheme}">${senderIdentifier}</Identifier></Sender>` +
+      `<Receiver><Identifier Authority="${RECEIVER.scheme}">${RECEIVER.value}</Identifier></Receiver>` +
+      `<DocumentIdentification><Standard>urn:oasis</Standard><Type>Invoice</Type></DocumentIdentification>` +
+      '<BusinessScope>' +
+      `<Scope><Type>PROCESSID</Type><InstanceIdentifier>${PROCESS.value}</InstanceIdentifier><Identifier>${PROCESS.scheme}</Identifier></Scope>` +
+      `<Scope><Type>DOCUMENTID</Type><InstanceIdentifier>${DOC_TYPE.value}</InstanceIdentifier><Identifier>${DOC_TYPE.scheme}</Identifier></Scope>` +
+      '</BusinessScope>' +
       '</StandardBusinessDocumentHeader>' +
       '</StandardBusinessDocument>',
-    'utf8',
   );
 }
 
@@ -110,11 +113,21 @@ async function collect(stream: Readable): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-test('opens a valid UserMessage and returns verified facts and handles', async () => {
+async function withRequest<T>(
+  payload: Buffer,
+  fn: (request: { contentType: string; body: Buffer }) => Promise<T>,
+): Promise<T> {
   const dir = await mkdtemp(join(tmpdir(), 'as4-open-'));
-  const document = documentWith(SENDER.value);
   try {
-    const request = await buildRequest(document, dir);
+    return await fn(await buildRequest(payload, dir));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test('opens a valid UserMessage and returns verified facts and handles', async () => {
+  const document = sbdhDocument(SENDER.value);
+  await withRequest(document, async (request) => {
     const result = await openAs4Message(openInput(request));
     assert.equal(result.ok, true, JSON.stringify(result));
     if (!result.ok) return;
@@ -122,63 +135,121 @@ test('opens a valid UserMessage and returns verified facts and handles', async (
       assert.equal(result.messageId, 'inbound@as4-sender.test');
       assert.equal(result.senderId, pki.sender.commonName);
       assert.equal(result.receiverId, pki.receiver.commonName);
+      assert.deepEqual(result.originalSender, SENDER);
+      assert.deepEqual(result.finalRecipient, RECEIVER);
       assert.equal(result.service.value, PROCESS.value);
-      assert.equal(result.service.scheme, PROCESS.scheme);
       assert.equal(result.action, `${DOC_TYPE.scheme}::${DOC_TYPE.value}`);
       assert.equal(result.credentialCertificate, pki.receiver.certPem);
       assert.equal(result.receipt.signedReferences.length, 3);
-      assert.equal(result.sbdhMismatches, undefined, 'a consistent SBDH reports no mismatch');
+      assert.equal(result.sbdh.status, 'consistent');
       assert.deepEqual(await collect(result.payload.read()), document);
     } finally {
       await result.dispose();
     }
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+  });
 });
 
-test('reports an SBDH/header inconsistency as a fact, not a failure', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'as4-open-'));
-  try {
-    const request = await buildRequest(documentWith('0192:999999999'), dir);
+test('reports an SBDH inconsistency as a distinct fact', async () => {
+  await withRequest(sbdhDocument('0192:999999999'), async (request) => {
     const result = await openAs4Message(openInput(request));
     assert.equal(result.ok, true, JSON.stringify(result));
     if (!result.ok) return;
     try {
-      assert.ok(result.sbdhMismatches?.some((m) => m.includes('originalSender')));
+      assert.equal(result.sbdh.status, 'inconsistent');
+      if (result.sbdh.status === 'inconsistent') {
+        assert.ok(result.sbdh.mismatches.some((mismatch) => mismatch.includes('originalSender')));
+      }
     } finally {
       await result.dispose();
     }
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+  });
 });
 
-test('rejects a message whose To party is not our identity', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'as4-open-'));
-  try {
-    const request = await buildRequest(documentWith(SENDER.value), dir);
+test('reports a missing or malformed SBDH distinctly', async () => {
+  await withRequest(Buffer.from('<notSbdh/>', 'utf8'), async (request) => {
+    const result = await openAs4Message(openInput(request));
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.equal(result.sbdh.status, 'missing');
+      await result.dispose();
+    }
+  });
+  await withRequest(Buffer.from('<a>', 'utf8'), async (request) => {
+    const result = await openAs4Message(openInput(request));
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.equal(result.sbdh.status, 'malformed');
+      await result.dispose();
+    }
+  });
+});
+
+test('rejects a message whose To party is not our identity, without trusting a claimed sender', async () => {
+  await withRequest(sbdhDocument(SENDER.value), async (request) => {
     const result = await openAs4Message(
       openInput(request, { receiverIdentity: { scheme: PEPPOL_PARTY_ID_TYPE, value: 'POP999999' } }),
     );
     assert.equal(result.ok, false);
-    if (!result.ok) assert.equal(result.reason, 'addressing.party-mismatch');
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+    if (!result.ok) {
+      assert.equal(result.reason, 'addressing.party-mismatch');
+      assert.equal(result.answerable, false);
+      assert.equal(result.correlation, undefined);
+    }
+  });
 });
 
 test('rejects a body that is not multipart/related', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'as4-open-'));
-  try {
-    const request = await buildRequest(documentWith(SENDER.value), dir);
+  await withRequest(sbdhDocument(SENDER.value), async (request) => {
     const result = await openAs4Message(openInput({ ...request, contentType: 'application/soap+xml' }));
     assert.equal(result.ok, false);
     if (!result.ok) {
       assert.equal(result.reason, 'mime.content-type-invalid');
       assert.equal(result.stage, 'mime');
     }
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+  });
+});
+
+test('rejects an additional unsigned MIME attachment', async () => {
+  await withRequest(sbdhDocument(SENDER.value), async (request) => {
+    const boundary = /boundary="?([^";]+)"?/.exec(request.contentType)![1]!;
+    const closing = Buffer.from(`--${boundary}--`, 'latin1');
+    const index = request.body.indexOf(closing);
+    const extra = Buffer.from(
+      `--${boundary}\r\nContent-Type: application/octet-stream\r\nContent-ID: <extra@x>\r\n\r\nunsigned\r\n`,
+      'latin1',
+    );
+    const body = Buffer.concat([request.body.subarray(0, index), extra, request.body.subarray(index)]);
+    const result = await openAs4Message(openInput({ ...request, body }));
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.reason, 'mime.malformed');
+  });
+});
+
+test('preserves a cancellation during the payload read', async () => {
+  await withRequest(sbdhDocument(SENDER.value), async (request) => {
+    const controller = new AbortController();
+    payloadHooks.onReadPayload = () => controller.abort();
+    try {
+      const result = await openAs4Message(openInput(request, { signal: controller.signal }));
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.reason, 'aborted');
+    } finally {
+      payloadHooks.onReadPayload = undefined;
+    }
+  });
+});
+
+test('preserves an I/O failure during the payload read', async () => {
+  await withRequest(sbdhDocument(SENDER.value), async (request) => {
+    payloadHooks.onReadPayload = () => {
+      throw Object.assign(new Error('io'), { code: 'EIO' });
+    };
+    try {
+      const result = await openAs4Message(openInput(request));
+      assert.equal(result.ok, false);
+      if (!result.ok) assert.equal(result.reason, 'payload.spool-failed');
+    } finally {
+      payloadHooks.onReadPayload = undefined;
+    }
+  });
 });

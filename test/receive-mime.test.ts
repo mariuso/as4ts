@@ -238,6 +238,30 @@ test('cancellation interrupts a read stalled between chunks', async () => {
   assert.ok(stream.wasReturned(), 'the source is cleaned up on abort');
 });
 
+test('a limit failure returns promptly even when source cleanup stalls and no signal is given', async () => {
+  let returned = false;
+  const body: AsyncIterable<Uint8Array> = {
+    [Symbol.asyncIterator]() {
+      let sent = false;
+      return {
+        next(): Promise<IteratorResult<Uint8Array>> {
+          if (sent) return Promise.resolve({ value: undefined, done: true });
+          sent = true;
+          return Promise.resolve({ value: Buffer.alloc(64), done: false });
+        },
+        return(): Promise<IteratorResult<Uint8Array>> {
+          returned = true;
+          return new Promise(() => {}); // never resolves
+        },
+      };
+    },
+  };
+  await assert.rejects(
+    parseMultipartRelated({ contentType: CT, body, limits: { ...LIMITS, maxRequestBytes: 4 } }),
+    (err) => err instanceof MimeFault && err.reason === 'body.too-large',
+  );
+  assert.ok(returned, 'the stalled source was signalled for cleanup');
+});
 test('rejects an ambiguous root (two SOAP parts)', async () => {
   const body = multipart([
     { headers: { 'Content-Type': 'application/soap+xml' }, body: SOAP },

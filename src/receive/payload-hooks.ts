@@ -8,9 +8,12 @@ import type { DecipherGCM } from 'node:crypto';
 export interface PayloadHooks {
   readonly createDecipher?: ((algorithm: string, key: Buffer, iv: Buffer) => DecipherGCM) | undefined;
   readonly onWriteStream?: ((path: string) => void) | undefined;
+  /** Called just before an inbound payload is read back for the SBDH check. */
+  readonly onReadPayload?: (() => void) | undefined;
 }
 
 export const payloadHooks: {
   createDecipher?: ((algorithm: string, key: Buffer, iv: Buffer) => DecipherGCM) | undefined;
   onWriteStream?: ((path: string) => void) | undefined;
+  onReadPayload?: (() => void) | undefined;
 } = {};

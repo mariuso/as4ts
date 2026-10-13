@@ -4,9 +4,10 @@ import type { InboundFailureReason } from './types.js';
 
 /**
  * Read the ebMS headers of an inbound `UserMessage` and check them against the
- * profile (Phase 3). Facts are read only from the expected elements in the
- * expected position; a message whose roles, agreement, MPC or identifiers do not
- * match the profile is rejected with `addressing.*`.
+ * profile (Phase 3). The structure is established by cardinality (exactly one
+ * UserMessage, PartyInfo, Service, PartInfo, ...), never by "the first match",
+ * and the AP identifier type is fixed by the profile. A message that does not
+ * match is rejected with `addressing.*`.
  */
 export class AddressingFault extends Error {
   constructor(
@@ -28,13 +29,13 @@ export interface UserMessageFacts {
   readonly agreement: string | null;
   readonly conversationId: string | null;
   readonly mpc: string | null;
-  readonly originalSender: string;
-  readonly finalRecipient: string;
+  readonly originalSender: ScopedId;
+  readonly finalRecipient: ScopedId;
   readonly compressionType: string | null;
   readonly partHref: string;
 }
 
-function directChildren(node: Element | null, ns: string, localName: string): Element[] {
+function directChildren(node: Element | null | undefined, ns: string, localName: string): Element[] {
   const out: Element[] = [];
   const children = node?.childNodes;
   if (!children) return out;
@@ -47,8 +48,17 @@ function directChildren(node: Element | null, ns: string, localName: string): El
   return out;
 }
 
-function direct(node: Element | null, ns: string, localName: string): Element | null {
-  return directChildren(node, ns, localName)[0] ?? null;
+function exactly(node: Element | null | undefined, ns: string, localName: string, what: string): Element {
+  const matches = directChildren(node, ns, localName);
+  if (matches.length === 0) throw new AddressingFault('addressing.unsupported', `missing ${what}`);
+  if (matches.length > 1) throw new AddressingFault('addressing.unsupported', `more than one ${what}`);
+  return matches[0]!;
+}
+
+function atMostOne(node: Element | null | undefined, ns: string, localName: string, what: string): Element | null {
+  const matches = directChildren(node, ns, localName);
+  if (matches.length > 1) throw new AddressingFault('addressing.unsupported', `more than one ${what}`);
+  return matches[0] ?? null;
 }
 
 function text(element: Element | null): string | null {
@@ -56,76 +66,100 @@ function text(element: Element | null): string | null {
   return value === null || value === undefined || value === '' ? null : value;
 }
 
-function requiredText(element: Element | null, what: string): string {
-  const value = text(element);
-  if (value === null) throw new AddressingFault('addressing.unsupported', `missing ${what}`);
+function requiredText(node: Element | null | undefined, ns: string, localName: string, what: string): string {
+  const value = text(exactly(node, ns, localName, what));
+  if (value === null) throw new AddressingFault('addressing.unsupported', `empty ${what}`);
   return value;
 }
 
-/** Read the `Property` with the given `@name` from an eb:MessageProperties/PartProperties. */
-function propertyValue(properties: Element | null, name: string): string | null {
+/** The named properties of an eb:MessageProperties/PartProperties, requiring uniqueness. */
+function namedProperties(properties: Element | null | undefined, what: string): Map<string, Element> {
+  const map = new Map<string, Element>();
   for (const property of directChildren(properties, EBMS_NS, 'Property')) {
-    if (property.getAttribute('name') === name) return text(property);
+    const name = property.getAttribute('name');
+    if (!name) throw new AddressingFault('addressing.unsupported', `a ${what} Property has no name`);
+    if (map.has(name)) throw new AddressingFault('addressing.unsupported', `duplicate ${what} Property ${name}`);
+    map.set(name, property);
   }
-  return null;
+  return map;
 }
 
 export function readUserMessage(envelope: Document, profile: Profile): UserMessageFacts {
-  const header = direct(envelope.documentElement, envelope.documentElement.namespaceURI ?? '', 'Header');
-  const messaging = direct(header, EBMS_NS, 'Messaging');
-  const userMessage = direct(messaging, EBMS_NS, 'UserMessage');
-  if (!messaging || !userMessage) {
-    throw new AddressingFault('addressing.unsupported', 'no eb:UserMessage in the Header');
+  const root = envelope.documentElement;
+  const soapNamespace = root.namespaceURI ?? '';
+  const header = exactly(root, soapNamespace, 'Header', 'SOAP Header');
+  const messaging = exactly(header, EBMS_NS, 'Messaging', 'eb:Messaging');
+  const userMessage = exactly(messaging, EBMS_NS, 'UserMessage', 'eb:UserMessage');
+
+  const messageInfo = exactly(userMessage, EBMS_NS, 'MessageInfo', 'MessageInfo');
+  const messageId = requiredText(messageInfo, EBMS_NS, 'MessageId', 'MessageId');
+  const timestamp = requiredText(messageInfo, EBMS_NS, 'Timestamp', 'Timestamp');
+
+  const partyInfo = exactly(userMessage, EBMS_NS, 'PartyInfo', 'PartyInfo');
+  const from = exactly(partyInfo, EBMS_NS, 'From', 'From');
+  const to = exactly(partyInfo, EBMS_NS, 'To', 'To');
+  const fromPartyIdElement = exactly(from, EBMS_NS, 'PartyId', 'From/PartyId');
+  const toPartyIdElement = exactly(to, EBMS_NS, 'PartyId', 'To/PartyId');
+  // Peppol fixes the access point identifier type.
+  for (const [element, what] of [
+    [fromPartyIdElement, 'From/PartyId'],
+    [toPartyIdElement, 'To/PartyId'],
+  ] as const) {
+    if (element.getAttribute('type') !== profile.partyIdType) {
+      throw new AddressingFault('addressing.unsupported', `${what} type is not the profile party id type`);
+    }
   }
-
-  const messageInfo = direct(userMessage, EBMS_NS, 'MessageInfo');
-  const messageId = requiredText(direct(messageInfo, EBMS_NS, 'MessageId'), 'MessageId');
-  const timestamp = requiredText(direct(messageInfo, EBMS_NS, 'Timestamp'), 'Timestamp');
-
-  const partyInfo = direct(userMessage, EBMS_NS, 'PartyInfo');
-  const from = direct(partyInfo, EBMS_NS, 'From');
-  const to = direct(partyInfo, EBMS_NS, 'To');
-  const fromPartyId = requiredText(direct(from, EBMS_NS, 'PartyId'), 'From/PartyId');
-  const toPartyId = requiredText(direct(to, EBMS_NS, 'PartyId'), 'To/PartyId');
-  if (text(direct(from, EBMS_NS, 'Role')) !== profile.initiatorRole) {
+  const fromPartyId = text(fromPartyIdElement);
+  const toPartyId = text(toPartyIdElement);
+  if (fromPartyId === null || toPartyId === null) {
+    throw new AddressingFault('addressing.unsupported', 'empty PartyId');
+  }
+  if (text(exactly(from, EBMS_NS, 'Role', 'From/Role')) !== profile.initiatorRole) {
     throw new AddressingFault('addressing.unsupported', 'From/Role is not the initiator role');
   }
-  if (text(direct(to, EBMS_NS, 'Role')) !== profile.responderRole) {
+  if (text(exactly(to, EBMS_NS, 'Role', 'To/Role')) !== profile.responderRole) {
     throw new AddressingFault('addressing.unsupported', 'To/Role is not the responder role');
   }
 
-  const collaboration = direct(userMessage, EBMS_NS, 'CollaborationInfo');
-  const serviceElement = direct(collaboration, EBMS_NS, 'Service');
-  const serviceScheme = serviceElement?.getAttribute('type');
+  const collaboration = exactly(userMessage, EBMS_NS, 'CollaborationInfo', 'CollaborationInfo');
+  const serviceElement = exactly(collaboration, EBMS_NS, 'Service', 'CollaborationInfo/Service');
+  const serviceScheme = serviceElement.getAttribute('type');
   const serviceValue = text(serviceElement);
   if (!serviceScheme || !serviceValue) {
     throw new AddressingFault('addressing.unsupported', 'missing CollaborationInfo/Service');
   }
-  const action = requiredText(direct(collaboration, EBMS_NS, 'Action'), 'Action');
-  const agreement = text(direct(collaboration, EBMS_NS, 'AgreementRef'));
+  const action = requiredText(collaboration, EBMS_NS, 'Action', 'CollaborationInfo/Action');
+  const agreement = text(atMostOne(collaboration, EBMS_NS, 'AgreementRef', 'AgreementRef'));
   if (agreement !== null && agreement !== profile.agreementRef) {
     throw new AddressingFault('addressing.unsupported', 'AgreementRef is not the profile agreement');
   }
-  const conversationId = text(direct(collaboration, EBMS_NS, 'ConversationId'));
+  const conversationId = text(atMostOne(collaboration, EBMS_NS, 'ConversationId', 'ConversationId'));
 
   const mpc = userMessage.getAttribute('mpc');
   if (mpc !== null && mpc !== '' && mpc !== profile.mpc) {
     throw new AddressingFault('addressing.mpc', `unsupported MPC ${mpc}`);
   }
 
-  const properties = direct(userMessage, EBMS_NS, 'MessageProperties');
-  const originalSender = propertyValue(properties, 'originalSender');
-  const finalRecipient = propertyValue(properties, 'finalRecipient');
-  if (originalSender === null || finalRecipient === null) {
+  const properties = namedProperties(
+    exactly(userMessage, EBMS_NS, 'MessageProperties', 'MessageProperties'),
+    'Message',
+  );
+  const originalSenderElement = properties.get('originalSender');
+  const finalRecipientElement = properties.get('finalRecipient');
+  if (!originalSenderElement || !finalRecipientElement) {
     throw new AddressingFault('addressing.unsupported', 'missing originalSender or finalRecipient property');
   }
+  const originalSender = participantProperty(originalSenderElement, 'originalSender');
+  const finalRecipient = participantProperty(finalRecipientElement, 'finalRecipient');
 
-  const payloadInfo = direct(userMessage, EBMS_NS, 'PayloadInfo');
-  const partInfo = direct(payloadInfo, EBMS_NS, 'PartInfo');
-  const partHref = partInfo?.getAttribute('href') ?? null;
+  const payloadInfo = exactly(userMessage, EBMS_NS, 'PayloadInfo', 'PayloadInfo');
+  const partInfo = exactly(payloadInfo, EBMS_NS, 'PartInfo', 'PayloadInfo/PartInfo');
+  const partHref = partInfo.getAttribute('href');
   if (!partHref) throw new AddressingFault('addressing.unsupported', 'missing PayloadInfo/PartInfo href');
-  const partProperties = direct(partInfo, EBMS_NS, 'PartProperties');
-  const compressionType = propertyValue(partProperties, 'CompressionType');
+  const partProperties = atMostOne(partInfo, EBMS_NS, 'PartProperties', 'PartProperties');
+  const compressionType = partProperties
+    ? text(namedProperties(partProperties, 'Part').get('CompressionType') ?? null)
+    : null;
 
   return {
     messageId,
@@ -142,6 +176,15 @@ export function readUserMessage(envelope: Document, profile: Profile): UserMessa
     compressionType,
     partHref,
   };
+}
+
+function participantProperty(property: Element, what: string): ScopedId {
+  const scheme = property.getAttribute('type');
+  const value = text(property);
+  if (!scheme || value === null) {
+    throw new AddressingFault('addressing.unsupported', `${what} property has no type or value`);
+  }
+  return { scheme, value };
 }
 
 /** Whether a compression declaration is supported by the constrained profile. */

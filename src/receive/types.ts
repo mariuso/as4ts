@@ -256,6 +256,10 @@ export interface OpenSuccess {
   readonly timestamp: string;
   readonly senderId: string;
   readonly receiverId: string;
+  /** The verified original sender participant (scheme/value). */
+  readonly originalSender: ScopedId;
+  /** The verified final recipient participant (scheme/value). */
+  readonly finalRecipient: ScopedId;
   readonly service: ScopedId;
   readonly action: string;
   readonly agreement?: string;
@@ -270,15 +274,22 @@ export interface OpenSuccess {
   readonly representation: RepresentationHandle;
   readonly evidence: EvidenceHandle;
   readonly receipt: ReceiptContext;
-  /**
-   * Explicit SBDH/header inconsistencies found in the authenticated payload
-   * (empty when consistent or unreadable). Protocol consistency facts, not a
-   * business-document validation.
-   */
-  readonly sbdhMismatches?: readonly string[];
+  /** The outcome of the SBDH consistency check over the authenticated payload. */
+  readonly sbdh: SbdhConsistency;
   /** Release the payload, representation and evidence handles. Idempotent. */
   dispose(): Promise<void>;
 }
+
+/**
+ * The outcome of the SBDH consistency check. Consistency is reported as distinct
+ * facts so a caller can tell "verified consistent" from "could not check".
+ */
+export type SbdhConsistency =
+  | { readonly status: 'consistent' }
+  | { readonly status: 'inconsistent'; readonly mismatches: readonly string[] }
+  | { readonly status: 'missing' }
+  | { readonly status: 'malformed'; readonly detail: string }
+  | { readonly status: 'too-large' };
 
 export type OpenResult = OpenSuccess | InboundFailure;
 

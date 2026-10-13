@@ -1,4 +1,5 @@
 import type { InboundFailureReason } from './types.js';
+import { abortableStream, isAbortError } from './streams.js';
 
 /**
  * A bounded `multipart/related` parser for inbound AS4 requests (Phase 1 spike).
@@ -78,51 +79,6 @@ export function extractStart(contentType: string | undefined): string | null {
   return match?.[1]?.trim() ?? null;
 }
 
-/**
- * Wrap a body iterator so a pending read is interrupted by `signal`, and call the
- * source's `return()` on any early exit (abort or downstream error). Without a
- * signal the source is consumed as-is.
- */
-async function* abortable(
-  body: AsyncIterable<Uint8Array>,
-  signal: AbortSignal | undefined,
-): AsyncGenerator<Uint8Array> {
-  const iterator = body[Symbol.asyncIterator]();
-  if (!signal) {
-    try {
-      for (;;) {
-        const result = await iterator.next();
-        if (result.done) break;
-        yield result.value;
-      }
-    } finally {
-      await iterator.return?.().catch(() => {});
-    }
-    return;
-  }
-
-  let onAbort: (() => void) | null = null;
-  const aborted = new Promise<never>((_resolve, reject) => {
-    const fail = (): void => reject(new MimeFault('aborted', 'request body read aborted'));
-    if (signal.aborted) {
-      fail();
-      return;
-    }
-    onAbort = fail;
-    signal.addEventListener('abort', onAbort, { once: true });
-  });
-  try {
-    for (;;) {
-      const result = await Promise.race([iterator.next(), aborted]);
-      if (result.done) break;
-      yield result.value;
-    }
-  } finally {
-    if (onAbort) signal.removeEventListener('abort', onAbort);
-    await iterator.return?.().catch(() => {});
-  }
-}
-
 /** Reassemble the body up to `maxRequestBytes`, honouring cancellation. */
 async function readAllBounded(
   body: AsyncIterable<Uint8Array>,
@@ -131,10 +87,15 @@ async function readAllBounded(
 ): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
-  for await (const chunk of abortable(body, signal)) {
-    total += chunk.byteLength;
-    if (total > maxRequestBytes) throw new MimeFault('body.too-large', 'request body exceeds the limit');
-    chunks.push(Buffer.from(chunk));
+  try {
+    for await (const chunk of abortableStream(body, signal)) {
+      total += chunk.byteLength;
+      if (total > maxRequestBytes) throw new MimeFault('body.too-large', 'request body exceeds the limit');
+      chunks.push(Buffer.from(chunk));
+    }
+  } catch (err) {
+    if (isAbortError(err)) throw new MimeFault('aborted', 'request body read aborted');
+    throw err;
   }
   return Buffer.concat(chunks);
 }

@@ -12,6 +12,7 @@ import { attachmentDigestBase64 } from './attachment.js';
 import { MessageBudget } from './budget.js';
 import { payloadHooks } from './payload-hooks.js';
 import { SessionKeyFault, unwrapSessionKey } from './session-key.js';
+import { abortableStream, isAbortError } from './streams.js';
 import { XmlFault, defaultXmlLimits } from './xml.js';
 import type {
   InboundEvent,
@@ -81,17 +82,6 @@ async function timed<T>(
   }
 }
 
-function abortError(): Error {
-  const error = new Error('aborted');
-  error.name = 'AbortError';
-  (error as NodeJS.ErrnoException).code = 'ABORT_ERR';
-  return error;
-}
-
-function isAbortError(err: unknown): boolean {
-  return err instanceof Error && (err.name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ABORT_ERR');
-}
-
 function isDecompressError(err: unknown): boolean {
   const code = (err as NodeJS.ErrnoException | undefined)?.code;
   return typeof code === 'string' && code.startsWith('Z_');
@@ -105,48 +95,6 @@ function isFileSystemError(err: unknown): boolean {
 function isXmlMediaType(mediaType: string): boolean {
   const type = mediaType.split(';')[0]?.trim().toLowerCase() ?? '';
   return type === 'application/xml' || type === 'text/xml' || type.endsWith('+xml');
-}
-
-/**
- * Consume a producer, honouring cancellation. On abort it stops waiting for the
- * producer's own cleanup: an external iterator's `return()` may itself stall, so
- * it is signalled but never awaited indefinitely.
- */
-async function* abortableStream(
-  source: AsyncIterable<Uint8Array>,
-  signal: AbortSignal | undefined,
-): AsyncGenerator<Uint8Array> {
-  const iterator = source[Symbol.asyncIterator]();
-  let onAbort: (() => void) | null = null;
-  const abortPromise = signal
-    ? new Promise<never>((_resolve, reject) => {
-        const fail = (): void => reject(abortError());
-        if (signal.aborted) fail();
-        else {
-          onAbort = fail;
-          signal.addEventListener('abort', fail, { once: true });
-        }
-      })
-    : null;
-  try {
-    for (;;) {
-      const result = abortPromise ? await Promise.race([iterator.next(), abortPromise]) : await iterator.next();
-      if (result.done) break;
-      yield result.value;
-    }
-  } finally {
-    if (onAbort && signal) signal.removeEventListener('abort', onAbort);
-    // Signal the producer to stop without blocking on its cleanup: an external
-    // iterator's return() may stall or throw. This is non-blocking on every
-    // early-exit path, whether or not a signal was supplied.
-    let returned: unknown;
-    try {
-      returned = iterator.return?.();
-    } catch {
-      returned = null;
-    }
-    if (returned) void Promise.resolve(returned).catch(() => {});
-  }
 }
 
 function discardingSink(): Writable {
