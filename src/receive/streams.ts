@@ -17,6 +17,31 @@ export function isAbortError(err: unknown): boolean {
   return err instanceof Error && (err.name === 'AbortError' || (err as NodeJS.ErrnoException).code === 'ABORT_ERR');
 }
 
+/**
+ * Await `operation`, but stop waiting as soon as `signal` aborts. A rejection
+ * handler is attached before any early return, so a late rejection (including one
+ * racing an abort) can never become an unhandled rejection.
+ */
+export async function abortableAwait<T>(operation: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  operation.catch(() => {});
+  if (!signal) return operation;
+  if (signal.aborted) throw abortError();
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortError());
+    signal.addEventListener('abort', onAbort, { once: true });
+    operation.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (err) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
 export async function* abortableStream(
   source: AsyncIterable<Uint8Array>,
   signal: AbortSignal | undefined,

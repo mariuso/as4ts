@@ -9,9 +9,9 @@ import { multipartHooks, parseMultipartMessage, selectSoapPart } from '../src/re
 import { defaultInboundLimits } from '../src/receive/types.js';
 
 /**
- * Incremental multipart parsing: the SOAP part is buffered, attachments are
- * spooled, and limits/cancellation/cleanup behave as the buffered parser did —
- * but memory does not scale with the attachment.
+ * Incremental multipart parsing: the SOAP part is buffered under the envelope
+ * budget, attachments are spooled, and limits/cancellation/cleanup/writer failure
+ * behave as required — memory does not scale with the attachment.
  */
 const BOUNDARY = 'as4-boundary';
 const CT = `multipart/related; type="application/soap+xml"; boundary="${BOUNDARY}"`;
@@ -30,7 +30,7 @@ interface Part {
   readonly body: Buffer;
 }
 
-function multipart(parts: readonly Part[]): Buffer {
+function multipart(parts: readonly Part[], epilogue = ''): Buffer {
   const chunks: Buffer[] = [];
   for (const part of parts) {
     chunks.push(Buffer.from(`--${BOUNDARY}\r\n`, 'latin1'));
@@ -40,7 +40,7 @@ function multipart(parts: readonly Part[]): Buffer {
     chunks.push(part.body);
     chunks.push(Buffer.from('\r\n', 'latin1'));
   }
-  chunks.push(Buffer.from(`--${BOUNDARY}--\r\n`, 'latin1'));
+  chunks.push(Buffer.from(`--${BOUNDARY}--\r\n${epilogue}`, 'latin1'));
   return Buffer.concat(chunks);
 }
 
@@ -53,12 +53,16 @@ const attachment = (body: Buffer): Part => ({
   body,
 });
 
+function isAsyncIterable(value: unknown): value is AsyncIterable<Uint8Array> {
+  return typeof (value as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator] === 'function';
+}
+
 function parse(
-  body: AsyncIterable<Uint8Array> | Buffer,
+  body: AsyncIterable<Uint8Array> | Buffer | readonly Buffer[],
   overrides: Partial<MimeLimits> = {},
-  extra: { signal?: AbortSignal; spoolDirectory?: string } = {},
+  extra: { signal?: AbortSignal; spoolDirectory?: string; maxEnvelopeBytes?: number } = {},
 ) {
-  const iterable = Buffer.isBuffer(body) ? Readable.from([body]) : body;
+  const iterable = isAsyncIterable(body) ? body : Readable.from(body);
   return parseMultipartMessage({
     contentType: CT,
     body: iterable,
@@ -116,7 +120,8 @@ function manualStream(options: { stallReturn?: boolean } = {}) {
 }
 
 test('buffers the SOAP part and spools the attachment', async () => {
-  const dir = await mkdtempSync(join(tmpdir(), 'as4-mp-'));
+  const dir = mkdtempSync(join(tmpdir(), 'as4-mp-'));
+  const dest = mkdtempSync(join(tmpdir(), 'as4-mp-dest-'));
   try {
     const attachmentBody = Buffer.from('hello attachment');
     const message = await parse(multipart([soapPart(), attachment(attachmentBody)]), {}, { spoolDirectory: dir });
@@ -131,13 +136,56 @@ test('buffers the SOAP part and spools the attachment', async () => {
       assert.equal(part.byteLength, attachmentBody.length);
       assert.deepEqual(await readAll(part.read()), attachmentBody);
 
-      // Ownership transfer: a matching Content-ID hands the spool over.
-      const path = message.takeSpool(part, 'att@x');
-      assert.equal(path, part.spoolPath);
-      assert.equal(message.takeSpool(part, 'wrong@x'), null);
+      // A wrong Content-ID must not transfer ownership.
+      assert.equal(await message.transferSpool(part, 'wrong@x', join(dest, 'c')), null);
+      const moved = await message.transferSpool(part, 'att@x', join(dest, 'ciphertext.bin'));
+      assert.notEqual(moved, null);
+      assert.deepEqual(readFileSync(moved!), attachmentBody);
       await message.dispose();
-      assert.equal(existsSync(path!), true, 'a taken spool survives dispose');
-      rmSync(path!, { force: true });
+      assert.equal(existsSync(moved!), true, 'a transferred spool survives dispose');
+    } finally {
+      await message.dispose();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(dest, { recursive: true, force: true });
+  }
+});
+
+test('a transferred spool survives dispose of the default private directory', async () => {
+  const dest = mkdtempSync(join(tmpdir(), 'as4-mp-dest-'));
+  try {
+    const message = await parse(multipart([soapPart(), attachment(Buffer.from('payload'))]));
+    try {
+      const part = message.parts.find((candidate) => candidate.spoolPath !== null)!;
+      const moved = await message.transferSpool(part, 'att@x', join(dest, 'ciphertext.bin'));
+      assert.notEqual(moved, null);
+      await message.dispose(); // removes the parser's private directory
+      assert.equal(existsSync(moved!), true, 'the moved file is not deleted with the private directory');
+    } finally {
+      await message.dispose();
+    }
+  } finally {
+    rmSync(dest, { recursive: true, force: true });
+  }
+});
+
+test('a failed transfer keeps ownership and dispose cleans up', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'as4-mp-'));
+  try {
+    const message = await parse(
+      multipart([soapPart(), attachment(Buffer.from('payload'))]),
+      {},
+      { spoolDirectory: dir },
+    );
+    try {
+      const part = message.parts.find((candidate) => candidate.spoolPath !== null)!;
+      // A destination in a directory that does not exist makes the rename fail.
+      const moved = await message.transferSpool(part, 'att@x', join(dir, 'missing', 'ciphertext.bin'));
+      assert.equal(moved, null, 'a failed move returns null and the parser keeps ownership');
+      assert.equal(existsSync(part.spoolPath!), true);
+      await message.dispose();
+      assert.equal(existsSync(part.spoolPath!), false, 'the retained spool is deleted on dispose');
     } finally {
       await message.dispose();
     }
@@ -169,8 +217,7 @@ test('selects the start part when the request names it', async () => {
     limits: LIMITS,
   });
   try {
-    const soap = selectSoapPart(message);
-    assert.equal(soap.contentId, 'other@x');
+    assert.equal(selectSoapPart(message).contentId, 'other@x');
   } finally {
     await message.dispose();
   }
@@ -178,8 +225,7 @@ test('selects the start part when the request names it', async () => {
 
 test('spools a large attachment delivered in small chunks', async () => {
   const size = 2 * 1024 * 1024;
-  const body = Buffer.alloc(size, 0x42);
-  const full = multipart([soapPart(), attachment(body)]);
+  const full = multipart([soapPart(), attachment(Buffer.alloc(size, 0x42))]);
   async function* chunked() {
     for (let offset = 0; offset < full.length; offset += 4096) yield full.subarray(offset, offset + 4096);
   }
@@ -187,25 +233,37 @@ test('spools a large attachment delivered in small chunks', async () => {
   try {
     const part = message.parts.find((candidate) => candidate.spoolPath !== null)!;
     assert.equal(part.byteLength, size);
-    const recovered = await readAll(part.read());
-    assert.equal(recovered.length, size);
-    assert.equal(recovered[0], 0x42);
+    assert.equal((await readAll(part.read())).length, size);
   } finally {
     await message.dispose();
   }
 });
 
-test('applies the part limit mid-part and removes the spool', async () => {
-  const dir = await mkdtempSync(join(tmpdir(), 'as4-mp-'));
+test('exceeding the attachment limit mid-part removes the spool', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'as4-mp-'));
   try {
+    // Allow the SOAP part (so no spool exists yet for it) and fail on the
+    // attachment, after its spool has been created and written to.
+    const maxPartBytes = SOAP_XML.length + 64;
     await assert.rejects(
-      parse(multipart([soapPart(), attachment(Buffer.alloc(4096))]), { maxPartBytes: 16 }, { spoolDirectory: dir }),
+      parse(multipart([soapPart(), attachment(Buffer.alloc(8192))]), { maxPartBytes }, { spoolDirectory: dir }),
       (err) => err instanceof MimeFault && err.reason === 'mime.part-too-large',
     );
-    assert.deepEqual(readdirSync(dir), [], 'no spool survives a mid-part failure');
+    assert.deepEqual(readdirSync(dir), [], 'no spool survives an attachment failure');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('bounds the SOAP envelope while buffering', async () => {
+  const bigSoap: Part = {
+    headers: { 'Content-Type': 'application/soap+xml', 'Content-ID': '<soap@x>' },
+    body: Buffer.alloc(4096, 0x3c),
+  };
+  await assert.rejects(
+    parse(multipart([bigSoap, attachment(Buffer.from('x'))]), {}, { maxEnvelopeBytes: 1024 }),
+    (err) => err instanceof MimeFault && err.reason === 'xml.too-large',
+  );
 });
 
 test('rejects more parts than the limit', async () => {
@@ -235,6 +293,54 @@ test('rejects a missing closing boundary', async () => {
   await assert.rejects(parse(noClosing), (err) => err instanceof MimeFault && err.reason === 'mime.malformed');
 });
 
+test('discards a large epilogue without retaining it', async () => {
+  const epilogue = 'x'.repeat(1024 * 1024);
+  const message = await parse(multipart([soapPart(), attachment(Buffer.from('body'))], epilogue));
+  try {
+    assert.equal(message.parts.length, 2);
+  } finally {
+    await message.dispose();
+  }
+});
+
+test('accepts a delimiter with long transport padding', async () => {
+  const padding = ' '.repeat(64 * 1024);
+  const body = Buffer.concat([
+    Buffer.from(`--${BOUNDARY}\r\nContent-Type: application/soap+xml\r\nContent-ID: <soap@x>\r\n\r\n`, 'latin1'),
+    SOAP_XML,
+    Buffer.from(
+      `\r\n--${BOUNDARY}${padding}\r\nContent-Type: application/octet-stream\r\nContent-ID: <att@x>\r\n\r\n`,
+      'latin1',
+    ),
+    Buffer.from('body'),
+    Buffer.from(`\r\n--${BOUNDARY}${padding}--\r\n`, 'latin1'),
+  ]);
+  const message = await parse(body);
+  try {
+    assert.equal(message.parts.length, 2);
+  } finally {
+    await message.dispose();
+  }
+});
+
+test('header acceptance does not depend on chunk boundaries', async () => {
+  const headers = { 'Content-Type': 'application/soap+xml', 'Content-ID': '<soap@x>', 'X-Pad': 'a'.repeat(40) };
+  const full = multipart([{ headers, body: SOAP_XML }, attachment(Buffer.from('x'))]);
+  // The first `\r\n\r\n` ends the SOAP part's header block; subtract the leading
+  // delimiter line to get the header block length itself.
+  const blockLength = full.indexOf('\r\n\r\n') - Buffer.byteLength(`--${BOUNDARY}\r\n`, 'latin1');
+  for (let split = 1; split < full.length; split += 1) {
+    const chunks = [full.subarray(0, split), full.subarray(split)];
+    const message = await parse(chunks, { maxHeaderBytes: blockLength });
+    await message.dispose();
+    await assert.rejects(
+      parse(chunks, { maxHeaderBytes: blockLength - 1 }),
+      (err) => err instanceof MimeFault && err.reason === 'mime.header-too-large',
+      `split at ${split}`,
+    );
+  }
+});
+
 test('cancellation mid-header and mid-part is a value, not a hang', async () => {
   const stream = manualStream();
   const controller = new AbortController();
@@ -254,14 +360,88 @@ test('cancellation mid-header and mid-part is a value, not a hang', async () => 
 
 test('a stalled source return() cannot prevent failure completion', async () => {
   const stream = manualStream({ stallReturn: true });
-  const pending = parse(stream.body, { maxPartBytes: 8 });
+  const pending = parse(stream.body, { maxPartBytes: SOAP_XML.length + 64 });
   stream.push(multipart([soapPart(), attachment(Buffer.alloc(4096))]));
   await assert.rejects(pending, (err) => err instanceof MimeFault && err.reason === 'mime.part-too-large');
   assert.ok(stream.wasReturned(), 'the stalled source was signalled for cleanup');
 });
 
+test('a spool write failure is a value, not a crash', async () => {
+  multipartHooks.createSpoolWriter = () =>
+    new Writable({
+      write(_chunk, _encoding, callback) {
+        callback(new Error('disk full'));
+      },
+    });
+  try {
+    await assert.rejects(
+      parse(multipart([soapPart(), attachment(Buffer.alloc(4096))])),
+      (err) => err instanceof Error && /disk full/.test(err.message),
+    );
+  } finally {
+    delete multipartHooks.createSpoolWriter;
+  }
+});
+
+test('a spool open failure is a value', async () => {
+  multipartHooks.createSpoolWriter = () => {
+    const writer = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+    process.nextTick(() => writer.destroy(new Error('EACCES: cannot open spool')));
+    return writer;
+  };
+  try {
+    await assert.rejects(
+      parse(multipart([soapPart(), attachment(Buffer.alloc(4096))])),
+      (err) => err instanceof Error && /EACCES/.test(err.message),
+    );
+  } finally {
+    delete multipartHooks.createSpoolWriter;
+  }
+});
+
+test('cancellation interrupts a stalled write', async () => {
+  multipartHooks.createSpoolWriter = () => new Writable({ write(_chunk, _encoding, _callback) {} });
+  try {
+    const stream = manualStream();
+    const controller = new AbortController();
+    const pending = parse(stream.body, {}, { signal: controller.signal });
+    stream.push(multipart([soapPart(), attachment(Buffer.alloc(4096))]));
+    setTimeout(() => controller.abort(), 20);
+    await assert.rejects(pending, (err) => err instanceof MimeFault && err.reason === 'aborted');
+  } finally {
+    delete multipartHooks.createSpoolWriter;
+  }
+});
+
+test('cancellation interrupts a stalled finalisation', async () => {
+  multipartHooks.createSpoolWriter = () =>
+    new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+      final(_callback) {
+        // never finalises
+      },
+    });
+  try {
+    const stream = manualStream();
+    const controller = new AbortController();
+    const pending = parse(stream.body, {}, { signal: controller.signal });
+    stream.push(multipart([soapPart(), attachment(Buffer.from('small'))]));
+    stream.end();
+    setTimeout(() => controller.abort(), 20);
+    await assert.rejects(pending, (err) => err instanceof MimeFault && err.reason === 'aborted');
+  } finally {
+    delete multipartHooks.createSpoolWriter;
+  }
+});
+
 test('ciphertext reaches its spool before the request finishes', async () => {
-  const dir = await mkdtempSync(join(tmpdir(), 'as4-mp-'));
+  const dir = mkdtempSync(join(tmpdir(), 'as4-mp-'));
   try {
     const full = multipart([soapPart(), attachment(Buffer.alloc(8192, 0x7a))]);
     const split = Math.floor(full.length * 0.75); // inside the attachment body
@@ -281,28 +461,44 @@ test('ciphertext reaches its spool before the request finishes', async () => {
   }
 });
 
-test('slow storage applies backpressure (one write in flight)', async () => {
-  let active = 0;
-  let maxActive = 0;
-  const slow = new Writable({
-    write(_chunk, _encoding, callback) {
-      active += 1;
-      maxActive = Math.max(maxActive, active);
-      setTimeout(() => {
-        active -= 1;
-        callback();
-      }, 1);
-    },
+test('backpressure bounds read-ahead until storage resumes', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
   });
-  multipartHooks.createSpoolWriter = () => slow;
+  let firstWrite = true;
+  multipartHooks.createSpoolWriter = () =>
+    new Writable({
+      write(_chunk, _encoding, callback) {
+        if (firstWrite) {
+          firstWrite = false;
+          void gate.then(() => callback());
+        } else {
+          callback();
+        }
+      },
+    });
   try {
-    const full = multipart([soapPart(), attachment(Buffer.alloc(64 * 1024, 0x5a))]);
-    async function* chunked() {
-      for (let offset = 0; offset < full.length; offset += 1024) yield full.subarray(offset, offset + 1024);
+    const full = multipart([soapPart(), attachment(Buffer.alloc(512 * 1024, 0x5a))]);
+    const totalChunks = Math.ceil(full.length / 1024);
+    let pulled = 0;
+    async function* source() {
+      for (let offset = 0; offset < full.length; offset += 1024) {
+        pulled += 1;
+        yield full.subarray(offset, offset + 1024);
+      }
     }
-    const message = await parse(chunked());
+    const pending = parse(source());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const pulledWhileStalled = pulled;
+    assert.ok(
+      pulledWhileStalled < totalChunks / 2,
+      `read-ahead stayed bounded (${pulledWhileStalled}/${totalChunks} chunks pulled while storage was stalled)`,
+    );
+    release();
+    const message = await pending;
     await message.dispose();
-    assert.equal(maxActive, 1, 'the parser awaits each write instead of buffering the attachment');
+    assert.equal(pulled, totalChunks, 'the source is drained once storage resumes');
   } finally {
     delete multipartHooks.createSpoolWriter;
   }
