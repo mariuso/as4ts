@@ -1,4 +1,4 @@
-import { ALGO_EXC_C14N, DS_NS, EBBP_SIGNALS_NS } from '../constants.js';
+import { ALGO_EXC_C14N, ALGO_SHA256, DS_NS, EBBP_SIGNALS_NS, SWA_TRANSFORM_SIGNATURE } from '../constants.js';
 import { defaultEntropy, hexToken, type Entropy } from '../entropy.js';
 import type { Signer } from '../types.js';
 import { safeMessage } from '../util.js';
@@ -145,10 +145,14 @@ function buildErrorSignal(
 
 /**
  * Await `operation`, but stop waiting as soon as `signal` aborts. The operation
- * itself is not cancelled here (that is the signer's concern); a late rejection
- * is still observed so it cannot become an unhandled rejection.
+ * itself is not cancelled here (that is the signer's concern). A rejection
+ * handler is attached to the started operation **before** any early return, so a
+ * late rejection — including one racing an already-aborted signal — can never
+ * become an unhandled rejection.
  */
 async function abortableAwait<T>(operation: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  // Observe the operation unconditionally, ahead of every exit path.
+  operation.catch(() => {});
   if (!signal) return operation;
   if (signal.aborted) throw abortError();
   return new Promise<T>((resolve, reject) => {
@@ -244,9 +248,22 @@ function response(xml: string): RespondSuccess {
   return { ok: true, status: 200, contentType: RESPONSE_CONTENT_TYPE, headers: {}, body: Buffer.from(xml, 'utf8') };
 }
 
+function isSha256Base64(value: string): boolean {
+  const bytes = Buffer.from(value, 'base64');
+  return bytes.length === 32 && bytes.toString('base64') === value;
+}
+
+/** The single transform the profile allows for a reference of this kind. */
+function supportedTransformAlgorithm(uri: string): string {
+  return uri.startsWith('cid:') ? SWA_TRANSFORM_SIGNATURE : ALGO_EXC_C14N;
+}
+
 /**
  * Reject an unusable persisted receipt context before any signing: a receipt is
- * only produced for a non-empty, unique set of well-formed references.
+ * only produced for a non-empty, unique set of references whose semantics the
+ * profile supports — SHA-256 over exclusive C14N for SOAP parts, the SwA content
+ * signature transform for attachments — so a persisted context cannot make us
+ * acknowledge something we would not have produced.
  */
 function validateReceipt(receipt: ReceiptContext): RespondFailure | null {
   if (!receipt || typeof receipt.messageId !== 'string' || receipt.messageId.length === 0) {
@@ -261,21 +278,25 @@ function validateReceipt(receipt: ReceiptContext): RespondFailure | null {
     if (!reference || typeof reference.uri !== 'string' || reference.uri.length === 0) {
       return refuse('respond.invalid-receipt', 'a reference has no URI');
     }
-    if (typeof reference.digest !== 'string' || reference.digest.length === 0) {
-      return refuse('respond.invalid-receipt', `reference ${reference.uri} has no digest`);
+    if (typeof reference.digest !== 'string' || !isSha256Base64(reference.digest)) {
+      return refuse('respond.invalid-receipt', `reference ${reference.uri} has a malformed digest`);
     }
-    if (typeof reference.digestMethod !== 'string' || reference.digestMethod.length === 0) {
-      return refuse('respond.invalid-receipt', `reference ${reference.uri} has no digest method`);
+    if (reference.digestMethod !== ALGO_SHA256) {
+      return refuse('respond.invalid-receipt', `reference ${reference.uri} has an unsupported digest method`);
     }
-    if (!Array.isArray(reference.transforms) || reference.transforms.length === 0) {
-      return refuse('respond.invalid-receipt', `reference ${reference.uri} has no transforms`);
+    if (!Array.isArray(reference.transforms) || reference.transforms.length !== 1) {
+      return refuse('respond.invalid-receipt', `reference ${reference.uri} must have exactly one transform`);
     }
+    const expectedTransform = supportedTransformAlgorithm(reference.uri);
     for (const transform of reference.transforms) {
-      if (!transform || typeof transform.algorithm !== 'string' || transform.algorithm.length === 0) {
-        return refuse('respond.invalid-receipt', `reference ${reference.uri} has an empty transform algorithm`);
+      if (!transform || typeof transform.algorithm !== 'string' || transform.algorithm !== expectedTransform) {
+        return refuse('respond.invalid-receipt', `reference ${reference.uri} has an unsupported transform`);
       }
-      if (!Array.isArray(transform.inclusivePrefixes)) {
-        return refuse('respond.invalid-receipt', `reference ${reference.uri} has invalid transform parameters`);
+      if (
+        !Array.isArray(transform.inclusivePrefixes) ||
+        transform.inclusivePrefixes.some((prefix: string) => typeof prefix !== 'string')
+      ) {
+        return refuse('respond.invalid-receipt', `reference ${reference.uri} has non-string transform parameters`);
       }
     }
     if (seen.has(reference.uri)) {
@@ -288,6 +309,12 @@ function validateReceipt(receipt: ReceiptContext): RespondFailure | null {
 
 /** Validate the request before doing any work, so bad input is a value. */
 function validateInput(input: RespondAs4MessageInput): RespondFailure | null {
+  if (!input || typeof input !== 'object') {
+    return refuse('respond.invalid-input', 'a response input is required');
+  }
+  if (input.kind !== 'accepted' && input.kind !== 'rejected') {
+    return refuse('respond.invalid-input', 'kind must be accepted or rejected');
+  }
   if (typeof input.now !== 'function') return refuse('respond.invalid-input', 'now must be a function');
   if (!input.signer || typeof input.signer.sign !== 'function') {
     return refuse('respond.invalid-input', 'a signer is required');
@@ -315,20 +342,18 @@ function validateInput(input: RespondAs4MessageInput): RespondFailure | null {
 }
 
 export async function respondAs4Message(input: RespondAs4MessageInput): Promise<RespondResult> {
-  const invalid = validateInput(input);
-  if (invalid) return invalid;
-
-  let timestamp: string;
+  // `started` marks the point past validation, so a throw before it is treated
+  // as malformed input and a throw after it as a build/self-check failure.
+  let started = false;
+  let timestamp = '';
   try {
+    const invalid = validateInput(input);
+    if (invalid) return invalid;
     timestamp = input.now().toISOString();
-  } catch (err) {
-    return refuse('respond.invalid-input', safeMessage(err));
-  }
+    const entropy = defaultEntropy();
+    if (input.signal?.aborted) return refuse('aborted');
+    started = true;
 
-  const entropy = defaultEntropy();
-  if (input.signal?.aborted) return refuse('aborted');
-
-  try {
     const parts = buildSignalEnvelope(entropy);
     if (input.kind === 'accepted') {
       buildReceiptSignal(parts, input.receipt, timestamp, `_${hexToken(entropy, 16)}@as4ts`);
@@ -369,6 +394,6 @@ export async function respondAs4Message(input: RespondAs4MessageInput): Promise<
     return response(signed.xml);
   } catch (err) {
     if (isAbortError(err)) return refuse('aborted');
-    return refuse('respond.self-check-failed', safeMessage(err));
+    return refuse(started ? 'respond.self-check-failed' : 'respond.invalid-input', safeMessage(err));
   }
 }

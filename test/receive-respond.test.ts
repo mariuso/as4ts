@@ -22,6 +22,7 @@ import type {
   OpenAs4MessageInput,
   OpenSuccess,
   ReceiptContext,
+  RespondAs4MessageInput,
 } from '../src/receive/types.js';
 import type { Signer } from '../src/types.js';
 import { parseSignal } from '../src/xml/signal.js';
@@ -253,9 +254,17 @@ test('requires an explicit acceptance decision before signing', async () => {
   }
 });
 
-test('rejects an empty or malformed persisted receipt context before signing', async () => {
+test('rejects an unsupported persisted receipt context with zero signing calls', async () => {
   const { opened, cleanup } = await openInbound();
-  const signer = signerFromKey(pki.receiver.keyObject, pki.receiver.certPem);
+  const inner = signerFromKey(pki.receiver.keyObject, pki.receiver.certPem);
+  let signCalls = 0;
+  const signer: Signer = {
+    certificate: inner.certificate,
+    async sign(data, signal) {
+      signCalls += 1;
+      return inner.sign(data, signal);
+    },
+  };
   const now = () => new Date();
   const attempt = (receipt: unknown) =>
     respondAs4Message({
@@ -267,20 +276,32 @@ test('rejects an empty or malformed persisted receipt context before signing', a
     } as unknown as AcceptResponseInput);
   try {
     const [first, ...rest] = opened.receipt.signedReferences;
+    const transform = first!.transforms[0]!;
     const cases: unknown[] = [
       { ...opened.receipt, signedReferences: [] },
       { ...opened.receipt, messageId: '' },
       { ...opened.receipt, signedReferences: [first, first, ...rest] },
       { ...opened.receipt, signedReferences: [{ ...first, digest: '' }] },
+      { ...opened.receipt, signedReferences: [{ ...first, digest: 'not-a-digest' }] },
       { ...opened.receipt, signedReferences: [{ ...first, digestMethod: '' }] },
+      { ...opened.receipt, signedReferences: [{ ...first, digestMethod: 'urn:unsupported' }] },
       { ...opened.receipt, signedReferences: [{ ...first, transforms: [] }] },
       { ...opened.receipt, signedReferences: [{ ...first, transforms: [{ algorithm: '', inclusivePrefixes: [] }] }] },
+      {
+        ...opened.receipt,
+        signedReferences: [{ ...first, transforms: [{ algorithm: 'urn:unsupported', inclusivePrefixes: [] }] }],
+      },
+      {
+        ...opened.receipt,
+        signedReferences: [{ ...first, transforms: [{ algorithm: transform.algorithm, inclusivePrefixes: [7] }] }],
+      },
     ];
     for (const receipt of cases) {
       const result = await attempt(receipt);
       assert.equal(result.ok, false, `must reject ${JSON.stringify(receipt)}`);
       if (!result.ok) assert.equal(result.reason, 'respond.invalid-receipt');
     }
+    assert.equal(signCalls, 0, 'an invalid persisted context must never reach the signer');
   } finally {
     await cleanup();
   }
@@ -382,5 +403,49 @@ test('a stalled signer is interrupted by cancellation', async () => {
     if (!result.ok) assert.equal(result.reason, 'aborted');
   } finally {
     await cleanup();
+  }
+});
+
+test('a signer that aborts and rejects does not leak an unhandled rejection', async () => {
+  const { opened, cleanup } = await openInbound();
+  const leaked: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => {
+    leaked.push(reason);
+  };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const controller = new AbortController();
+    const aborter: Signer = {
+      certificate: pki.receiver.certPem,
+      sign(): Promise<Uint8Array> {
+        // Synchronously abort the operation, then reject: the started signing
+        // promise must still be observed.
+        controller.abort();
+        return Promise.reject(new Error('signer aborted'));
+      },
+    };
+    const result = await respondAs4Message({
+      kind: 'accepted',
+      receipt: opened.receipt,
+      decision: 'committed',
+      signer: aborter,
+      now: () => new Date(),
+      signal: controller.signal,
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.reason, 'aborted');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.deepEqual(leaked, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+    await cleanup();
+  }
+});
+
+test('malformed runtime input is respond.invalid-input, not a throw', async () => {
+  for (const input of [null, undefined, 42, 'accepted', {}, { kind: 'nope' }]) {
+    const result = await respondAs4Message(input as unknown as RespondAs4MessageInput);
+    assert.equal(result.ok, false, `must reject ${JSON.stringify(input)}`);
+    if (!result.ok) assert.equal(result.reason, 'respond.invalid-input');
   }
 });
