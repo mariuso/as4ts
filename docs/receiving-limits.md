@@ -148,27 +148,79 @@ deliberately **different** from `'malformed'`: a resource limit is a
 bounded-inspection outcome, not a claim that the business document is malformed.
 The message itself may still be accepted (`ok: true`).
 
-## A "500 MB document" contract
+## A "500 MiB document" contract
 
-Not established today. To make such a claim, each of the following must hold, and
-be specified against document vs wire size:
+The four prerequisites are met: MIME and the SBDH check stream, the DOM path is
+guarded by a pre-parse preflight and a canonicalisation budget, and the supported
+representations are documented. ("MiB" throughout; never "MB".)
 
-1. **Streaming MIME** — done: headers and delimiters are parsed incrementally and
-   each ciphertext part is streamed into its quarantine file, so memory does not
-   scale with the request.
-2. **Streaming SBDH inspection** — done: the SBDH subtree is validated under
-   dedicated bounds without building a DOM, and the remainder is still parsed for
-   well-formedness.
-3. **Pre-DOM budget enforcement** — done: a bounded SAX preflight enforces depth,
-   node, attribute and lexical-token limits before the DOM is constructed, and a
-   conservative canonicalisation bound rejects expansion before the canonical
-   string is allocated.
-4. **A documented supported representation** — done: an uncompressed XML
-   attachment is bounded explicitly by `maxDomXmlBytes` (a separate, smaller
-   budget) and `maxCanonicalBytes` rather than streamed.
+**Claim (required).** A receiver configured with the override block below can open
+a gzip-delivered business document of up to **500 MiB** (524,288,000 recovered
+bytes) at **4 concurrent `openAs4Message` calls in one process**, with peak
+process memory bounded and **not growing with the document size**, and with
+temporary disk growing with message size and returning to empty after `dispose()`.
+Four separate processes would trade lower per-process memory for higher total
+memory; this contract is stated for one process.
 
-Until then, treat the defaults as the supported envelope and raise them only with
-the measured peak-memory budget of the host in mind.
+**What is measured.** The _recovered_ (decrypted, decompressed) document; the
+_wire_ (compressed request) is reported alongside. For a gzip-delivered document
+the wire size is roughly recovered/9.6 (compressible invoice XML) to
+recovered/1.33 (barely-compressible base64 content).
+
+**Supported representations.** gzip attachments are in the claim. Uncompressed XML
+attachments are **not**: they are parsed into a DOM, bounded by `maxDomXmlBytes`
+(8 MiB) and `maxCanonicalBytes` (16 MiB), and raising `maxXmlBytes` raises neither.
+Uncompressed binary attachments are streamed but are not part of the claim.
+
+**Override block** (the defaults stay conservative; large messages opt in). Note
+`maxXmlBytes` must cover the recovered document because every successful open
+streams it through the SBDH check, and it does **not** raise the DOM or
+canonicalisation budgets (`maxDomXmlBytes`, `maxCanonicalBytes`).
+
+```ts
+import type { InboundLimits } from 'as4ts/receive';
+
+// Rounded up from the largest measured wire size (404 MiB for 512 MiB base64)
+// and recovered size (512 MiB); 1 GiB gives headroom. Remaining limits keep
+// their defaults.
+const limits: Partial<InboundLimits> = {
+  maxRequestBytes: 1024 * 1024 * 1024,
+  maxPartBytes: 1024 * 1024 * 1024,
+  maxRepresentationBytes: 1024 * 1024 * 1024,
+  maxDecompressedBytes: 1024 * 1024 * 1024,
+  maxAggregateOutputBytes: 1024 * 1024 * 1024,
+  maxXmlBytes: 1024 * 1024 * 1024,
+};
+```
+
+**Host requirements.** Peak spool disk at concurrency 4, measured: 2474 MiB for a
+512 MiB compressible document, 5132 MiB for a 512 MiB barely-compressible one
+(about 1.25 GiB per concurrent receive). Point `spoolDirectory` at a volume sized
+for it; the directory is empty after every open is disposed.
+
+**Cost.** At 512 MiB × 4 concurrency: about 75 s for the compressible document and
+45 s for the barely-compressible one — roughly 27 and 46 MiB/s recovered
+(Linux/Docker on the same host: 107 s and 69 s).
+
+**Measured status (this revision).** The functional assertions pass on both macOS
+and Linux — every open succeeds, the SBDH check is `consistent`, the payload
+digest matches, and the spool is cleaned up — but the **memory assertions do not
+meet the contract**: peak RSS grows with the message size on both platforms, and
+the barely-compressible runs exceed the provisional 384 MiB ceiling from 256 MiB
+(up to 1674 MiB at 512 MiB). The measured figures and the full finding list are in
+[receiving-measurements.md](receiving-measurements.md). The ceiling was not raised
+to make the run pass; closing this is a follow-up fix.
+
+**How to reproduce.**
+
+```bash
+AS4_MEASURE_SIZES=64,256,512 AS4_MEASURE_KINDS=xml,base64 AS4_MEASURE_CONCURRENCY=4 \
+  npm run measure:receive
+```
+
+`AS4_MEASURE_DIR` selects the fixture/spool root (default: a fresh directory under
+`os.tmpdir()`); `AS4_MEASURE_KEEP=1` retains the generated fixtures. See
+[receiving-measurements.md](receiving-measurements.md) for the recorded results.
 
 ## Verifying a configuration
 
@@ -189,5 +241,5 @@ Receiving-specific tests to run when changing these limits (see
 - the encoding policy (BOM/declaration agreement, ASCII, XML 1.1 rejection,
   invalid UTF-8, `<?xml-stylesheet` versus the declaration);
 - cancellation at each stage, asserting no residue and no success fact;
-- measured peak memory (for example `node --max-old-space-size` plus RSS sampling)
-  rather than an assumption.
+- measured peak memory and disk rather than an assumption: run `npm run measure:receive`
+  (see [receiving-measurements.md](receiving-measurements.md)).

@@ -290,6 +290,10 @@ CI runs on Node.js 22 and 24. To exercise a larger payload, use
 and a fake receiver. [Golden fixtures](test/golden/) cover envelope and multipart
 serialization. Their committed private key is a throwaway test key.
 
+To measure the receiving side's large-message behaviour (peak RSS and disk at
+concurrency 4), use `npm run measure:receive`; results are in
+[docs/receiving-measurements.md](docs/receiving-measurements.md).
+
 Useful commands:
 
 ```bash

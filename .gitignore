@@ -8,3 +8,4 @@ coverage/
 .example-output/
 evidence/
 /invoice*.sbdh.xml
+measurements/
