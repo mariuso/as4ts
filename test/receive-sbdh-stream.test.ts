@@ -581,6 +581,79 @@ test('a non-SBDH root with a lookalike header is missing, not a resource limit',
   assert.deepEqual(await check(xml, { headerBytes: 1 }), { status: 'missing' });
 });
 
+/** Comment padding, small enough that no single token or node count trips first. */
+function commentPadding(total: number): string {
+  let remaining = total;
+  const parts: string[] = [];
+  while (remaining > 0) {
+    const size = Math.min(remaining, 60_000);
+    parts.push(`<!--${'p'.repeat(size - 7)}-->`);
+    remaining -= size;
+  }
+  return parts.join('');
+}
+
+const CHUNK_SIZES = [0, 64 * 1024, 1, 7];
+
+function chunksOf(xml: string, size: number): Buffer[] {
+  const bytes = Buffer.from(xml, 'utf8');
+  return size > 0 ? chunked(bytes, size) : [bytes];
+}
+
+test('a header over the byte limit is a resource limit even with a foreign lookalike after it', async () => {
+  const base = header();
+  const target = 295_299;
+  const big = base.replace(
+    '</StandardBusinessDocumentHeader>',
+    `${commentPadding(target - headerBytesOf(base))}</StandardBusinessDocumentHeader>`,
+  );
+  assert.equal(headerBytesOf(big), target);
+  assert.ok(target > defaultSbdhStreamLimits.headerBytes);
+  const withLookalike = big.replace(
+    '</StandardBusinessDocument>',
+    '<StandardBusinessDocumentHeader xmlns="urn:other"/></StandardBusinessDocument>',
+  );
+  for (const size of CHUNK_SIZES) {
+    assert.deepEqual(await checkChunks(chunksOf(big, size)), { status: 'resource-limit', reason: 'xml.too-large' });
+    assert.deepEqual(
+      await checkChunks(chunksOf(withLookalike, size)),
+      { status: 'resource-limit', reason: 'xml.too-large' },
+      `chunk size ${size} with a trailing lookalike`,
+    );
+  }
+});
+
+test('a large foreign lookalike is not charged to a valid header', async () => {
+  const lookalike = `<StandardBusinessDocumentHeader xmlns="urn:other">${commentPadding(300_000)}</StandardBusinessDocumentHeader>`;
+  const cases: ReadonlyArray<readonly [string, string]> = [
+    ['after', header().replace('</StandardBusinessDocument>', `${lookalike}</StandardBusinessDocument>`)],
+    ['before', header().replace('<StandardBusinessDocumentHeader>', `${lookalike}<StandardBusinessDocumentHeader>`)],
+  ];
+  for (const size of CHUNK_SIZES) {
+    for (const [label, xml] of cases) {
+      assert.deepEqual(
+        await checkChunks(chunksOf(xml, size)),
+        { status: 'consistent' },
+        `${label}, chunk size ${size}`,
+      );
+    }
+  }
+});
+
+test('the header span is bound to the validated element, not a lookalike', async () => {
+  const expected = headerBytesOf(header());
+  const lookalike = '<StandardBusinessDocumentHeader xmlns="urn:other"><A/></StandardBusinessDocumentHeader>';
+  const cases = [
+    header().replace('</StandardBusinessDocument>', `${lookalike}</StandardBusinessDocument>`),
+    header().replace('<StandardBusinessDocumentHeader>', `${lookalike}<StandardBusinessDocumentHeader>`),
+  ];
+  for (const xml of cases) {
+    const bytes = Buffer.from(xml, 'utf8');
+    assert.equal(await minHeaderBudget(bytes, 0), expected);
+    assert.equal(await minHeaderBudget(bytes, 1), expected);
+  }
+});
+
 // --- Prefix and DOCTYPE accumulation -----------------------------------------
 
 test('leading whitespace is not accumulated while waiting for a declaration', async () => {

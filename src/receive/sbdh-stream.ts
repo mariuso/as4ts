@@ -191,13 +191,18 @@ class LexicalGuard {
         } else if (char === '/') {
           this.selfClosing = true;
         } else if (char === '>') {
-          this.onTag?.({
+          const kind: TagEvent['kind'] = this.closing ? 'close' : 'open';
+          const event: TagEvent = {
             name: this.name,
-            kind: this.closing ? 'close' : 'open',
+            kind,
             selfClosing: this.selfClosing,
             start: this.tokenStart,
             end: this.consumed,
-          });
+          };
+          this.onTag?.(event);
+          // A self-closing tag ends two elements (open then close) in the SAX
+          // event stream; mirror that so the ordered association stays aligned.
+          if (this.selfClosing) this.onTag?.({ ...event, kind: 'close' });
           this.endToken();
         }
         return;
@@ -422,22 +427,18 @@ export async function checkSbdhStream(
     const decoder = makeDecoder(encoding);
 
     // The lexical span of the SBDH header element, in cumulative UTF-8 bytes.
+    // The guard reports the exact byte span of every element tag; the span is
+    // bound to the namespace-validated header by pairing the guard's tag events,
+    // in order, with the parser's element events for the header's local name.
+    // The lists are per chunk (not document-wide), and once the header's span is
+    // selected it is preserved, so a later lookalike cannot replace it.
     let headerSpanStart: number | null = null;
     let headerSpanEnd: number | null = null;
-    let headerNesting = 0;
+    const pendingHeaderTags: TagEvent[] = [];
+    let pendingHeaderCursor = 0;
     const guard = new LexicalGuard(limits.tokenBytes, (tag) => {
       const local = tag.name.includes(':') ? tag.name.slice(tag.name.indexOf(':') + 1) : tag.name;
-      if (local !== HEADER_LOCAL_NAME) return;
-      if (tag.kind === 'open') {
-        if (headerNesting === 0) {
-          headerSpanStart = tag.start;
-          headerSpanEnd = tag.selfClosing ? tag.end : null;
-        }
-        if (!tag.selfClosing) headerNesting += 1;
-      } else if (headerNesting > 0) {
-        headerNesting -= 1;
-        if (headerNesting === 0) headerSpanEnd = tag.end;
-      }
+      if (local === HEADER_LOCAL_NAME) pendingHeaderTags.push(tag);
     });
 
     const parser = new SaxesParser({ xmlns: true });
@@ -479,6 +480,9 @@ export async function checkSbdhStream(
     };
 
     parser.on('opentag', (node: SaxesTagNS) => {
+      // Pair this element event with the guard's tag event of the same local
+      // name, in order, to recover its exact byte span.
+      const tag = node.local === HEADER_LOCAL_NAME ? pendingHeaderTags[pendingHeaderCursor++] : undefined;
       // Simple-content fields carry no child elements. Reject a nested element
       // rather than silently dropping its content.
       if (openField !== null) throw new StructuralError(`unexpected element inside ${openField[openField.length - 1]}`);
@@ -504,6 +508,10 @@ export async function checkSbdhStream(
         headerSeen = setOnce(headerSeen, HEADER_LOCAL_NAME, () => {});
         headerOpen = true;
         headerDepth = 0;
+        if (tag) {
+          headerSpanStart = tag.start;
+          headerSpanEnd = tag.selfClosing ? tag.end : null;
+        }
       }
       if (!headerOpen) {
         const field = SIMPLE_FIELDS.find((path) => atPath(path));
@@ -596,12 +604,14 @@ export async function checkSbdhStream(
     parser.on('text', handleText);
     parser.on('cdata', handleText);
 
-    parser.on('closetag', () => {
+    parser.on('closetag', (node: SaxesTagNS) => {
+      const tag = node.local === HEADER_LOCAL_NAME ? pendingHeaderTags[pendingHeaderCursor++] : undefined;
       // End a field / scope only when the exact element being collected closes.
       if (openField !== null && stack.length === openFieldDepth) openField = null;
       if (currentScope !== null && stack.length === scopeDepth) currentScope = null;
       if (headerOpen && stack.length === 2 && stack[1]!.local === HEADER_LOCAL_NAME && stack[1]!.uri === SBDH_NS) {
         headerOpen = false;
+        if (tag) headerSpanEnd = tag.end;
       }
       if (headerOpen) headerDepth -= 1;
       stack.pop();
@@ -616,14 +626,11 @@ export async function checkSbdhStream(
       if (end - headerSpanStart > limits.headerBytes) throw new ResourceLimit('xml.too-large');
     };
 
-    const feed = (bytes: Buffer, alreadyCharged: boolean): void => {
-      if (!alreadyCharged) charge(bytes.length);
-      let text: string;
-      try {
-        text = decoder.decode(bytes);
-      } catch (error) {
-        throw error instanceof StructuralError ? error : new StructuralError('invalid text encoding');
-      }
+    const process = (text: string): void => {
+      // Reset the per-chunk association: the guard reports every element tag in
+      // this chunk before the parser consumes them.
+      pendingHeaderTags.length = 0;
+      pendingHeaderCursor = 0;
       guard.scan(text);
       try {
         parser.write(text);
@@ -633,6 +640,17 @@ export async function checkSbdhStream(
       }
       enforceHeaderBytes();
       if (parseError) throw new StructuralError(parseError);
+    };
+
+    const feed = (bytes: Buffer, alreadyCharged: boolean): void => {
+      if (!alreadyCharged) charge(bytes.length);
+      let text: string;
+      try {
+        text = decoder.decode(bytes);
+      } catch (error) {
+        throw error instanceof StructuralError ? error : new StructuralError('invalid text encoding');
+      }
+      process(text);
     };
 
     feed(prefix, true);
@@ -651,12 +669,7 @@ export async function checkSbdhStream(
     } catch {
       throw new StructuralError('incomplete or invalid text encoding');
     }
-    if (tail.length > 0) {
-      guard.scan(tail);
-      parser.write(tail);
-      enforceHeaderBytes();
-      if (parseError) throw new StructuralError(parseError);
-    }
+    if (tail.length > 0) process(tail);
     parser.close();
     if (parseError) throw new StructuralError(parseError);
 
