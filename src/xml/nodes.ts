@@ -28,6 +28,13 @@ export const NS = {
 
 export type Prefix = keyof typeof NS;
 
+/**
+ * Lenient parse for **locally built** XML only — never remote input. Remote
+ * documents go through `parseStrictXml` (`src/xml/strict.ts`), which validates
+ * encoding, bounds the structure and rejects a DOCTYPE. This parser silently
+ * repairs malformed input and ignores the declared encoding, so a guard test
+ * keeps it out of the receipt, signal and lookup paths.
+ */
 export function parseXml(source: string | Buffer): Document {
   const parser = new DOMParser();
   return parser.parseFromString(typeof source === 'string' ? source : source.toString('utf8'), 'application/xml');
