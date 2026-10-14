@@ -42,11 +42,15 @@ SBDH inspection streams the recovered document
 ([`src/receive/sbdh-stream.ts`](../src/receive/sbdh-stream.ts)); it does not build a
 DOM. Its header budgets (`defaultSbdhStreamLimits`) are separate from the document
 budget: `documentBytes` is `maxXmlBytes`, `documentDepth` 256, `headerBytes`
-256 KiB, `headerNodes` 4096, `headerDepth` 32, `attributes` 64, and `tokenBytes`
-64 KiB bounds any one lexical token (a text run, a tag and its attribute
-collection, a comment, a CDATA section or a processing instruction), measured in
-UTF-8 bytes and enforced while input is consumed rather than after the parser has
-accumulated it.
+256 KiB (the UTF-8 byte span of the SBDH header element itself, including its
+opening markup — not approximated from the document root), `headerNodes` 4096,
+`headerDepth` 32, `attributes` 64, and `tokenBytes` 64 KiB bounds any one lexical
+token (a text run, a tag and its attribute collection, a comment, a CDATA section
+or a processing instruction), measured in UTF-8 bytes and enforced while input is
+consumed rather than after the parser has accumulated it. A `DOCTYPE` is rejected
+as soon as its opening is recognised (a malformed outcome, and the reason the
+internal subset can never be accumulated), and the optional XML declaration is
+read under its own bounded limit.
 
 ## What is buffered today
 

@@ -507,7 +507,7 @@ test('closing an unrelated nested Scope does not end scope collection', async ()
   assert.deepEqual(await check(header().replace(original, nested)), { status: 'consistent' });
 });
 
-// --- The header byte budget includes the opening markup ----------------------
+// --- The header byte budget measures the actual header span ------------------
 
 async function minHeaderBudget(bytes: Buffer, chunkSize: number): Promise<number> {
   const chunks = chunkSize > 0 ? chunked(bytes, chunkSize) : [bytes];
@@ -524,26 +524,119 @@ async function minHeaderBudget(bytes: Buffer, chunkSize: number): Promise<number
   return lo;
 }
 
-test('the header byte budget includes the opening tag for ordinary headers', async () => {
+/** The exact UTF-8 byte span of the SBDH header element in `xml`. */
+function headerBytesOf(xml: string): number {
+  const start = xml.indexOf('<StandardBusinessDocumentHeader');
+  const close = xml.indexOf('</StandardBusinessDocumentHeader>');
+  const end = close >= 0 ? close + '</StandardBusinessDocumentHeader>'.length : xml.indexOf('/>', start) + 2;
+  return Buffer.byteLength(xml.slice(start, end), 'utf8');
+}
+
+test('the header budget equals the header span for ordinary headers', async () => {
+  const expected = headerBytesOf(header());
   const bytes = Buffer.from(header(), 'utf8');
-  const single = await minHeaderBudget(bytes, 0);
-  assert.ok(single > 0, `header budget ${single}`);
-  assert.equal(await minHeaderBudget(bytes, 1), single);
-  assert.equal(await minHeaderBudget(bytes, 7), single);
-  assert.equal((await checkChunks([bytes], { headerBytes: single - 1 })).status, 'resource-limit');
-  assert.notEqual((await checkChunks([bytes], { headerBytes: single })).status, 'resource-limit');
+  assert.equal(await minHeaderBudget(bytes, 0), expected);
+  assert.equal(await minHeaderBudget(bytes, 1), expected);
+  assert.equal(await minHeaderBudget(bytes, 7), expected);
+  assert.equal((await checkChunks([bytes], { headerBytes: expected - 1 })).status, 'resource-limit');
+  assert.notEqual((await checkChunks([bytes], { headerBytes: expected })).status, 'resource-limit');
 });
 
-test('a self-closing header still counts its opening tag and attributes', async () => {
-  const bytes = Buffer.from(
-    `<StandardBusinessDocument xmlns="${SBDH_NS}">` +
-      `<StandardBusinessDocumentHeader ${'a'.repeat(200)}="x"/><Body/></StandardBusinessDocument>`,
-    'utf8',
-  );
-  const single = await minHeaderBudget(bytes, 0);
-  assert.ok(single > 200, `header budget ${single} did not include the 200-character attribute`);
-  assert.equal(await minHeaderBudget(bytes, 1), single);
-  assert.equal(await minHeaderBudget(bytes, 7), single);
-  // With the previous behaviour this returned inconsistent under a one-byte budget.
+test('a self-closing header counts its exact opening markup', async () => {
+  const xml = `<StandardBusinessDocument xmlns="${SBDH_NS}"><StandardBusinessDocumentHeader ${'a'.repeat(200)}="x"/><Body/></StandardBusinessDocument>`;
+  const expected = headerBytesOf(xml);
+  assert.ok(expected > 200, `header span ${expected} did not include the 200-character attribute`);
+  const bytes = Buffer.from(xml, 'utf8');
+  assert.equal(await minHeaderBudget(bytes, 0), expected);
+  assert.equal(await minHeaderBudget(bytes, 1), expected);
   assert.equal((await checkChunks([bytes], { headerBytes: 1 })).status, 'resource-limit');
+});
+
+test('content before the header is not charged to the header budget', async () => {
+  const xml = header().replace(
+    '<StandardBusinessDocumentHeader>',
+    `<Other>${'x'.repeat(5000)}</Other><StandardBusinessDocumentHeader>`,
+  );
+  assert.deepEqual(await check(xml, { headerBytes: 1000 }), { status: 'consistent' });
+});
+
+test('the header budget applies to a header that follows another child', async () => {
+  const xml = header().replace('<StandardBusinessDocumentHeader>', '<Other/><StandardBusinessDocumentHeader>');
+  assert.deepEqual(await check(xml, { headerBytes: 1 }), { status: 'resource-limit', reason: 'xml.too-large' });
+});
+
+test('whitespace and comments before the header do not change the header span', async () => {
+  const xml = header().replace(
+    '<StandardBusinessDocumentHeader>',
+    '\n  <!-- note -->\n  <StandardBusinessDocumentHeader>',
+  );
+  const expected = headerBytesOf(xml);
+  const bytes = Buffer.from(xml, 'utf8');
+  assert.equal(await minHeaderBudget(bytes, 0), expected);
+  assert.equal(await minHeaderBudget(bytes, 1), expected);
+});
+
+test('a non-SBDH root with a lookalike header is missing, not a resource limit', async () => {
+  const xml = `<Root xmlns="urn:unrelated"><StandardBusinessDocumentHeader ${'a'.repeat(500)}="x"/></Root>`;
+  assert.deepEqual(await check(xml, { headerBytes: 1 }), { status: 'missing' });
+});
+
+// --- Prefix and DOCTYPE accumulation -----------------------------------------
+
+test('leading whitespace is not accumulated while waiting for a declaration', async () => {
+  const bytes = Buffer.concat([Buffer.from(' '.repeat(1024 * 1024)), Buffer.from(header(), 'utf8')]);
+  const track = trackingSource(chunked(bytes, 4096));
+  const result = await checkSbdhStream(
+    track.source,
+    { ...defaultSbdhStreamLimits, documentBytes: 8 * 1024 * 1024, tokenBytes: 128 },
+    expected,
+  );
+  assert.deepEqual(result, { status: 'resource-limit', reason: 'xml.token-too-large' });
+  assert.ok(track.reads() <= 2, `pulled ${track.reads()} chunks`);
+  await settle();
+  assert.ok(track.closed());
+});
+
+test('a DOCTYPE is rejected as soon as its opening is recognised', async () => {
+  const bytes = Buffer.from(`<!DOCTYPE foo [${'<!ENTITY a "b">'.repeat(10_000)}]>${header()}`, 'utf8');
+  const track = trackingSource(chunked(bytes, 4096));
+  const result = await checkSbdhStream(
+    track.source,
+    { ...defaultSbdhStreamLimits, documentBytes: 8 * 1024 * 1024 },
+    expected,
+  );
+  assert.equal(result.status, 'malformed');
+  assert.ok(track.reads() <= 2, `pulled ${track.reads()} chunks`);
+});
+
+test('an unfinished DOCTYPE is rejected early too', async () => {
+  const bytes = Buffer.from(`<!DOCTYPE foo [${'<!ENTITY a "b">'.repeat(10_000)}`, 'utf8');
+  const track = trackingSource(chunked(bytes, 4096));
+  const result = await checkSbdhStream(
+    track.source,
+    { ...defaultSbdhStreamLimits, documentBytes: 8 * 1024 * 1024 },
+    expected,
+  );
+  assert.equal(result.status, 'malformed');
+  assert.ok(track.reads() <= 2, `pulled ${track.reads()} chunks`);
+});
+
+test('a conflicting declaration is malformed across every BOM and declaration split', async () => {
+  for (const bom of [[], [0xef, 0xbb, 0xbf]]) {
+    const bytes = Buffer.concat([
+      Buffer.from(bom),
+      Buffer.from(`<?xml version="1.0" encoding="utf-16"?>${header()}`, 'utf8'),
+    ]);
+    await assertStatusAcrossSplits(bytes, 'malformed');
+  }
+  const latin1 = Buffer.concat([
+    Buffer.from([0xef, 0xbb, 0xbf]),
+    Buffer.from(`<?xml version="1.0" encoding="iso-8859-1"?>${header()}`, 'utf8'),
+  ]);
+  await assertStatusAcrossSplits(latin1, 'malformed');
+});
+
+test('a processing instruction whose target begins with xml is not the declaration', async () => {
+  const bytes = Buffer.from(`<?xml-stylesheet encoding="utf-16"?>${header()}`, 'utf8');
+  await assertStatusAcrossSplits(bytes, 'consistent');
 });

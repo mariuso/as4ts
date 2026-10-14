@@ -20,20 +20,21 @@ import type { SbdhConsistency, SbdhResourceLimit } from './types.js';
  * header are still detected.
  *
  * Resource bounds are enforced while input is consumed, not after a token has
- * been accumulated: a lexical guard tracks token openings with explicit states
- * and bounds each token (text run, element tag, comment, CDATA, processing
- * instruction) in UTF-8 bytes before the SAX parser sees it. Header
- * bytes/nodes/depth/attributes are separate from the document byte/depth bounds.
- * Aborts and read errors propagate; the source iterator is always closed.
+ * been accumulated: a lexical guard tracks token openings with explicit states,
+ * bounds each token (text run, element tag, comment, CDATA, processing
+ * instruction) in UTF-8 bytes before the SAX parser sees it, and rejects a
+ * DOCTYPE as soon as its opening is recognised. The header byte budget is
+ * measured from the lexical span of the SBDH header element itself. Aborts and
+ * read errors propagate; the source iterator is always closed.
  */
 export interface SbdhStreamLimits {
   /** Whole recovered document, in bytes. */
   readonly documentBytes: number;
   /** Whole-document nesting bound (protects the parser stack). */
   readonly documentDepth: number;
-  /** Bytes within the SBDH header subtree (including its opening markup). */
+  /** Bytes within the SBDH header element (including its opening markup). */
   readonly headerBytes: number;
-  /** Nodes (elements and text) within the header subtree. */
+  /** Nodes (elements and text) within the header element. */
   readonly headerNodes: number;
   /** Header nesting bound. */
   readonly headerDepth: number;
@@ -60,6 +61,10 @@ export const defaultSbdhStreamLimits: Omit<SbdhStreamLimits, 'documentBytes'> = 
  */
 const DECLARATION_LIMIT = 1024;
 
+/** The SBDH header element's local name. */
+const HEADER_LOCAL_NAME = 'StandardBusinessDocumentHeader';
+const ROOT_LOCAL_NAME = 'StandardBusinessDocument';
+
 class ResourceLimit extends Error {
   constructor(readonly reason: SbdhResourceLimit) {
     super(reason);
@@ -83,9 +88,7 @@ interface ScopeRecord {
   schemeSeen: number;
 }
 
-/**
- * UTF-8 byte length of a single code point.
- */
+/** UTF-8 byte length of a single code point. */
 function codePointBytes(code: number): number {
   if (code < 0x80) return 1;
   if (code < 0x800) return 2;
@@ -95,25 +98,52 @@ function codePointBytes(code: number): number {
 
 type LexicalState = 'text' | 'markup' | 'element' | 'comment' | 'cdata' | 'pi' | 'declaration';
 
+interface TagEvent {
+  /** Raw element name, including any namespace prefix. */
+  readonly name: string;
+  readonly kind: 'open' | 'close';
+  readonly selfClosing: boolean;
+  /** Cumulative UTF-8 byte offset of the opening `<`. */
+  readonly start: number;
+  /** Cumulative UTF-8 byte offset just past the closing `>`. */
+  readonly end: number;
+}
+
 /**
  * Bounds the current lexical token in UTF-8 bytes as characters are consumed, so
  * an oversized value never reaches the SAX parser's own accumulation.
  *
  * Token openings are recognised with explicit, token-local states and a bounded
- * lookahead (`opener`, at most the length of `<![CDATA[`). Once inside a comment,
- * CDATA section or processing instruction, only its real terminator ends it; a
- * lone `>` or markup-shaped content inside it does not. All per-token buffers are
- * reset at every token boundary, so recognition never depends on the previous
- * token.
+ * lookahead (`opener`, at most the length of `<!DOCTYPE`). Once inside a
+ * comment, CDATA section or processing instruction, only its real terminator
+ * ends it. Every per-token buffer is reset at a token boundary, so recognition
+ * never depends on the previous token. A DOCTYPE is rejected the moment its
+ * opening is recognised, before the SAX parser can accumulate its internal
+ * subset. Element tags are reported with their exact byte span so the caller can
+ * account for a specific element without buffering document text.
  */
 class LexicalGuard {
   private state: LexicalState = 'text';
   private bytes = 0;
+  private consumed = 0;
   private quote: number | null = null;
   private opener = '';
   private tail = '';
+  private tokenStart = 0;
+  private name = '';
+  private nameDone = true;
+  private closing = false;
+  private selfClosing = false;
 
-  constructor(private readonly maxBytes: number) {}
+  constructor(
+    private readonly maxBytes: number,
+    private readonly onTag?: (tag: TagEvent) => void,
+  ) {}
+
+  /** Cumulative UTF-8 bytes consumed so far. */
+  get position(): number {
+    return this.consumed;
+  }
 
   scan(text: string): void {
     for (const char of text) {
@@ -121,7 +151,11 @@ class LexicalGuard {
       const size = codePointBytes(code);
       // A '<' in text starts a new markup token; the counter resets before the
       // byte is charged so an exactly-full text token is not rejected.
-      if (this.state === 'text' && char === '<') this.bytes = 0;
+      if (this.state === 'text' && char === '<') {
+        this.bytes = 0;
+        this.tokenStart = this.consumed;
+      }
+      this.consumed += size;
       this.bytes += size;
       if (this.bytes > this.maxBytes) throw new ResourceLimit('xml.token-too-large');
       this.step(char, code);
@@ -143,11 +177,27 @@ class LexicalGuard {
         this.classify();
         return;
       case 'element':
+        if (!this.nameDone && this.quote === null) {
+          if (char === '>' || char === '/' || char === ' ' || char === '\t' || char === '\n' || char === '\r') {
+            this.nameDone = true;
+          } else {
+            this.name += char;
+          }
+        }
         if (this.quote !== null) {
           if (code === this.quote) this.quote = null;
         } else if (char === '"' || char === "'") {
           this.quote = code;
+        } else if (char === '/') {
+          this.selfClosing = true;
         } else if (char === '>') {
+          this.onTag?.({
+            name: this.name,
+            kind: this.closing ? 'close' : 'open',
+            selfClosing: this.selfClosing,
+            start: this.tokenStart,
+            end: this.consumed,
+          });
           this.endToken();
         }
         return;
@@ -176,19 +226,20 @@ class LexicalGuard {
       return;
     }
     if (opener.startsWith('<!')) {
-      if (opener === '<!--') {
-        this.openToken('comment');
-        return;
-      }
-      if (opener === '<![CDATA[') {
-        this.openToken('cdata');
-        return;
-      }
-      if ('<!--'.startsWith(opener) || '<![CDATA['.startsWith(opener)) return; // still deciding
-      this.openToken('declaration');
-      return;
+      if (opener === '<!--') return this.openToken('comment');
+      if (opener === '<![CDATA[') return this.openToken('cdata');
+      if (opener === '<!DOCTYPE') throw new StructuralError('DOCTYPE is not accepted');
+      if ('<!--'.startsWith(opener) || '<![CDATA['.startsWith(opener) || '<!DOCTYPE'.startsWith(opener)) return;
+      return this.openToken('declaration');
     }
-    this.openToken('element');
+    this.state = 'element';
+    this.opener = '';
+    this.tail = '';
+    this.quote = null;
+    this.closing = opener.startsWith('</');
+    this.name = this.closing ? '' : opener.slice(1);
+    this.nameDone = false;
+    this.selfClosing = false;
   }
 
   /** Continue the same token in a specialised state (byte counter is preserved). */
@@ -197,6 +248,10 @@ class LexicalGuard {
     this.opener = '';
     this.tail = '';
     this.quote = null;
+    this.name = '';
+    this.nameDone = true;
+    this.closing = false;
+    this.selfClosing = false;
   }
 
   /** Finish the current token: the next character begins a fresh one. */
@@ -206,6 +261,10 @@ class LexicalGuard {
     this.opener = '';
     this.tail = '';
     this.quote = null;
+    this.name = '';
+    this.nameDone = true;
+    this.closing = false;
+    this.selfClosing = false;
   }
 }
 
@@ -227,19 +286,48 @@ type DeclarationStatus = 'pending' | 'absent' | 'complete' | 'too-long';
  * Classify the buffer's leading bytes as: still pending (too little to decide
  * whether the optional XML declaration is present), absent (no declaration),
  * complete (a full declaration is present) or too-long (a declaration is
- * present but exceeds the declaration limit). This depends only on the bytes
- * seen, never on how they were chunked.
+ * present but exceeds the declaration limit).
+ *
+ * This depends only on the bytes seen, never on how they were chunked. A partial
+ * byte-order mark stays pending, and only the exact `<?xml` opening (its name
+ * followed by whitespace or `?`) counts as a declaration — a processing
+ * instruction such as `<?xml-stylesheet …?>` is not one. The declaration must
+ * start at the very first byte, so leading whitespace means "absent" and the
+ * prefix never accumulates it.
  */
 function inspectDeclaration(buffer: Buffer): DeclarationStatus {
-  const body = buffer.subarray(hasUtf8Bom(buffer) ? 3 : 0);
-  const window = body.subarray(0, DECLARATION_LIMIT).toString('latin1');
-  const trimmed = window.replace(/^\s+/, '');
-  if (trimmed.length === 0) return 'pending';
-  if ('<?xml'.startsWith(trimmed)) return 'pending'; // could still become the declaration
-  if (!trimmed.startsWith('<?xml')) return 'absent'; // a tag or a different processing instruction
-  const close = body.indexOf('?>');
-  if (close < 0) return body.length > DECLARATION_LIMIT ? 'too-long' : 'pending';
+  let start = 0;
+  const first = buffer.length > 0 ? buffer[0] : -1;
+  if (first === 0xef) {
+    if (buffer.length < 3) {
+      if (buffer.length >= 2 && buffer[1] !== 0xbb) return 'absent';
+      return 'pending'; // could still be a UTF-8 byte order mark
+    }
+    if (buffer[1] !== 0xbb || buffer[2] !== 0xbf) return 'absent';
+    start = 3;
+  } else if (first === 0xfe || first === 0xff) {
+    if (buffer.length < 2) return 'pending'; // a partial UTF-16 byte order mark
+    return 'complete'; // rejected by detectEncoding
+  }
+  const rest = buffer.subarray(start);
+  if (rest.length === 0) return 'pending';
+  if (rest[0] !== 0x3c /* '<' */) return 'absent';
+  const opener = rest.subarray(0, Math.min(rest.length, 5)).toString('latin1');
+  if (opener.length < 5) return '<?xml'.startsWith(opener) ? 'pending' : 'absent';
+  if (opener !== '<?xml') return 'absent';
+  if (rest.length === 5) return 'pending'; // need one more byte to tell declaration from a PI
+  const isNameChar = /[A-Za-z0-9_:.\-]/.test(String.fromCharCode(rest[5]!));
+  if (isNameChar) return 'absent'; // e.g. <?xml-stylesheet …?>
+  const close = rest.indexOf('?>');
+  if (close < 0) return rest.length > DECLARATION_LIMIT ? 'too-long' : 'pending';
   return close + 2 > DECLARATION_LIMIT ? 'too-long' : 'complete';
+}
+
+/** True when the head begins with the exact XML declaration opening. */
+function hasDeclarationOpening(head: string): boolean {
+  if (!head.startsWith('<?xml')) return false;
+  const next = head[5];
+  return next === undefined || /\s/.test(next) || next === '?';
 }
 
 /** Decide the encoding, or throw malformed for an unsupported/conflicting one. */
@@ -248,11 +336,10 @@ function detectEncoding(buffer: Buffer): Encoding {
   if (!utf8Bom && hasUtf16Bom(buffer)) {
     throw new StructuralError('unsupported XML encoding (UTF-16 byte order mark)');
   }
-  const body = buffer.subarray(utf8Bom ? 3 : 0);
-  const trimmed = body.subarray(0, DECLARATION_LIMIT).toString('latin1').replace(/^\s+/, '');
-  if (!trimmed.startsWith('<?xml')) return 'utf-8';
-  if (!trimmed.includes('?>')) throw new StructuralError('unterminated XML declaration');
-  const declared = /^<\?xml[^>]*encoding\s*=\s*["']([^"']+)["']/i.exec(trimmed)?.[1]?.trim().toLowerCase();
+  const head = buffer.subarray(utf8Bom ? 3 : 0, DECLARATION_LIMIT + 8).toString('latin1');
+  if (!hasDeclarationOpening(head)) return 'utf-8';
+  if (!head.includes('?>')) throw new StructuralError('unterminated XML declaration');
+  const declared = /^<\?xml[^>]*encoding\s*=\s*["']([^"']+)["']/i.exec(head)?.[1]?.trim().toLowerCase();
   if (declared === undefined) return 'utf-8';
   if (declared === 'utf-8' || declared === 'utf8') return 'utf-8';
   if (declared === 'us-ascii' || declared === 'ascii') return 'ascii';
@@ -290,11 +377,11 @@ function makeDecoder(encoding: Encoding): Decoder {
 
 /** The SBDH fields that carry simple character content (no child elements). */
 const SIMPLE_FIELDS: ReadonlyArray<readonly string[]> = [
-  ['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'Sender', 'Identifier'],
-  ['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'Receiver', 'Identifier'],
-  ['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'BusinessScope', 'Scope', 'Type'],
-  ['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'BusinessScope', 'Scope', 'InstanceIdentifier'],
-  ['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'BusinessScope', 'Scope', 'Identifier'],
+  [ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'Sender', 'Identifier'],
+  [ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'Receiver', 'Identifier'],
+  [ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'BusinessScope', 'Scope', 'Type'],
+  [ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'BusinessScope', 'Scope', 'InstanceIdentifier'],
+  [ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'BusinessScope', 'Scope', 'Identifier'],
 ];
 
 export async function checkSbdhStream(
@@ -311,9 +398,11 @@ export async function checkSbdhStream(
   };
 
   try {
-    // Read until the optional XML declaration is determined, charging document
-    // bytes as they arrive and enforcing the declaration bound against the
-    // declaration itself (so the outcome does not depend on the chunking).
+    // Read until the optional XML declaration is determined. The retained prefix
+    // stays small: an absent declaration is decided at the first byte, and the
+    // declaration bound is enforced against the declaration itself, so the
+    // outcome never depends on the chunking and leading whitespace is not
+    // accumulated.
     let prefix = Buffer.alloc(0);
     let finished = false;
     for (;;) {
@@ -332,8 +421,26 @@ export async function checkSbdhStream(
     const encoding = detectEncoding(prefix);
     const decoder = makeDecoder(encoding);
 
-    const guard = new LexicalGuard(limits.tokenBytes);
-    const parser = new SaxesParser({ xmlns: true, position: true });
+    // The lexical span of the SBDH header element, in cumulative UTF-8 bytes.
+    let headerSpanStart: number | null = null;
+    let headerSpanEnd: number | null = null;
+    let headerNesting = 0;
+    const guard = new LexicalGuard(limits.tokenBytes, (tag) => {
+      const local = tag.name.includes(':') ? tag.name.slice(tag.name.indexOf(':') + 1) : tag.name;
+      if (local !== HEADER_LOCAL_NAME) return;
+      if (tag.kind === 'open') {
+        if (headerNesting === 0) {
+          headerSpanStart = tag.start;
+          headerSpanEnd = tag.selfClosing ? tag.end : null;
+        }
+        if (!tag.selfClosing) headerNesting += 1;
+      } else if (headerNesting > 0) {
+        headerNesting -= 1;
+        if (headerNesting === 0) headerSpanEnd = tag.end;
+      }
+    });
+
+    const parser = new SaxesParser({ xmlns: true });
     let parseError: string | null = null;
     parser.on('error', (error) => {
       parseError ??= error.message;
@@ -362,21 +469,6 @@ export async function checkSbdhStream(
     let openField: readonly string[] | null = null;
     let openFieldDepth = 0;
 
-    // Header byte capture. It begins immediately after the document root's
-    // opening tag (so the header's own opening markup and attributes are
-    // included) and stops at the header's closing tag, or as soon as a direct
-    // child of the root other than the header proves there is no header here.
-    let capturing = false;
-    let captureFrom = 0;
-    let capturedBytes = 0;
-    let currentText = '';
-    let chunkStart = 0;
-    const localOffset = (): number => Math.max(0, Math.min(currentText.length, parser.position - chunkStart));
-    const capture = (part: string): void => {
-      capturedBytes += Buffer.byteLength(part, 'utf8');
-      if (capturedBytes > limits.headerBytes) throw new ResourceLimit('xml.too-large');
-    };
-
     const atPath = (names: readonly string[]): boolean =>
       stack.length === names.length && names.every((name, i) => stack[i]!.local === name && stack[i]!.uri === SBDH_NS);
 
@@ -400,24 +492,18 @@ export async function checkSbdhStream(
       depth += 1;
       if (depth > limits.documentDepth) throw new ResourceLimit('xml.too-deep');
       stack.push({ local: node.local, uri: node.uri });
-      if (!root) {
-        root = { local: node.local, uri: node.uri };
-        capturing = true;
-        captureFrom = localOffset();
-      }
+      if (!root) root = { local: node.local, uri: node.uri };
       if (headerOpen) {
         headerNodes += 1;
         if (headerNodes > limits.headerNodes) throw new ResourceLimit('xml.too-many-nodes');
         headerDepth += 1;
         if (headerDepth > limits.headerDepth) throw new ResourceLimit('xml.too-deep');
       }
-      // A direct child of the root decides whether a valid header can still appear.
-      if (!headerOpen && stack.length === 2 && atPath(['StandardBusinessDocument', 'StandardBusinessDocumentHeader'])) {
-        headerSeen = setOnce(headerSeen, 'StandardBusinessDocumentHeader', () => {});
+      // The header is the root's direct child in the SBDH namespace.
+      if (!headerOpen && stack.length === 2 && atPath([ROOT_LOCAL_NAME, HEADER_LOCAL_NAME])) {
+        headerSeen = setOnce(headerSeen, HEADER_LOCAL_NAME, () => {});
         headerOpen = true;
         headerDepth = 0;
-      } else if (capturing && !headerOpen && stack.length === 2) {
-        capturing = false;
       }
       if (!headerOpen) {
         const field = SIMPLE_FIELDS.find((path) => atPath(path));
@@ -427,52 +513,40 @@ export async function checkSbdhStream(
         }
         return;
       }
-      if (atPath(['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'Sender'])) {
+      if (atPath([ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'Sender'])) {
         senderSeen = setOnce(senderSeen, 'Sender', () => {});
       }
-      if (atPath(['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'Receiver'])) {
+      if (atPath([ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'Receiver'])) {
         receiverSeen = setOnce(receiverSeen, 'Receiver', () => {});
       }
-      if (atPath(['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'Sender', 'Identifier'])) {
+      if (atPath([ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'Sender', 'Identifier'])) {
         senderIdSeen = setOnce(senderIdSeen, 'Sender/Identifier', () => {
           sender.authority = node.attributes['Authority']?.value ?? null;
         });
       }
-      if (atPath(['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'Receiver', 'Identifier'])) {
+      if (atPath([ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'Receiver', 'Identifier'])) {
         receiverIdSeen = setOnce(receiverIdSeen, 'Receiver/Identifier', () => {
           receiver.authority = node.attributes['Authority']?.value ?? null;
         });
       }
-      if (atPath(['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'BusinessScope'])) {
+      if (atPath([ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'BusinessScope'])) {
         businessScopeSeen = setOnce(businessScopeSeen, 'BusinessScope', () => {});
       }
-      if (atPath(['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'BusinessScope', 'Scope'])) {
+      if (atPath([ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'BusinessScope', 'Scope'])) {
         currentScope = { type: null, instance: null, scheme: null, typeSeen: 0, instanceSeen: 0, schemeSeen: 0 };
         scopes.push(currentScope);
         scopeDepth = stack.length;
       }
-      if (
-        currentScope &&
-        atPath(['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'BusinessScope', 'Scope', 'Type'])
-      ) {
+      if (currentScope && atPath([ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'BusinessScope', 'Scope', 'Type'])) {
         currentScope.typeSeen = setOnce(currentScope.typeSeen, 'Scope/Type', () => {});
       }
       if (
         currentScope &&
-        atPath([
-          'StandardBusinessDocument',
-          'StandardBusinessDocumentHeader',
-          'BusinessScope',
-          'Scope',
-          'InstanceIdentifier',
-        ])
+        atPath([ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'BusinessScope', 'Scope', 'InstanceIdentifier'])
       ) {
         currentScope.instanceSeen = setOnce(currentScope.instanceSeen, 'Scope/InstanceIdentifier', () => {});
       }
-      if (
-        currentScope &&
-        atPath(['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'BusinessScope', 'Scope', 'Identifier'])
-      ) {
+      if (currentScope && atPath([ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'BusinessScope', 'Scope', 'Identifier'])) {
         currentScope.schemeSeen = setOnce(currentScope.schemeSeen, 'Scope/Identifier', () => {});
       }
       const field = SIMPLE_FIELDS.find((path) => atPath(path));
@@ -494,38 +568,26 @@ export async function checkSbdhStream(
       if (Buffer.byteLength(text, 'utf8') > limits.tokenBytes) throw new ResourceLimit('xml.token-too-large');
       // Character data (including CDATA) accumulates within one element; a second
       // element of the same kind is a cardinality error caught at opentag.
-      if (atPath(['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'Sender', 'Identifier'])) {
+      if (atPath([ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'Sender', 'Identifier'])) {
         appendField(sender.value, text, (value) => {
           sender.value = value;
         });
-      } else if (atPath(['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'Receiver', 'Identifier'])) {
+      } else if (atPath([ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'Receiver', 'Identifier'])) {
         appendField(receiver.value, text, (value) => {
           receiver.value = value;
         });
-      } else if (
-        currentScope &&
-        atPath(['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'BusinessScope', 'Scope', 'Type'])
-      ) {
+      } else if (currentScope && atPath([ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'BusinessScope', 'Scope', 'Type'])) {
         appendField(currentScope.type, text, (value) => {
           currentScope!.type = value;
         });
       } else if (
         currentScope &&
-        atPath([
-          'StandardBusinessDocument',
-          'StandardBusinessDocumentHeader',
-          'BusinessScope',
-          'Scope',
-          'InstanceIdentifier',
-        ])
+        atPath([ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'BusinessScope', 'Scope', 'InstanceIdentifier'])
       ) {
         appendField(currentScope.instance, text, (value) => {
           currentScope!.instance = value;
         });
-      } else if (
-        currentScope &&
-        atPath(['StandardBusinessDocument', 'StandardBusinessDocumentHeader', 'BusinessScope', 'Scope', 'Identifier'])
-      ) {
+      } else if (currentScope && atPath([ROOT_LOCAL_NAME, HEADER_LOCAL_NAME, 'BusinessScope', 'Scope', 'Identifier'])) {
         appendField(currentScope.scheme, text, (value) => {
           currentScope!.scheme = value;
         });
@@ -538,22 +600,21 @@ export async function checkSbdhStream(
       // End a field / scope only when the exact element being collected closes.
       if (openField !== null && stack.length === openFieldDepth) openField = null;
       if (currentScope !== null && stack.length === scopeDepth) currentScope = null;
-      if (
-        headerOpen &&
-        stack.length === 2 &&
-        stack[1]!.local === 'StandardBusinessDocumentHeader' &&
-        stack[1]!.uri === SBDH_NS
-      ) {
-        if (capturing) {
-          capture(currentText.slice(captureFrom, localOffset()));
-          capturing = false;
-        }
+      if (headerOpen && stack.length === 2 && stack[1]!.local === HEADER_LOCAL_NAME && stack[1]!.uri === SBDH_NS) {
         headerOpen = false;
       }
       if (headerOpen) headerDepth -= 1;
       stack.pop();
       depth -= 1;
     });
+
+    // Enforce the header byte budget against the actual header span once the
+    // parser has confirmed the header is the SBDH header.
+    const enforceHeaderBytes = (): void => {
+      if (headerSeen === 0 || headerSpanStart === null) return;
+      const end = headerSpanEnd ?? guard.position;
+      if (end - headerSpanStart > limits.headerBytes) throw new ResourceLimit('xml.too-large');
+    };
 
     const feed = (bytes: Buffer, alreadyCharged: boolean): void => {
       if (!alreadyCharged) charge(bytes.length);
@@ -564,27 +625,15 @@ export async function checkSbdhStream(
         throw error instanceof StructuralError ? error : new StructuralError('invalid text encoding');
       }
       guard.scan(text);
-      currentText = text;
-      chunkStart = consumedChars;
-      const capturingBefore = capturing;
-      if (capturingBefore) captureFrom = 0;
       try {
         parser.write(text);
       } catch (error) {
         if (error instanceof ResourceLimit || error instanceof StructuralError) throw error;
         throw new StructuralError(error instanceof Error ? error.message : String(error));
       }
-      consumedChars += text.length;
-      // Capture exactly the header span: a fully-inside chunk, or the tail of the
-      // chunk where the root opened (the header close, if it happened in this
-      // chunk, was already captured by the handler).
-      if (capturing) {
-        if (capturingBefore) capture(text);
-        else capture(currentText.slice(captureFrom));
-      }
+      enforceHeaderBytes();
       if (parseError) throw new StructuralError(parseError);
     };
-    let consumedChars = 0;
 
     feed(prefix, true);
     if (!finished) {
@@ -604,17 +653,15 @@ export async function checkSbdhStream(
     }
     if (tail.length > 0) {
       guard.scan(tail);
-      currentText = tail;
-      chunkStart = consumedChars;
       parser.write(tail);
-      consumedChars += tail.length;
+      enforceHeaderBytes();
       if (parseError) throw new StructuralError(parseError);
     }
     parser.close();
     if (parseError) throw new StructuralError(parseError);
 
     const sbdhRoot = root as { local: string; uri: string } | null;
-    if (!sbdhRoot || sbdhRoot.local !== 'StandardBusinessDocument' || sbdhRoot.uri !== SBDH_NS) {
+    if (!sbdhRoot || sbdhRoot.local !== ROOT_LOCAL_NAME || sbdhRoot.uri !== SBDH_NS) {
       return { status: 'missing' };
     }
     if (headerSeen === 0) return { status: 'missing' };
