@@ -71,6 +71,7 @@
     "@typescript-eslint/eslint-plugin": "^8.71.1",
     "@typescript-eslint/parser": "^8.71.1",
     "asn1js": "^3.0.10",
+    "esbuild": "0.28.2",
     "eslint": "^9.39.5",
     "pkijs": "^3.4.1",
     "prettier": "^3.9.10",

@@ -91,6 +91,7 @@ async function main(): Promise<void> {
   const spoolDir = process.env['AS4_CHILD_SPOOL'];
   const concurrency = Number(process.env['AS4_CHILD_CONCURRENCY'] ?? '4');
   const profile = process.env['AS4_CHILD_PROFILE'] ?? 'override';
+  const useSignal = process.env['AS4_CHILD_SIGNAL'] === '1';
   if (!fixtureDir || !pkiDir || !spoolDir)
     throw new Error('AS4_CHILD_FIXTURE, AS4_CHILD_PKI and AS4_CHILD_SPOOL are required');
 
@@ -128,6 +129,9 @@ async function main(): Promise<void> {
         receiverIdentity,
         spoolDirectory: spoolDir,
         ...(limits ? { limits } : {}),
+        // Production callers pass a signal; this one never aborts. It exercises
+        // the cancellation path (and, before the fix, its separate retention).
+        ...(useSignal ? { signal: new AbortController().signal } : {}),
         now: () => new Date(),
       });
     } catch (err) {
@@ -171,6 +175,7 @@ async function main(): Promise<void> {
     sizeMiB: meta.sizeMiB,
     concurrency,
     profile,
+    signal: useSignal,
     recoveredBytes: meta.recoveredBytes,
     wireBytes: meta.wireBytes,
     contentType: meta.contentType,

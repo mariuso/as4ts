@@ -5,6 +5,11 @@ Measured evidence for the contract in
 with `npm run measure:receive` (see that section for the env variables). Raw JSON
 is written to `measurements/` (gitignored).
 
+The measured process runs **under plain `node`**, from a bundle the driver builds
+with esbuild (`measurements/receive-child.mjs`), so the numbers reflect the
+shipped code rather than the tsx loader. The fixture generator still runs under
+tsx; it is not measured.
+
 ## Environment
 
 |                     | macOS run                              | Linux run                                |
@@ -14,7 +19,7 @@ is written to `measurements/` (gitignored).
 | RAM                 | 16 GiB                                 | 5.76 GiB VM limit, 4 vCPU                |
 | Disk                | APFS, ~14 GiB free                     | container overlay                        |
 | Container           | none                                   | Docker Desktop VM on the same host       |
-| `maxRSS` unit check | +261 MiB for a 256 MiB `Buffer`        | +259 MiB for a 256 MiB `Buffer`          |
+| `maxRSS` unit check | +261 MiB for a 256 MiB `Buffer`        | +261 MiB for a 256 MiB `Buffer`          |
 
 Both unit checks confirm `process.resourceUsage().maxRSS` is in kilobytes.
 
@@ -22,7 +27,7 @@ Both unit checks confirm `process.resourceUsage().maxRSS` is in kilobytes.
 
 The request body is a real signed `multipart/related` message whose payload is a
 valid SBDH document followed by streamed invoice content. The content is
-deterministic, so the two platforms produced byte-identical fixtures. `xml` is
+deterministic, so both platforms produced byte-identical fixtures. `xml` is
 compressible (realistic invoice lines); `base64` is barely compressible (base64 of
 random bytes, like an embedded PDF).
 
@@ -40,76 +45,82 @@ random bytes, like an embedded PDF).
 Every run: all four concurrent opens returned `ok: true` with
 `sbdh.status === 'consistent'`, the payload byte length and SHA-256 matched the
 generator, the spool directory was empty after `dispose()`, and no `as4-*` entry
-was left in `os.tmpdir()`. `MiB/s` is recovered bytes across all four receives
-divided by wall time.
+was left in `os.tmpdir()`. "signal" means `openAs4Message` was passed a
+(never-aborting) `AbortSignal`, as a production caller would. `MiB/s` is an
+**aggregate** throughput: recovered bytes across all four receives divided by
+wall time (not per-receive).
 
 ### macOS
 
-| kind   | MiB | maxRSS MiB | spool peak MiB | wall s | MiB/s |
-| ------ | --: | ---------: | -------------: | -----: | ----: |
-| xml    |  64 |        223 |            310 |    9.5 |    27 |
-| xml    | 256 |        269 |           1238 |   37.6 |    27 |
-| xml    | 512 |        421 |           2474 |   75.4 |    27 |
-| base64 |  64 |        372 |            641 |    4.4 |    58 |
-| base64 | 256 |        682 |           2566 |   21.5 |    48 |
-| base64 | 512 |       1298 |           5132 |   45.0 |    46 |
+| kind   | MiB | signal | maxRSS MiB | spool peak MiB | wall s | MiB/s |
+| ------ | --: | ------ | ---------: | -------------: | -----: | ----: |
+| xml    |  64 | no     |        159 |            310 |    9.5 |    27 |
+| xml    |  64 | yes    |        178 |            310 |    9.6 |    27 |
+| xml    | 256 | no     |        176 |           1238 |   39.1 |    26 |
+| xml    | 256 | yes    |        180 |           1238 |   37.5 |    27 |
+| xml    | 512 | no     |        144 |           2474 |   87.9 |    23 |
+| xml    | 512 | yes    |        183 |           2474 |   78.2 |    26 |
+| base64 |  64 | no     |        160 |            641 |    4.9 |    52 |
+| base64 |  64 | yes    |        163 |            641 |    4.9 |    52 |
+| base64 | 256 | no     |        154 |           2566 |   23.5 |    44 |
+| base64 | 256 | yes    |        160 |           2566 |   27.1 |    38 |
+| base64 | 512 | no     |        119 |           5132 |   77.3 |    26 |
+| base64 | 512 | yes    |        140 |           5132 |   74.6 |    27 |
 
 ### Linux (Docker `node:22-bookworm`, 5.76 GiB, 4 vCPU)
 
-| kind   | MiB | maxRSS MiB | spool peak MiB | wall s | MiB/s |
-| ------ | --: | ---------: | -------------: | -----: | ----: |
-| xml    |  64 |        189 |            310 |   23.7 |    11 |
-| xml    | 256 |        260 |           1238 |   58.9 |    17 |
-| xml    | 512 |        346 |           2474 |  106.5 |    19 |
-| base64 |  64 |        323 |            641 |    5.5 |    37 |
-| base64 | 256 |        915 |           2566 |   31.0 |    33 |
-| base64 | 512 |       1674 |           5132 |   69.1 |    30 |
+| kind   | MiB | signal | maxRSS MiB | spool peak MiB | wall s | MiB/s |
+| ------ | --: | ------ | ---------: | -------------: | -----: | ----: |
+| xml    |  64 | no     |        153 |            310 |   12.5 |    20 |
+| xml    |  64 | yes    |        148 |            310 |   12.1 |    21 |
+| xml    | 256 | no     |        152 |           1238 |   54.8 |    19 |
+| xml    | 256 | yes    |        153 |           1238 |   50.9 |    20 |
+| xml    | 512 | no     |        149 |           2474 |  114.6 |    18 |
+| xml    | 512 | yes    |        152 |           2474 |  121.4 |    17 |
+| base64 |  64 | no     |        134 |            641 |    6.3 |    41 |
+| base64 |  64 | yes    |        151 |            641 |    6.5 |    39 |
+| base64 | 256 | no     |        166 |           2566 |   25.6 |    40 |
+| base64 | 256 | yes    |        153 |           2566 |   29.4 |    35 |
+| base64 | 512 | no     |        158 |           5132 |   49.7 |    41 |
+| base64 | 512 | yes    |        143 |           5132 |   62.5 |    33 |
+
+Peak RSS is flat at 119–183 MiB across every size and both signal variants on
+both platforms. Flatness (`maxRSS(512) − maxRSS(64)`) per kind × signal is
+−40…+6 MiB on macOS and −8…+25 MiB on Linux, all within the 64 MiB tolerance; the
+ceiling is 384 MiB.
 
 ## Negative controls (default limits, 512 MiB, concurrency 4)
 
-| platform | kind   | reason                                                                           | maxRSS MiB | wall s | spool clean |
-| -------- | ------ | -------------------------------------------------------------------------------- | ---------: | -----: | ----------- |
-| macOS    | xml    | `payload/payload.too-large` (decompressed output exceeds `maxDecompressedBytes`) |        402 |    2.0 | yes         |
-| macOS    | base64 | `mime/body.too-large` (request exceeds `maxRequestBytes`)                        |        399 |    0.4 | yes         |
-| Linux    | xml    | `payload/payload.too-large`                                                      |        334 |    4.4 | yes         |
-| Linux    | base64 | `mime/body.too-large`                                                            |        358 |    1.4 | yes         |
+| platform | kind   | signal | reason                      | maxRSS MiB | wall s | spool clean |
+| -------- | ------ | ------ | --------------------------- | ---------: | -----: | ----------- |
+| macOS    | xml    | no     | `payload/payload.too-large` |        139 |    3.5 | yes         |
+| macOS    | xml    | yes    | `payload/payload.too-large` |        142 |    3.4 | yes         |
+| macOS    | base64 | no     | `mime/body.too-large`       |         91 |    2.3 | yes         |
+| macOS    | base64 | yes    | `mime/body.too-large`       |         98 |    0.8 | yes         |
+| Linux    | xml    | no     | `payload/payload.too-large` |        105 |    5.5 | yes         |
+| Linux    | xml    | yes    | `payload/payload.too-large` |        102 |    5.4 | yes         |
+| Linux    | base64 | no     | `mime/body.too-large`       |         95 |    0.6 | yes         |
+| Linux    | base64 | yes    | `mime/body.too-large`       |         95 |    0.7 | yes         |
 
-Both fail with a size-limit reason, leave the spool empty and are far faster than
-the positive runs. The `xml` control still peaks high because it decrypts and
-decompresses up to the 256 MiB `maxDecompressedBytes` before failing.
+Both fail with a size-limit reason, leave the spool empty, and stay under
+~142 MiB — well below the ceiling and the positive 512 MiB runs.
 
-## Findings
+## History
 
-The contract's memory assertions are **not met** by this revision on either
-platform. Every run is functionally correct (payload verified, spooled and cleaned
-up), but peak process memory grows with the message size rather than staying flat,
-and it exceeds the provisional 384 MiB ceiling before 512 MiB.
+Commit `0a4d56f` (the first Item 5 measurement) reported peak RSS growing with
+message size, up to 1298 MiB (macOS) / 1674 MiB (Linux) at 512 MiB, and exceeding
+the 384 MiB ceiling from 256 MiB. Two causes were found and fixed in commit
+`2a2684c`:
 
-| #   | Assertion                          | macOS         | Linux          |
-| --- | ---------------------------------- | ------------- | -------------- |
-| 1   | ceiling ≤ 384 MiB, xml-512         | **FAIL** 421  | 346 (pass)     |
-| 2   | ceiling ≤ 384 MiB, base64-256      | **FAIL** 682  | **FAIL** 915   |
-| 3   | ceiling ≤ 384 MiB, base64-512      | **FAIL** 1298 | **FAIL** 1674  |
-| 4   | flatness ≤ 64 MiB, xml (64→512)    | **FAIL** +198 | **FAIL** +157  |
-| 5   | flatness ≤ 64 MiB, base64 (64→512) | **FAIL** +926 | **FAIL** +1350 |
+- `abortableStream` raced every chunk read against a long-lived abort promise, so
+  every consumed chunk stayed reachable until the stream ended. The MIME parser
+  always passes a signal, so it retained the whole request body while parsing,
+  before authentication.
+- The measured child ran under the tsx loader, which added ~110 MiB of peak
+  memory.
 
-Observations that localise the growth:
-
-- It is off-heap: peak `heapUsed` stayed flat at ~35 MB in every run, while peak
-  `external`/`arrayBuffers` tracked the message size (e.g. at 512 MiB,
-  sampled peak `external` ≈ 228 MB at base64-512 vs ≈ 35 MB at base64-64).
-- It scales with concurrency and with the wire/ciphertext size, not the recovered
-  size: a single receive of xml-512 peaked at 239 MiB; four concurrent receives of
-  the same message peaked at 421 MiB, and the base64 (wire ≈ recovered) runs peak
-  far above the xml ones (wire ≈ recovered/9.6).
-- Early-failing runs still peak high: the xml negative control (fails during
-  decompression after reading a 53 MiB request) hit 402 MiB (macOS) / 334 MiB
-  (Linux).
-
-This points at memory retained per concurrent receive scaling with the request/
-ciphertext size rather than a fixed working set. Because Item 5 is measurement
-only, this is recorded as a finding for a follow-up fix; no `src/` change was made
-and the provisional ceiling was **not** raised.
+These runs (bundled child under plain `node`, retention fixed) show flat, bounded
+peak memory on both platforms.
 
 ## Command
 

@@ -113,7 +113,10 @@ The path is bounded but not streaming end to end:
 - **MIME (`src/receive/multipart.ts`).** Headers and delimiters are parsed
   incrementally and each ciphertext part is streamed into a private spool file, so
   peak memory does not scale with the request size; only the bounded SOAP part is
-  held in memory (`maxEnvelopeBytes`).
+  held in memory (`maxEnvelopeBytes`). Consumed chunks are released as they are
+  parsed. Before this was fixed, the reader retained the whole request body while
+  parsing -- before authentication -- which the defaults bounded to
+  `maxRequestBytes` per concurrent request.
 - **Ciphertext quarantine (`src/receive/payload.ts`).** The part bytes are written
   to a private spool file in one pass; a second pass decrypts and authenticates,
   then (for gzip) decompresses into a private document spool. These are streamed
@@ -198,18 +201,18 @@ const limits: Partial<InboundLimits> = {
 (about 1.25 GiB per concurrent receive). Point `spoolDirectory` at a volume sized
 for it; the directory is empty after every open is disposed.
 
-**Cost.** At 512 MiB × 4 concurrency: about 75 s for the compressible document and
-45 s for the barely-compressible one — roughly 27 and 46 MiB/s recovered
-(Linux/Docker on the same host: 107 s and 69 s).
+**Cost.** At 512 MiB × 4 concurrency, with a caller signal: about 78 s for the
+compressible document and 75 s for the barely-compressible one — roughly 26 and
+27 MiB/s recovered in aggregate across the four receives (Linux/Docker on the
+same host: 121 s and 63 s, about 17 and 33 MiB/s).
 
-**Measured status (this revision).** The functional assertions pass on both macOS
-and Linux — every open succeeds, the SBDH check is `consistent`, the payload
-digest matches, and the spool is cleaned up — but the **memory assertions do not
-meet the contract**: peak RSS grows with the message size on both platforms, and
-the barely-compressible runs exceed the provisional 384 MiB ceiling from 256 MiB
-(up to 1674 MiB at 512 MiB). The measured figures and the full finding list are in
-[receiving-measurements.md](receiving-measurements.md). The ceiling was not raised
-to make the run pass; closing this is a follow-up fix.
+**Measured status.** The claim is met on both macOS and Linux, with the measured
+process run under plain `node` from a bundle, at concurrency 4, with and without a
+caller `AbortSignal`: every open succeeds, the SBDH check is `consistent`, the
+payload digest matches and the spool is cleaned up, while peak RSS stays flat at
+119–183 MiB across 64–512 MiB (ceiling 384 MiB; flatness within 25 MiB, tolerance
+64 MiB). The figures are in
+[receiving-measurements.md](receiving-measurements.md).
 
 **How to reproduce.**
 
