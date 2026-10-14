@@ -387,3 +387,163 @@ test('an ASCII declaration is enforced', async () => {
   )}`;
   assert.equal((await check(xml)).status, 'malformed');
 });
+
+// --- Lexical scanner: token openings, terminators and boundaries -------------
+
+test('a processing instruction is bounded even with markup-shaped content', async () => {
+  const doc = withBody(`<?pi ${'<x>'.repeat(10_000)}?>`);
+  assert.deepEqual(await check(doc, { tokenBytes: 128 }), { status: 'resource-limit', reason: 'xml.token-too-large' });
+});
+
+test('a comment whose content starts with ">" ends only at "-->";', async () => {
+  const doc = withBody(`<!-->${'<x>'.repeat(10_000)}-->`);
+  assert.deepEqual(await check(doc, { tokenBytes: 128 }), { status: 'resource-limit', reason: 'xml.token-too-large' });
+});
+
+test('token recognition does not depend on the previous token', async () => {
+  const pi = `<?pi ${'<x>'.repeat(10_000)}?>`;
+  const comment = `<!--${'<x>'.repeat(10_000)}-->`;
+  assert.deepEqual(await check(withBody(`<a/>${pi}`), { tokenBytes: 128 }), {
+    status: 'resource-limit',
+    reason: 'xml.token-too-large',
+  });
+  assert.deepEqual(await check(withBody(`<a b="c"/>${comment}`), { tokenBytes: 128 }), {
+    status: 'resource-limit',
+    reason: 'xml.token-too-large',
+  });
+});
+
+test('a short processing instruction followed by small elements is accepted', async () => {
+  assert.deepEqual(await check(withBody('<?pi "?><i>x</i>')), { status: 'consistent' });
+});
+
+test('embedded >, < and quotes inside a comment or processing instruction are accepted', async () => {
+  assert.deepEqual(await check(withBody('<!-- a > b < c " d --><?pi x > < y " z ?>')), { status: 'consistent' });
+});
+
+test('a text token at the byte boundary is accepted and one byte over is rejected', async () => {
+  assert.deepEqual(await check(withBody(`<t>${'x'.repeat(128)}</t>`), { tokenBytes: 128 }), { status: 'consistent' });
+  assert.deepEqual(await check(withBody(`<t>${'x'.repeat(129)}</t>`), { tokenBytes: 128 }), {
+    status: 'resource-limit',
+    reason: 'xml.token-too-large',
+  });
+});
+
+test('an unfinished comment at end of document is bounded, or malformed when small', async () => {
+  assert.deepEqual(await check(withBody(`<!--${'x'.repeat(200)}`), { tokenBytes: 128 }), {
+    status: 'resource-limit',
+    reason: 'xml.token-too-large',
+  });
+  assert.equal((await check(withBody('<!-- small'))).status, 'malformed');
+});
+
+// --- Declaration detection is chunk independent ------------------------------
+
+async function assertStatusAcrossSplits(bytes: Buffer, status: string): Promise<void> {
+  assert.equal((await checkChunks([bytes])).status, status, 'single chunk');
+  assert.equal((await checkChunks(chunked(bytes, 1))).status, status, 'one-byte chunks');
+  for (let split = 0; split <= Math.min(bytes.length, 64); split++) {
+    const result = await checkChunks([bytes.subarray(0, split), bytes.subarray(split)]);
+    assert.equal(result.status, status, `split at ${split}`);
+  }
+}
+
+test('an unsupported declaration is malformed at every split position', async () => {
+  const bytes = Buffer.from(`<?xml version="1.0" encoding="utf-16"?>${header()}`, 'utf8');
+  await assertStatusAcrossSplits(bytes, 'malformed');
+});
+
+test('an over-long declaration is malformed regardless of chunk size', async () => {
+  const bytes = Buffer.from(`<?xml version="1.0"${' '.repeat(2000)}encoding="utf-16"?>${header()}`, 'utf8');
+  assert.equal((await checkChunks([bytes])).status, 'malformed', 'single chunk');
+  assert.equal((await checkChunks(chunked(bytes, 64))).status, 'malformed', '64-byte chunks');
+});
+
+test('a matching declaration is consistent at every split position', async () => {
+  const bytes = Buffer.from(`<?xml version="1.0" encoding="utf-8"?>${header()}`, 'utf8');
+  await assertStatusAcrossSplits(bytes, 'consistent');
+});
+
+test('a byte order mark with a matching declaration is consistent at every split position', async () => {
+  const bytes = Buffer.concat([
+    Buffer.from([0xef, 0xbb, 0xbf]),
+    Buffer.from(`<?xml version="1.0" encoding="utf-8"?>${header()}`, 'utf8'),
+  ]);
+  await assertStatusAcrossSplits(bytes, 'consistent');
+});
+
+test('a Latin-1 document is consistent at every split position', async () => {
+  const bytes = Buffer.concat([
+    Buffer.from(
+      `<?xml version="1.0" encoding="iso-8859-1"?>${header().replace('</StandardBusinessDocument>', '<extra>')}`,
+      'latin1',
+    ),
+    Buffer.from([0xe9]),
+    Buffer.from('</extra></StandardBusinessDocument>', 'latin1'),
+  ]);
+  await assertStatusAcrossSplits(bytes, 'consistent');
+});
+
+// --- Simple-content fields and scope collection ------------------------------
+
+test('a nested element inside an identifier is rejected, not silently ignored', async () => {
+  const xml = header().replace(`>${SENDER.value}</Identifier>`, `>${SENDER.value}<x>WRONG</x></Identifier>`);
+  assert.equal((await check(xml)).status, 'malformed');
+});
+
+test('a nested element inside a scope field is rejected', async () => {
+  const xml = header().replace(
+    `>${PROCESS.value}</InstanceIdentifier>`,
+    `>${PROCESS.value}<x>WRONG</x></InstanceIdentifier>`,
+  );
+  assert.equal((await check(xml)).status, 'malformed');
+});
+
+test('closing an unrelated nested Scope does not end scope collection', async () => {
+  const original = `<Scope><Type>PROCESSID</Type><InstanceIdentifier>${PROCESS.value}</InstanceIdentifier><Identifier>${PROCESS.scheme}</Identifier></Scope>`;
+  const nested =
+    `<Scope><Type>PROCESSID</Type><Extra><Scope/></Extra>` +
+    `<InstanceIdentifier>${PROCESS.value}</InstanceIdentifier><Identifier>${PROCESS.scheme}</Identifier></Scope>`;
+  assert.deepEqual(await check(header().replace(original, nested)), { status: 'consistent' });
+});
+
+// --- The header byte budget includes the opening markup ----------------------
+
+async function minHeaderBudget(bytes: Buffer, chunkSize: number): Promise<number> {
+  const chunks = chunkSize > 0 ? chunked(bytes, chunkSize) : [bytes];
+  const limited = async (budget: number): Promise<boolean> =>
+    (await checkChunks(chunks, { headerBytes: budget })).status === 'resource-limit';
+  let lo = 0;
+  let hi = bytes.length + 32;
+  if (await limited(hi)) return -1;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (await limited(mid)) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+test('the header byte budget includes the opening tag for ordinary headers', async () => {
+  const bytes = Buffer.from(header(), 'utf8');
+  const single = await minHeaderBudget(bytes, 0);
+  assert.ok(single > 0, `header budget ${single}`);
+  assert.equal(await minHeaderBudget(bytes, 1), single);
+  assert.equal(await minHeaderBudget(bytes, 7), single);
+  assert.equal((await checkChunks([bytes], { headerBytes: single - 1 })).status, 'resource-limit');
+  assert.notEqual((await checkChunks([bytes], { headerBytes: single })).status, 'resource-limit');
+});
+
+test('a self-closing header still counts its opening tag and attributes', async () => {
+  const bytes = Buffer.from(
+    `<StandardBusinessDocument xmlns="${SBDH_NS}">` +
+      `<StandardBusinessDocumentHeader ${'a'.repeat(200)}="x"/><Body/></StandardBusinessDocument>`,
+    'utf8',
+  );
+  const single = await minHeaderBudget(bytes, 0);
+  assert.ok(single > 200, `header budget ${single} did not include the 200-character attribute`);
+  assert.equal(await minHeaderBudget(bytes, 1), single);
+  assert.equal(await minHeaderBudget(bytes, 7), single);
+  // With the previous behaviour this returned inconsistent under a one-byte budget.
+  assert.equal((await checkChunks([bytes], { headerBytes: 1 })).status, 'resource-limit');
+});
