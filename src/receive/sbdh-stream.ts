@@ -344,6 +344,12 @@ function detectEncoding(buffer: Buffer): Encoding {
   const head = buffer.subarray(utf8Bom ? 3 : 0, DECLARATION_LIMIT + 8).toString('latin1');
   if (!hasDeclarationOpening(head)) return 'utf-8';
   if (!head.includes('?>')) throw new StructuralError('unterminated XML declaration');
+  // This reader implements XML 1.0 only. XML 1.1 is rejected because it changes
+  // the whitespace and line-separator rules that the lexical scanner relies on.
+  const version = /^<\?xml\s+version\s*=\s*["']([^"']+)["']/i.exec(head)?.[1]?.trim();
+  if (version !== undefined && version !== '1.0') {
+    throw new StructuralError(`unsupported XML version ${version} (only 1.0 is supported)`);
+  }
   const declared = /^<\?xml[^>]*encoding\s*=\s*["']([^"']+)["']/i.exec(head)?.[1]?.trim().toLowerCase();
   if (declared === undefined) return 'utf-8';
   if (declared === 'utf-8' || declared === 'utf8') return 'utf-8';
@@ -427,19 +433,18 @@ export async function checkSbdhStream(
     const decoder = makeDecoder(encoding);
 
     // The lexical span of the SBDH header element, in cumulative UTF-8 bytes.
-    // The guard reports the exact byte span of every element tag; the span is
-    // bound to the namespace-validated header by pairing the guard's tag events,
-    // in order, with the parser's element events for the header's local name.
-    // The lists are per chunk (not document-wide), and once the header's span is
-    // selected it is preserved, so a later lookalike cannot replace it.
+    // The guard reports the exact byte span of every element tag; the parser's
+    // element events are paired with them, in order, and the span is selected
+    // only for the namespace-validated, direct-child SBDH header. Every pair is
+    // checked for kind and qualified name, so an absent or mismatched event fails
+    // closed rather than silently skipping header-byte accounting. The lists are
+    // per chunk (not document-wide), and once the header's span is selected it is
+    // preserved, so a later lookalike cannot replace it.
     let headerSpanStart: number | null = null;
     let headerSpanEnd: number | null = null;
-    const pendingHeaderTags: TagEvent[] = [];
-    let pendingHeaderCursor = 0;
-    const guard = new LexicalGuard(limits.tokenBytes, (tag) => {
-      const local = tag.name.includes(':') ? tag.name.slice(tag.name.indexOf(':') + 1) : tag.name;
-      if (local === HEADER_LOCAL_NAME) pendingHeaderTags.push(tag);
-    });
+    const chunkTags: TagEvent[] = [];
+    let chunkTagCursor = 0;
+    const guard = new LexicalGuard(limits.tokenBytes, (tag) => chunkTags.push(tag));
 
     const parser = new SaxesParser({ xmlns: true });
     let parseError: string | null = null;
@@ -479,10 +484,21 @@ export async function checkSbdhStream(
       return current + 1;
     };
 
+    // Pair a parser element event with the guard's next tag event. A missing or
+    // mismatched pair means the two event streams disagree (for example on what
+    // constitutes whitespace inside a tag); fail closed rather than silently
+    // miss the header's span.
+    const pairTag = (kind: TagEvent['kind'], node: SaxesTagNS): TagEvent => {
+      const tag = chunkTags[chunkTagCursor++];
+      const name = node.prefix ? `${node.prefix}:${node.local}` : node.local;
+      if (!tag || tag.kind !== kind || tag.name !== name) {
+        throw new StructuralError('the lexical scanner and the XML parser disagree on an element event');
+      }
+      return tag;
+    };
+
     parser.on('opentag', (node: SaxesTagNS) => {
-      // Pair this element event with the guard's tag event of the same local
-      // name, in order, to recover its exact byte span.
-      const tag = node.local === HEADER_LOCAL_NAME ? pendingHeaderTags[pendingHeaderCursor++] : undefined;
+      const tag = pairTag('open', node);
       // Simple-content fields carry no child elements. Reject a nested element
       // rather than silently dropping its content.
       if (openField !== null) throw new StructuralError(`unexpected element inside ${openField[openField.length - 1]}`);
@@ -605,7 +621,7 @@ export async function checkSbdhStream(
     parser.on('cdata', handleText);
 
     parser.on('closetag', (node: SaxesTagNS) => {
-      const tag = node.local === HEADER_LOCAL_NAME ? pendingHeaderTags[pendingHeaderCursor++] : undefined;
+      const tag = pairTag('close', node);
       // End a field / scope only when the exact element being collected closes.
       if (openField !== null && stack.length === openFieldDepth) openField = null;
       if (currentScope !== null && stack.length === scopeDepth) currentScope = null;
@@ -629,8 +645,8 @@ export async function checkSbdhStream(
     const process = (text: string): void => {
       // Reset the per-chunk association: the guard reports every element tag in
       // this chunk before the parser consumes them.
-      pendingHeaderTags.length = 0;
-      pendingHeaderCursor = 0;
+      chunkTags.length = 0;
+      chunkTagCursor = 0;
       guard.scan(text);
       try {
         parser.write(text);

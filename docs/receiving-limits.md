@@ -50,7 +50,9 @@ or a processing instruction), measured in UTF-8 bytes and enforced while input i
 consumed rather than after the parser has accumulated it. A `DOCTYPE` is rejected
 as soon as its opening is recognised (a malformed outcome, and the reason the
 internal subset can never be accumulated), and the optional XML declaration is
-read under its own bounded limit.
+read under its own bounded limit. Only **XML 1.0** is supported: an XML 1.1
+declaration is rejected, because 1.1 changes the whitespace and line-separator
+rules that the lexical scanner relies on.
 
 ## What is buffered today
 

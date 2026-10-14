@@ -629,7 +629,7 @@ test('a large foreign lookalike is not charged to a valid header', async () => {
     ['after', header().replace('</StandardBusinessDocument>', `${lookalike}</StandardBusinessDocument>`)],
     ['before', header().replace('<StandardBusinessDocumentHeader>', `${lookalike}<StandardBusinessDocumentHeader>`)],
   ];
-  for (const size of CHUNK_SIZES) {
+  for (const size of [0, 64 * 1024, 4096, 7]) {
     for (const [label, xml] of cases) {
       assert.deepEqual(
         await checkChunks(chunksOf(xml, size)),
@@ -712,4 +712,28 @@ test('a conflicting declaration is malformed across every BOM and declaration sp
 test('a processing instruction whose target begins with xml is not the declaration', async () => {
   const bytes = Buffer.from(`<?xml-stylesheet encoding="utf-16"?>${header()}`, 'utf8');
   await assertStatusAcrossSplits(bytes, 'consistent');
+});
+
+test('an XML 1.1 declaration is unsupported', async () => {
+  const bytes = Buffer.from(`<?xml version="1.1"?>${header()}`, 'utf8');
+  await assertStatusAcrossSplits(bytes, 'malformed');
+});
+
+test('XML 1.1 line separators cannot desynchronise the scanner', async () => {
+  for (const separator of ['\u0085', '\u2028', '\u000b', '\u000c']) {
+    const xml = `<?xml version="1.1"?>${header().replace(
+      '<StandardBusinessDocumentHeader>',
+      `<StandardBusinessDocumentHeader${separator}>`,
+    )}`;
+    await assertStatusAcrossSplits(Buffer.from(xml, 'utf8'), 'malformed');
+  }
+});
+
+test('a separator that only the parser treats as whitespace fails closed', async () => {
+  // Without an XML 1.1 declaration the streams still disagree; the association
+  // must reject rather than silently skipping the header-byte budget.
+  for (const separator of ['\u0085', '\u2028']) {
+    const xml = header().replace('<StandardBusinessDocumentHeader>', `<StandardBusinessDocumentHeader${separator}>`);
+    await assertStatusAcrossSplits(Buffer.from(xml, 'utf8'), 'malformed');
+  }
 });
