@@ -164,11 +164,10 @@ function findLenientXmlImports(files: readonly SourceFile[]): string[] {
 }
 
 function remoteXmlFiles(): string[] {
-  // `src/lookup` joins this list once its parser is strict (Phase 3).
-  return [...walk(join(src, 'receipt')), join(src, 'xml', 'signal.ts')];
+  return [...walk(join(src, 'lookup')), ...walk(join(src, 'receipt')), join(src, 'xml', 'signal.ts')];
 }
 
-test('receipt and signal paths do not import the lenient parseXml', () => {
+test('receipt, signal and lookup paths do not import the lenient parseXml', () => {
   const violations = findLenientXmlImports(load(remoteXmlFiles()));
   assert.deepEqual(violations, [], `remote XML must not use parseXml:\n${violations.join('\n')}`);
 });

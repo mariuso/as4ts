@@ -8,6 +8,7 @@ import type { LookupInput, LookupResult } from '../src/lookup/index.js';
 import type { ParticipantId, ScopedId } from '../src/types.js';
 import { buildServiceGroup, buildSignedServiceMetadata } from './helpers/smp.js';
 import { createTestPki, type TestPki } from './helpers/pki.js';
+import { xmlHooks } from '../src/xml/hooks.js';
 
 const DAY = 24 * 3600 * 1000;
 
@@ -389,4 +390,76 @@ test('lookupParticipant never throws for an expected failure', async () => {
     lookupParticipant(baseInput({ resolveNaptr: async () => [] })),
   ]);
   for (const result of results) assert.ok(typeof result.outcome === 'string');
+});
+
+// --- Item 6: strict parsing and bounded canonicalisation ---------------------
+
+test('lookupParticipant rejects an invalid limits override before any DNS query', async () => {
+  let dnsCalled = false;
+  const result = await lookupParticipant(
+    baseInput({
+      limits: { maxMetadataBytes: Number.NaN },
+      resolveNaptr: async () => {
+        dnsCalled = true;
+        return naptr();
+      },
+    }),
+  );
+  assert.equal(result.outcome, 'unavailable');
+  if (result.outcome === 'unavailable') assert.match(result.reason, /limits\.invalid/);
+  assert.equal(dnsCalled, false, 'no DNS query may run for an invalid override');
+});
+
+test('lookupParticipant rejects a DOCTYPE-bearing ServiceGroup with the strict reason', async () => {
+  const result = await lookupParticipant(
+    baseInput({
+      fetch: mockFetch([
+        { contains: '/services/', body: metadata() },
+        { contains: encodeURIComponent(SEGMENT), body: '<!DOCTYPE x []><x/>' },
+      ]),
+    }),
+  );
+  assert.equal(result.outcome, 'unavailable');
+  if (result.outcome === 'unavailable') assert.match(result.reason, /xml\.doctype/);
+});
+
+test('lookupParticipant rejects malformed signed metadata rather than repairing it', async () => {
+  const result = await lookupParticipant(
+    baseInput({
+      fetch: mockFetch([
+        { contains: '/services/', body: '<SignedServiceMetadata><broken></SignedServiceMetadata>' },
+        {
+          contains: encodeURIComponent(SEGMENT),
+          body: buildServiceGroup(PARTICIPANT, [{ documentType: DOCUMENT_TYPE, href: refHref() }]),
+        },
+      ]),
+    }),
+  );
+  assert.equal(result.outcome, 'unavailable');
+  if (result.outcome === 'unavailable') assert.match(result.reason, /xml\.malformed/);
+});
+
+test('an over-canonical-budget SMP response is signature-invalid without canonicalising', async () => {
+  // Build the fixture (which itself canonicalises) before installing the counter.
+  const input = baseInput({
+    limits: { maxCanonicalBytes: 8 },
+    fetch: mockFetch([
+      { contains: '/services/', body: metadata() },
+      {
+        contains: encodeURIComponent(SEGMENT),
+        body: buildServiceGroup(PARTICIPANT, [{ documentType: DOCUMENT_TYPE, href: refHref() }]),
+      },
+    ]),
+  });
+  let canonicalizations = 0;
+  xmlHooks.onCanonicalize = () => {
+    canonicalizations += 1;
+  };
+  try {
+    const result = await lookupParticipant(input);
+    assert.equal(result.outcome, 'signature-invalid');
+    assert.equal(canonicalizations, 0, 'the canonicaliser must not run over budget');
+  } finally {
+    delete xmlHooks.onCanonicalize;
+  }
 });

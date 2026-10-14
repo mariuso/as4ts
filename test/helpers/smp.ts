@@ -107,7 +107,7 @@ export function buildSignedServiceMetadata(options: SignedServiceMetadataOptions
   }).toString('base64');
   setText(firstByLocalName(signature, DS_NS, 'SignatureValue')!, signatureValue);
 
-  return `<?xml version="1.0" encoding="UTF-8"?>${serializeXml(document)}`;
+  return serializeXml(document);
 }
 
 function date(value: string | undefined, name: string): string {

@@ -3,8 +3,11 @@ import { C14nCanonicalization } from 'xml-crypto';
 import type { NamespacePrefix } from 'xml-crypto';
 import { DS_NS } from '../constants.js';
 import { normalizePem, parseCertificate } from '../util.js';
+import { CanonicalizationLimitExceeded } from '../xml/c14n.js';
+import { xmlHooks } from '../xml/hooks.js';
 import { attrOf, firstByLocalName, textOf } from '../xml/nodes.js';
 import { ALGO_ENVELOPED_SIGNATURE, ALGO_INCLUSIVE_C14N, ALGO_RSA_SHA256, ALGO_SHA256, SMP_NS } from './constants.js';
+import { defaultLookupLimits, type LookupLimits } from './limits.js';
 
 /**
  * Inclusive C14N 1.0, which the SMP specification mandates (SMP v1.4.0 §5.5.1,
@@ -34,6 +37,7 @@ const canonicalizer = new C14nCanonicalization();
  */
 export function inclusiveCanonicalize(node: Node): string {
   const ancestorNamespaces = node.nodeType === 1 ? findAncestorNsForElement(node as Element) : [];
+  xmlHooks.onCanonicalize?.();
   return canonicalizer.process(node, { ancestorNamespaces });
 }
 
@@ -42,7 +46,7 @@ export function inclusiveCanonicalize(node: Node): string {
  * `node`, nearest declaration winning, excluding undeclarations and anything the
  * node declares (or binds) itself.
  */
-function findAncestorNsForElement(node: Element): NamespacePrefix[] {
+export function findAncestorNsForElement(node: Element): NamespacePrefix[] {
   const collected: NamespacePrefix[] = [];
   let ancestor: Node | null = node.parentNode;
   while (ancestor && ancestor.nodeType === 1) {
@@ -66,6 +70,199 @@ function findAncestorNsForElement(node: Element): NamespacePrefix[] {
   }
   own.add(node.prefix ?? '');
   return nearest.filter((namespace) => namespace.namespaceURI !== '' && !own.has(namespace.prefix));
+}
+
+/** UTF-8 byte length, without allocating. */
+function utf8(value: string): number {
+  return Buffer.byteLength(value, 'utf8');
+}
+
+/** Characters inclusive C14N escapes in text, CDATA and attribute values. */
+function countEscaped(value: string): number {
+  let count = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (
+      code === 0x26 ||
+      code === 0x3c ||
+      code === 0x3e ||
+      code === 0x22 ||
+      code === 0x09 ||
+      code === 0x0a ||
+      code === 0x0d
+    ) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+/** Worst-case byte cost of a value once C14N escapes it (six bytes per special char). */
+function escapedBytes(value: string): number {
+  return utf8(value) + 5 * countEscaped(value);
+}
+
+/** Byte cost of a namespace declaration `xmlns[:prefix]="uri"` (leading space included). */
+function declarationCost(prefix: string, uri: string): number {
+  const name = prefix === '' ? 'xmlns' : `xmlns:${prefix}`;
+  return 1 + utf8(name) + 2 + escapedBytes(uri) + 1;
+}
+
+/**
+ * A conservative upper bound on the UTF-8 size of a node's **inclusive** C14N
+ * form (the SMP canonicaliser, `C14nCanonicalization`). Inclusive C14N may render
+ * every in-scope namespace declaration on an element, so — unlike the exclusive
+ * bound in `xml/c14n.ts` — this charges the whole in-scope set per element. It
+ * also charges element/attribute markup (UTF-8), escaped text/CDATA, processing
+ * instructions, the ancestor `xml:lang` / `xml:space` xml-crypto copies onto the
+ * apex, and (for a document node) the newline between top-level children.
+ * Comments are dropped by this canonicaliser, so they cost nothing. The walk is
+ * O(nodes + characters) with no input-proportional allocation.
+ *
+ * `skip` lets the caller exclude a direct child (the document digest covers the
+ * root without its envelope signature) before it is cloned.
+ */
+export function inclusiveCanonicalSizeUpperBound(
+  node: Node,
+  ancestorNamespaces: readonly NamespacePrefix[] = [],
+  skip?: (child: Node) => boolean,
+): number {
+  let total = 0;
+  const scope: Array<{ prefix: string; cost: number }> = ancestorNamespaces.map((namespace) => ({
+    prefix: namespace.prefix,
+    cost: declarationCost(namespace.prefix, namespace.namespaceURI),
+  }));
+  let scopeSum = scope.reduce((sum, entry) => sum + entry.cost, 0);
+
+  const visitNode = (child: Node): void => {
+    switch (child.nodeType) {
+      case 1:
+        visitElement(child as Element);
+        return;
+      case 3: // text
+      case 4: // CDATA — written as escaped character data
+        total += 5 * utf8(child.nodeValue ?? '');
+        return;
+      case 7: // processing instruction
+        total += 4 + utf8(child.nodeName ?? '') + 1 + utf8(child.nodeValue ?? '');
+        return;
+      case 8: // comment: dropped by this canonicaliser
+        return;
+      default:
+        return;
+    }
+  };
+
+  const visitElement = (element: Element): void => {
+    const name = element.nodeName;
+    total += 1 + utf8(name) + 1; // '<name'
+    const restore: Array<{ prefix: string; previous: number | null }> = [];
+    for (let i = 0; i < element.attributes.length; i += 1) {
+      const attribute = element.attributes.item(i);
+      if (!attribute) continue;
+      const attributeName = attribute.nodeName;
+      if (attributeName === 'xmlns' || attributeName.startsWith('xmlns:')) {
+        const prefix = attributeName === 'xmlns' ? '' : attributeName.slice('xmlns:'.length);
+        const cost = declarationCost(prefix, attribute.value ?? '');
+        const index = scope.findIndex((entry) => entry.prefix === prefix);
+        if (index >= 0) {
+          restore.push({ prefix, previous: scope[index]!.cost });
+          scopeSum -= scope[index]!.cost;
+          scope[index]!.cost = cost;
+          scopeSum += cost;
+        } else {
+          restore.push({ prefix, previous: null });
+          scope.push({ prefix, cost });
+          scopeSum += cost;
+        }
+      } else {
+        total += 1 + utf8(attributeName) + 2 + escapedBytes(attribute.value ?? '') + 1;
+      }
+    }
+    total += 1; // '>'
+    total += scopeSum; // every in-scope declaration may be rendered here
+    const children = element.childNodes;
+    for (let i = 0; i < children.length; i += 1) {
+      const child = children.item(i);
+      if (child && !(skip && skip(child))) visitNode(child);
+    }
+    total += 2 + utf8(name) + 1; // '</name>'
+    for (let i = restore.length - 1; i >= 0; i -= 1) {
+      const entry = restore[i]!;
+      const index = scope.findIndex((candidate) => candidate.prefix === entry.prefix);
+      if (index < 0) continue;
+      scopeSum -= scope[index]!.cost;
+      if (entry.previous === null) scope.splice(index, 1);
+      else {
+        scope[index]!.cost = entry.previous;
+        scopeSum += entry.previous;
+      }
+    }
+  };
+
+  if (node.nodeType === 1) {
+    const element = node as Element;
+    // Seed the in-scope set from the ancestors as well as the caller's list:
+    // xml-crypto renders inherited namespaces (including the default) on the
+    // apex, and `findAncestorNsForElement` excludes the apex's own prefix.
+    const seen = new Set(scope.map((entry) => entry.prefix));
+    let ancestor: Node | null = element.parentNode;
+    while (ancestor && ancestor.nodeType === 1) {
+      const parent = ancestor as Element;
+      for (let i = 0; i < parent.attributes.length; i += 1) {
+        const attribute = parent.attributes.item(i);
+        if (!attribute) continue;
+        const attributeName = attribute.nodeName;
+        if (attributeName === 'xmlns' || attributeName.startsWith('xmlns:')) {
+          const prefix = attributeName === 'xmlns' ? '' : attributeName.slice('xmlns:'.length);
+          if (!seen.has(prefix)) {
+            seen.add(prefix);
+            const cost = declarationCost(prefix, attribute.value ?? '');
+            scope.push({ prefix, cost });
+            scopeSum += cost;
+          }
+        }
+      }
+      ancestor = parent.parentNode;
+    }
+    visitElement(element);
+    // xml-crypto copies inherited xml:lang / xml:space onto the apex.
+    ancestor = element.parentNode;
+    while (ancestor && ancestor.nodeType === 1) {
+      const parent = ancestor as Element;
+      for (const attributeName of ['xml:lang', 'xml:space']) {
+        const value = parent.getAttribute(attributeName);
+        if (value !== null) total += 1 + utf8(attributeName) + 2 + escapedBytes(value) + 1;
+      }
+      ancestor = parent.parentNode;
+    }
+  } else {
+    const children = node.childNodes;
+    for (let i = 0; i < children.length; i += 1) {
+      const child = children.item(i);
+      if (child) {
+        total += 1; // document-level newline
+        visitNode(child);
+      }
+    }
+  }
+  return total;
+}
+
+/**
+ * Inclusive C14N of a node only when its conservative expansion bound fits the
+ * budget. The bound is checked before the canonicaliser runs, so an
+ * expansion-amplifying SMP response never allocates the canonical string.
+ */
+export function inclusiveCanonicalizeWithin(node: Node, maxBytes: number): string {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new RangeError('canonicalisation budget must be a non-negative safe integer');
+  }
+  const ancestorNamespaces = node.nodeType === 1 ? findAncestorNsForElement(node as Element) : [];
+  const bound = inclusiveCanonicalSizeUpperBound(node, ancestorNamespaces);
+  if (bound > maxBytes) throw new CanonicalizationLimitExceeded(bound, maxBytes);
+  xmlHooks.onCanonicalize?.();
+  return canonicalizer.process(node, { ancestorNamespaces });
 }
 
 export type SmpSignatureVerification =
@@ -96,7 +293,10 @@ export type SmpSignatureVerification =
  * The certificate is only extracted here; the caller validates it. Nothing is
  * thrown.
  */
-export function verifySmpSignature(document: Document): SmpSignatureVerification {
+export function verifySmpSignature(
+  document: Document,
+  limits: LookupLimits = defaultLookupLimits,
+): SmpSignatureVerification {
   const root = document.documentElement;
   if (!root) return fail('the response has no document element');
   if (root.namespaceURI !== SMP_NS || root.localName !== 'SignedServiceMetadata') {
@@ -140,6 +340,18 @@ export function verifySmpSignature(document: Document): SmpSignatureVerification
   }
   const expected = textOf(firstByLocalName(reference, DS_NS, 'DigestValue'))?.trim();
   if (!expected) return fail('missing ds:DigestValue');
+
+  // Bound the canonicalisation before cloning or canonicalising. The document
+  // digest covers the root without its envelope ds:Signature; SignedInfo is
+  // canonicalised separately. Their sum must fit the total budget, so an
+  // expansion-amplifying response never allocates the clone or the strings.
+  const isSignature = (child: Node): boolean =>
+    child.nodeType === 1 && (child as Element).namespaceURI === DS_NS && (child as Element).localName === 'Signature';
+  const digestBound = inclusiveCanonicalSizeUpperBound(root, [], isSignature);
+  const signedInfoBound = inclusiveCanonicalSizeUpperBound(signedInfo, findAncestorNsForElement(signedInfo));
+  if (digestBound + signedInfoBound > limits.maxCanonicalBytes) {
+    return fail('the SMP response exceeds the canonicalisation budget');
+  }
 
   // The node-set the reference covers: the whole document with the signature
   // removed. Everything downstream reads from this document only.

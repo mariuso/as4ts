@@ -76,6 +76,7 @@ test('the lookup entry point exports a stable surface', async () => {
   const module = await import('../src/lookup/index.js');
   assert.deepEqual(Object.keys(module).sort(), [
     'PEPPOL_TRANSPORT_PROFILE',
+    'defaultLookupLimits',
     'documentTypeMatches',
     'lookupParticipant',
     'participantDnsName',

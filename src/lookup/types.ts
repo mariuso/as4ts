@@ -1,4 +1,5 @@
 import type { ParticipantId, ScopedId, ValidateCertificate } from '../types.js';
+import type { LookupLimits } from './limits.js';
 
 /** A DNS NAPTR record, as returned by Node's `resolveNaptr`. */
 export interface NaptrRecord {
@@ -37,6 +38,12 @@ export interface LookupInput {
   readonly signal?: AbortSignal;
   /** Per HTTP request timeout in milliseconds. Defaults to 10 000. */
   readonly timeoutMs?: number;
+  /**
+   * Limits for parsing and canonicalising SMP responses. Any omitted property
+   * falls back to `defaultLookupLimits`. An invalid value is `unavailable` with
+   * `limits.invalid: ...`, before any DNS query.
+   */
+  readonly limits?: Partial<LookupLimits>;
   /** Deterministic clock, used for the service activation/expiration dates. */
   readonly now: () => Date;
 }
