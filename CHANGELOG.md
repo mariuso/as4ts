@@ -6,6 +6,21 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `responseLimits` on `sendAs4` / `transmitAs4` and `limits` on `lookupParticipant`,
+  with `defaultResponseLimits` / `defaultLookupLimits` and their types exported, to
+  bound receipt, error-signal and SMP lookup XML parsing and canonicalisation.
+- The `limits.invalid` not-sent reason (classified `fatal`) and an optional,
+  secret-free `detail` on `NoSignalResult`.
+
+### Changed
+
+- Receipts, error signals and SMP lookup responses are parsed strictly
+  (`parseStrictXml`): malformed, encoding-mismatched or DOCTYPE-bearing responses
+  that were previously repaired are now `no-signal` / `unavailable`, and receipt
+  and SMP canonicalisation are bounded before they run.
+
 ## [0.2.0-rc.1] - 2026-10-13
 
 A release candidate for the inbound receiving side. The signature-coverage policy

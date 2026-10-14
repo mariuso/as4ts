@@ -250,7 +250,9 @@ Current limits:
   inbound parser is exercised against locally generated messages, not live peers.
   Receiving is bounded but not streaming end to end; the limit table and the
   size-envelope limitations are in
-  [`docs/receiving-limits.md`](docs/receiving-limits.md).
+  [`docs/receiving-limits.md`](docs/receiving-limits.md). Receipt, error-signal
+  and SMP lookup responses are bounded separately; see
+  [`docs/response-limits.md`](docs/response-limits.md).
 - **Durable retransmission is caller-driven.** `prepareAs4` + `transmitAs4`
   re-send an identical artifact, and the directory it writes can be persisted and
   reloaded with `loadPreparedMessage`. Persistence, retention and retry policy

@@ -106,6 +106,10 @@ read under its own bounded limit. Only **XML 1.0** is supported: an XML 1.1
 declaration is rejected, because 1.1 changes the whitespace and line-separator
 rules that the lexical scanner relies on.
 
+Receipt, error-signal and SMP lookup responses are remote input too, and are
+bounded separately by the same strict parser and a canonicalisation budget. See
+[`docs/response-limits.md`](response-limits.md).
+
 ## What is buffered today
 
 The path is bounded but not streaming end to end:
