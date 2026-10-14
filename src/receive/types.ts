@@ -70,6 +70,8 @@ export type InboundFailureReason =
   | 'xml.too-large'
   | 'xml.too-deep'
   | 'xml.too-many-nodes'
+  | 'xml.too-many-attributes'
+  | 'xml.token-too-large'
   // signature
   | 'signature.malformed'
   | 'signature.bad-signature'
@@ -142,8 +144,26 @@ export interface InboundLimits {
   readonly maxDecompressedBytes: number;
   /** Aggregate decompressed output across every attachment in one message. */
   readonly maxAggregateOutputBytes: number;
-  /** Cap on XML bytes handed to the DOM parser. */
+  /**
+   * Cap on the recovered document inspected incrementally by the SBDH check.
+   * Independent of `maxDomXmlBytes`: raising this never raises the DOM budget.
+   */
   readonly maxXmlBytes: number;
+  /** Cap on the uncompressed XML representation eligible for DOM processing. */
+  readonly maxDomXmlBytes: number;
+  /**
+   * Conservative upper bound on a single canonicalisation's expansion, applied
+   * to SOAP signature canonicalisation and to XML attachments.
+   */
+  readonly maxCanonicalBytes: number;
+  /** Element nesting bound enforced before the DOM parser is invoked. */
+  readonly maxXmlDepth: number;
+  /** Node bound enforced before the DOM parser is invoked. */
+  readonly maxXmlNodes: number;
+  /** Attribute (and namespace declaration) bound per element. */
+  readonly maxXmlAttributes: number;
+  /** One lexical XML token (text, attribute, comment, CDATA, markup), in UTF-8 bytes. */
+  readonly maxXmlTokenBytes: number;
   readonly maxBoundaryLength: number;
   /** Maximum number of decryption credentials tried during rollover. */
   readonly maxKeyCandidates: number;
@@ -159,9 +179,49 @@ export const defaultInboundLimits: InboundLimits = {
   maxDecompressedBytes: 256 * 1024 * 1024,
   maxAggregateOutputBytes: 512 * 1024 * 1024,
   maxXmlBytes: 64 * 1024 * 1024,
+  // The DOM budget is deliberately smaller than the streaming document budget:
+  // an uncompressed XML attachment is materialised as a DOM, so it is bounded
+  // much more tightly than a document that is only inspected incrementally.
+  maxDomXmlBytes: 8 * 1024 * 1024,
+  maxCanonicalBytes: 16 * 1024 * 1024,
+  maxXmlDepth: 64,
+  maxXmlNodes: 100_000,
+  maxXmlAttributes: 64,
+  maxXmlTokenBytes: 64 * 1024,
   maxBoundaryLength: 70,
   maxKeyCandidates: 4,
 };
+
+/**
+ * Merge caller-supplied limits over the defaults. Every property defaults
+ * independently, so a legacy caller that supplies only `maxXmlBytes` still gets
+ * the (smaller) DOM and canonicalisation budgets — a missing property never
+ * silently removes a bound.
+ */
+export function resolveInboundLimits(partial?: Partial<InboundLimits>): InboundLimits {
+  const resolved: { -readonly [K in keyof InboundLimits]: InboundLimits[K] } = { ...defaultInboundLimits };
+  if (!partial) return resolved;
+  for (const key of Object.keys(defaultInboundLimits) as Array<keyof InboundLimits>) {
+    const value = partial[key];
+    if (value !== undefined) resolved[key] = value;
+  }
+  return resolved;
+}
+
+/**
+ * Validate every limit as a finite, non-negative safe integer. `0` legitimately
+ * means "nothing is allowed". Returns a detail string on an invalid
+ * configuration, or `null` when the limits are usable.
+ */
+export function validateInboundLimits(limits: InboundLimits): string | null {
+  for (const key of Object.keys(defaultInboundLimits) as Array<keyof InboundLimits>) {
+    const value = limits[key];
+    if (!Number.isSafeInteger(value) || value < 0) {
+      return `limit ${key} must be a non-negative safe integer`;
+    }
+  }
+  return null;
+}
 
 /** Observation hook for inbound phases. Observe only; never receives secrets. */
 export type InboundPhase =
@@ -203,7 +263,11 @@ export interface OpenAs4MessageInput {
   /** Required. Our own AP identity, to bind the message's `To` party. */
   readonly receiverIdentity: ScopedId;
   readonly profile?: Profile;
-  readonly limits?: InboundLimits;
+  /**
+   * Limits to apply. Any omitted property falls back to its default, so a legacy
+   * caller that supplies only `maxXmlBytes` still gets every other bound.
+   */
+  readonly limits?: Partial<InboundLimits>;
   /** Spool directory for the quarantined ciphertext. Defaults to the OS temp directory. */
   readonly spoolDirectory?: string;
   readonly signal?: AbortSignal;

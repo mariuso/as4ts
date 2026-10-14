@@ -15,10 +15,10 @@ import {
 import { recoverInboundPayload } from './payload.js';
 import { payloadHooks } from './payload-hooks.js';
 import { documentTypeFromAction } from './sbdh.js';
-import { checkSbdhStream, defaultSbdhStreamLimits } from './sbdh-stream.js';
+import { defaultSbdhStreamLimits, checkSbdhStream } from './sbdh-stream.js';
 import { abortableStream, isAbortError } from './streams.js';
 import { AddressingFault, isSupportedCompression, readUserMessage } from './user-message.js';
-import { defaultXmlLimits, parseStrictXml, XmlFault } from './xml.js';
+import { parseStrictXml, XmlFault } from './xml.js';
 import { verifyWsSecuritySignature } from '../xml/ws-security.js';
 import type {
   EvidenceHandle,
@@ -33,7 +33,7 @@ import type {
   ReceiptContext,
   SbdhConsistency,
 } from './types.js';
-import { defaultInboundLimits } from './types.js';
+import { resolveInboundLimits, validateInboundLimits } from './types.js';
 
 /**
  * Verify and unpack one inbound AS4 `UserMessage` (Phase 3). It performs no
@@ -146,7 +146,11 @@ async function readPart(part: MultipartPart, signal: AbortSignal | undefined): P
 }
 
 export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenResult> {
-  const limits = input.limits ?? defaultInboundLimits;
+  const limits = resolveInboundLimits(input.limits);
+  const invalid = validateInboundLimits(limits);
+  if (invalid !== null) {
+    return { ok: false, stage: 'internal', reason: 'limits.invalid', detail: invalid, answerable: false };
+  }
   const profile = input.profile ?? peppolProfile;
   const holders = Array.isArray(input.keyHolder) ? input.keyHolder : [input.keyHolder];
   const abort = input.signal;
@@ -188,15 +192,26 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
     const envelopeBytes = await readPart(soap, abort);
 
     const document = await timed(onEvent, 'parse-xml', () =>
-      Promise.resolve(parseStrictXml(envelopeBytes, { ...defaultXmlLimits, maxBytes: limits.maxEnvelopeBytes })),
+      Promise.resolve(
+        parseStrictXml(envelopeBytes, {
+          maxBytes: limits.maxEnvelopeBytes,
+          maxDepth: limits.maxXmlDepth,
+          maxNodes: limits.maxXmlNodes,
+          maxAttributes: limits.maxXmlAttributes,
+          maxTokenBytes: limits.maxXmlTokenBytes,
+        }),
+      ),
     );
 
     const structure = validateSoapStructure(document);
     if ('detail' in structure) return fail('xml', 'xml.malformed', structure.detail);
     const { messaging, body: soapBody } = structure;
 
-    const verification = verifyWsSecuritySignature(document);
-    if (!verification.ok) return fail('signature', mapSignatureReason(verification.reason), verification.detail);
+    const verification = verifyWsSecuritySignature(document, { maxCanonicalBytes: limits.maxCanonicalBytes });
+    if (!verification.ok) {
+      if (verification.reason === 'too-large') return fail('xml', 'xml.too-large', verification.detail);
+      return fail('signature', mapSignatureReason(verification.reason), verification.detail);
+    }
     const signature = verification.signature;
     const signerPem = signature.signerCertificatePem;
 

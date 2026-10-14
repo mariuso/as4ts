@@ -29,6 +29,8 @@ const CODE_BY_REASON: Readonly<Record<InboundFailureReason, string>> = {
   'xml.too-large': 'EBMS:0009',
   'xml.too-deep': 'EBMS:0009',
   'xml.too-many-nodes': 'EBMS:0009',
+  'xml.too-many-attributes': 'EBMS:0009',
+  'xml.token-too-large': 'EBMS:0009',
   'signature.malformed': 'EBMS:0101',
   'signature.bad-signature': 'EBMS:0101',
   'signature.digest-mismatch': 'EBMS:0101',

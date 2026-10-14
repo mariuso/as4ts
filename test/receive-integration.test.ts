@@ -357,3 +357,67 @@ test('a MIME storage failure leaves no residue, and cancellation stays aborted',
     if (!aborted.ok) assert.equal(aborted.reason, 'aborted');
   });
 });
+
+// --- Item 4: separated budgets through `openAs4Message` ----------------------
+
+test('an invalid limit configuration fails open with limits.invalid and no correlation', async () => {
+  const result = await openAs4Message(
+    openInput(
+      { contentType: 'multipart/related; boundary="x"', body: Buffer.alloc(0) },
+      { limits: { maxXmlNodes: Number.NaN } },
+    ),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.reason, 'limits.invalid');
+    assert.equal(result.answerable, false);
+    assert.equal(result.correlation, undefined);
+  }
+});
+
+test('a SOAP canonicalisation budget failure fails open before identity binding', async () => {
+  await withRequest(async (request) => {
+    const result = await openAs4Message(openInput(request, { limits: { maxCanonicalBytes: 1 } }));
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.stage, 'xml');
+      assert.equal(result.reason, 'xml.too-large');
+      assert.equal(result.answerable, false, 'no trusted correlation before identity binding');
+    }
+  });
+});
+
+test('a SBDH document budget failure remains its own resource-limit fact', async () => {
+  await withRequest(async (request) => {
+    const result = await openAs4Message(openInput(request, { limits: { maxXmlBytes: 16 } }));
+    assert.equal(result.ok, true, JSON.stringify(result));
+    if (result.ok) {
+      assert.equal(result.sbdh.status, 'resource-limit');
+      await result.dispose();
+    }
+  });
+});
+
+test('the request body chunking does not change the open result', async () => {
+  await withRequest(async (request) => {
+    const whole = await openAs4Message(openInput(request));
+    const oneByte = await openAs4Message(
+      openInput(request, {
+        body: (async function* () {
+          for (const byte of request.body) yield Buffer.from([byte]);
+        })(),
+      }),
+    );
+    try {
+      assert.equal(whole.ok, true, JSON.stringify(whole));
+      assert.equal(oneByte.ok, true, JSON.stringify(oneByte));
+      if (whole.ok && oneByte.ok) {
+        assert.equal(oneByte.messageId, whole.messageId);
+        assert.deepEqual(oneByte.sbdh, whole.sbdh);
+      }
+    } finally {
+      if (whole.ok) await whole.dispose();
+      if (oneByte.ok) await oneByte.dispose();
+    }
+  });
+});

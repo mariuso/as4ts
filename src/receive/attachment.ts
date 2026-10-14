@@ -1,4 +1,5 @@
-import { canonicalize, sha256Digest } from '../xml/c14n.js';
+import { canonicalizeWithin, sha256Digest } from '../xml/c14n.js';
+import { createHash } from 'node:crypto';
 import { parseStrictXml, type XmlLimits } from './xml.js';
 
 /**
@@ -11,13 +12,22 @@ import { parseStrictXml, type XmlLimits } from './xml.js';
  *
  * The XML path rejects malformed content, DOCTYPEs, oversized documents and
  * unsupported encodings, and honours the declared encoding, so equivalent
- * documents in different encodings digest identically.
+ * documents in different encodings digest identically. Canonicalisation runs only
+ * when its conservative expansion bound fits `maxCanonicalBytes`; the resulting
+ * string is hashed directly, without an intermediate UTF-8 buffer.
  */
-export function attachmentDigestBase64(mediaType: string, bytes: Buffer, xmlLimits?: XmlLimits): string {
+export function attachmentDigestBase64(
+  mediaType: string,
+  bytes: Buffer,
+  xmlLimits?: XmlLimits,
+  maxCanonicalBytes = Number.MAX_SAFE_INTEGER,
+): string {
   const type = mediaType.split(';')[0]?.trim().toLowerCase() ?? '';
   const isXml = type === 'application/xml' || type === 'text/xml' || type.endsWith('+xml');
   if (isXml) {
-    return sha256Digest(Buffer.from(canonicalize(parseStrictXml(bytes, xmlLimits)), 'utf8'));
+    const document = parseStrictXml(bytes, xmlLimits);
+    const canonical = canonicalizeWithin(document, maxCanonicalBytes);
+    return createHash('sha256').update(canonical, 'utf8').digest('base64');
   }
   return sha256Digest(bytes);
 }

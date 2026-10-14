@@ -13,7 +13,7 @@ import { MessageBudget } from './budget.js';
 import { payloadHooks } from './payload-hooks.js';
 import { SessionKeyFault, unwrapSessionKey } from './session-key.js';
 import { abortableStream, isAbortError } from './streams.js';
-import { XmlFault, defaultXmlLimits } from './xml.js';
+import { XmlFault } from './xml.js';
 import type {
   InboundEvent,
   InboundFailure,
@@ -386,8 +386,8 @@ export async function recoverInboundPayload(input: RecoverInboundPayloadInput): 
     if (!willDecompress) {
       // The payload is the representation; its size is known already.
       if (representationBytes > maxOutput) return fail('payload', 'payload.too-large', 'output exceeds the limit');
-      if (isXml && representationBytes > limits.maxXmlBytes) {
-        return fail('xml', 'xml.too-large', 'XML exceeds the limit');
+      if (isXml && representationBytes > limits.maxDomXmlBytes) {
+        return fail('xml', 'xml.too-large', 'XML exceeds the DOM limit');
       }
     }
 
@@ -442,12 +442,20 @@ export async function recoverInboundPayload(input: RecoverInboundPayloadInput): 
     let payloadDigestBase64: string;
 
     if (isXml) {
-      if (pass2.bytes > limits.maxXmlBytes) return fail('xml', 'xml.too-large', 'XML exceeds the limit');
+      if (pass2.bytes > limits.maxDomXmlBytes) return fail('xml', 'xml.too-large', 'XML exceeds the DOM limit');
       const bytes = await readRange(representationPath, 0, pass2.bytes);
-      transformDigestBase64 = attachmentDigestBase64(encryption.mediaType, bytes, {
-        ...defaultXmlLimits,
-        maxBytes: limits.maxXmlBytes,
-      });
+      transformDigestBase64 = attachmentDigestBase64(
+        encryption.mediaType,
+        bytes,
+        {
+          maxBytes: limits.maxDomXmlBytes,
+          maxDepth: limits.maxXmlDepth,
+          maxNodes: limits.maxXmlNodes,
+          maxAttributes: limits.maxXmlAttributes,
+          maxTokenBytes: limits.maxXmlTokenBytes,
+        },
+        limits.maxCanonicalBytes,
+      );
       if (transformDigestBase64 !== reference.digest) {
         return fail('signature', 'signature.attachment-digest', 'canonical attachment digest mismatch');
       }

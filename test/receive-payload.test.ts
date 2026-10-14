@@ -343,13 +343,13 @@ test('the aggregate limit applies even without an explicit budget', async () => 
   if (!result.ok) assert.equal(result.reason, 'payload.too-large');
 });
 
-test('rejects an XML representation larger than maxXmlBytes before reading it', async () => {
+test('rejects an XML representation larger than maxDomXmlBytes before reading it', async () => {
   const built = await makeInbound(DOCUMENT, {
     mediaType: 'application/xml',
     digest: attachmentDigestBase64('application/xml', DOCUMENT),
   });
   const result = await recoverInboundPayload(
-    inputFor(built, { compression: { kind: 'none' }, limits: { ...defaultInboundLimits, maxXmlBytes: 1 } }),
+    inputFor(built, { compression: { kind: 'none' }, limits: { ...defaultInboundLimits, maxDomXmlBytes: 1 } }),
   );
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.reason, 'xml.too-large');
