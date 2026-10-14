@@ -1,6 +1,6 @@
-import { canonicalizeWithin, sha256Digest } from '../xml/c14n.js';
 import { createHash } from 'node:crypto';
-import { parseStrictXml, type XmlLimits } from './xml.js';
+import { CanonicalizationLimitExceeded, canonicalizeWithin, sha256Digest } from '../xml/c14n.js';
+import { XmlFault, parseStrictXml, type XmlLimits } from './xml.js';
 
 /**
  * The SwA content-signature transform digest for an attachment, chosen by media
@@ -26,8 +26,15 @@ export function attachmentDigestBase64(
   const isXml = type === 'application/xml' || type === 'text/xml' || type.endsWith('+xml');
   if (isXml) {
     const document = parseStrictXml(bytes, xmlLimits);
-    const canonical = canonicalizeWithin(document, maxCanonicalBytes);
-    return createHash('sha256').update(canonical, 'utf8').digest('base64');
+    try {
+      const canonical = canonicalizeWithin(document, maxCanonicalBytes);
+      return createHash('sha256').update(canonical, 'utf8').digest('base64');
+    } catch (error) {
+      // A canonicalisation budget failure is an XML size limit, not an internal
+      // error: reclassify it so recovery maps it to `stage: 'xml'`.
+      if (error instanceof CanonicalizationLimitExceeded) throw new XmlFault('xml.too-large', error.message);
+      throw error;
+    }
   }
   return sha256Digest(bytes);
 }

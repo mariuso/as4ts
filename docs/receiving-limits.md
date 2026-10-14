@@ -68,16 +68,27 @@ Receiving XML paths, all using the shared policy in
   returned string directly.
 
 The canonicalisation bound is a **conservative upper bound**, not an exact
-output-size limit: it sums worst-case escaping, attribute and namespace
-declarations (a long URI declared once can be repeated on every descendant that
-uses it) and CDATA/comments/PIs. Its purpose is to reject expansion-amplifying
-input before the canonical string is allocated.
+output-size limit: it charges every element's markup and attributes, worst-case
+escaping of text, CDATA and attribute values, and the namespaces an element
+_visibly uses_ — including a declaration made on an ancestor outside the subtree
+being canonicalised — plus the inclusive prefixes on the apex. Names are measured
+in UTF-8 bytes. With per-character escaping the bound stays close to the input
+size for ordinary XML, so the 16 MiB canonical default comfortably covers the
+8 MiB DOM default; expansion-amplifying input (a long URI repeated on every
+descendant) is rejected before the canonical string is allocated.
 
-Any omitted limit falls back to its default, so a caller that supplies only a
-legacy `maxXmlBytes` still gets the (smaller) DOM and canonicalisation budgets; a
-missing property never silently removes a bound. Every limit must be a finite,
-non-negative safe integer (`0` allows nothing); an invalid configuration makes
-`openAs4Message` return a `limits.invalid` failure before any parsing.
+`maxXmlBytes` used to bound DOM parsing. For migration, a caller that supplies
+`maxXmlBytes` but not `maxDomXmlBytes` gets
+`maxDomXmlBytes = min(defaultDomXmlBytes, maxXmlBytes)`, so lowering `maxXmlBytes`
+still tightens the DOM budget; raising it never raises the DOM budget. Any other
+omitted limit falls back to its default, so a missing property never silently
+removes a bound. Every limit must be a finite, non-negative safe integer (`0`
+allows nothing); an invalid configuration makes `openAs4Message` return a
+`limits.invalid` failure before any parsing.
+
+The DOM preflight consumes the whole decoded document in one pass, so "chunk
+independence" applies to the streaming SBDH reader and to the request body, not to
+the DOM preflight.
 
 SBDH inspection streams the recovered document
 ([`src/receive/sbdh-stream.ts`](../src/receive/sbdh-stream.ts)); it does not build a

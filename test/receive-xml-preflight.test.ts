@@ -5,9 +5,11 @@ import {
   canonicalSizeUpperBound,
   canonicalize,
   canonicalizeWithin,
+  materializeInclusiveNamespaces,
 } from '../src/xml/c14n.js';
 import { xmlHooks } from '../src/xml/hooks.js';
 import { attachmentDigestBase64 } from '../src/receive/attachment.js';
+import { defaultInboundLimits, resolveInboundLimits, validateInboundLimits } from '../src/receive/types.js';
 import { XmlFault, defaultXmlLimits, parseStrictXml, validateXmlLimits, type XmlLimits } from '../src/receive/xml.js';
 
 /**
@@ -192,7 +194,7 @@ test('an expansion-amplifying document is rejected before the canonicaliser runs
 
 test('the inclusive-prefix path is bounded too', () => {
   const document = parseStrictXml(expansionDocument());
-  const bound = canonicalSizeUpperBound(document);
+  const bound = canonicalSizeUpperBound(document, ['p']);
   reset();
   assert.throws(
     () => canonicalizeWithin(document, 1000, ['p']),
@@ -203,11 +205,11 @@ test('the inclusive-prefix path is bounded too', () => {
   assert.equal(c14nCalls, 1);
 });
 
-test('an XML attachment over the canonicalisation budget fails before digesting', () => {
+test('an XML attachment over the canonicalisation budget fails as an XML size limit', () => {
   reset();
   assert.throws(
     () => attachmentDigestBase64('application/xml', expansionDocument(), undefined, 1000),
-    (err) => err instanceof CanonicalizationLimitExceeded,
+    (err) => err instanceof XmlFault && err.reason === 'xml.too-large',
   );
   assert.equal(c14nCalls, 0, 'no canonical string may be allocated over budget');
   assert.equal(domCalls, 1, 'the DOM itself is still built within the DOM budget');
@@ -224,4 +226,135 @@ test('equivalent supported encodings retain matching digests', () => {
     attachmentDigestBase64('application/xml', Buffer.from('<a>cafe</a>', 'utf8')),
     attachmentDigestBase64('application/xml', ascii),
   );
+});
+
+// --- Canonical-size bound: soundness, tightness, subtree rejection -----------
+
+const BOUND_LIMITS: XmlLimits = { ...defaultXmlLimits, maxBytes: 32 * 1024 * 1024 };
+
+function ancestorNamespaceDocument(): Buffer {
+  return Buffer.from(`<E xmlns:a="urn:${'x'.repeat(2000)}"><B>${'<a:x/>'.repeat(200)}</B></E>`, 'utf8');
+}
+
+function invoiceDocument(): Buffer {
+  const uris = Array.from(
+    { length: 8 },
+    (_, index) => `urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2:${index}:${'u'.repeat(40)}`,
+  );
+  const declarations = uris.map((uri, index) => `xmlns:ns${index}="${uri}"`).join(' ');
+  const body = '<cbc:Note>Line</cbc:Note>'.repeat(30_000);
+  return Buffer.from(
+    `<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2" ` +
+      `xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2" ${declarations}>${body}</Invoice>`,
+    'utf8',
+  );
+}
+
+function plainTextDocument(): Buffer {
+  return Buffer.from(`<r>${`<c>${'a'.repeat(1024)}</c>`.repeat(3072)}</r>`, 'utf8');
+}
+
+test('the canonical-size bound is sound across namespaces, encodings and node kinds', () => {
+  const uri = `urn:${'x'.repeat(2000)}`;
+  const cases: ReadonlyArray<readonly [string, () => { node: Element | Document; prefixes?: readonly string[] }]> = [
+    [
+      'ancestor-declared namespace on the element',
+      () => ({ node: parseStrictXml(ancestorNamespaceDocument(), BOUND_LIMITS).documentElement.firstChild as Element }),
+    ],
+    [
+      'ancestor-declared namespace via a prefixed attribute',
+      () => ({
+        node: parseStrictXml(
+          Buffer.from(`<E xmlns:a="${uri}"><B>${'<x a:v="1"/>'.repeat(200)}</B></E>`, 'utf8'),
+          BOUND_LIMITS,
+        ).documentElement.firstChild as Element,
+      }),
+    ],
+    [
+      'inclusive prefix declared on an ancestor',
+      () => {
+        const inner = parseStrictXml(ancestorNamespaceDocument(), BOUND_LIMITS).documentElement.firstChild as Element;
+        materializeInclusiveNamespaces(inner, ['a']);
+        return { node: inner, prefixes: ['a'] };
+      },
+    ],
+    [
+      'non-ASCII element and attribute names and surrogate-pair text',
+      () => {
+        const name = '名'.repeat(50);
+        return {
+          node: parseStrictXml(
+            Buffer.from(`<r><${name} a="${name}">emoji \u{1f600}</${name}></r>`, 'utf8'),
+            BOUND_LIMITS,
+          ),
+        };
+      },
+    ],
+    [
+      'text and attributes dense with escaped characters',
+      () => ({
+        node: parseStrictXml(
+          Buffer.from(`<r a="&amp;&lt;&gt;&quot;\t\n\r">x &amp; y &lt; z &gt; \t\n\r</r>`, 'utf8'),
+          BOUND_LIMITS,
+        ),
+      }),
+    ],
+    [
+      'comments, PIs and CDATA before, inside and after the root',
+      () => ({
+        node: parseStrictXml(
+          Buffer.from(`<?pi data?><!--before--><r><![CDATA[a&b<c]]><!--in--><?p q?></r><!--after-->`, 'utf8'),
+          BOUND_LIMITS,
+        ),
+      }),
+    ],
+    ['repeated namespace expansion', () => ({ node: parseStrictXml(expansionDocument(), BOUND_LIMITS) })],
+  ];
+  for (const [name, make] of cases) {
+    const { node, prefixes } = make();
+    const bound = canonicalSizeUpperBound(node, prefixes);
+    const actual = Buffer.byteLength(canonicalize(node, prefixes), 'utf8');
+    assert.ok(bound >= actual, `${name}: bound ${bound} must not be below the actual ${actual}`);
+  }
+});
+
+test('the bound stays tight enough for realistic documents', () => {
+  const invoice = invoiceDocument();
+  const invoiceDoc = parseStrictXml(invoice, BOUND_LIMITS);
+  const invoiceBound = canonicalSizeUpperBound(invoiceDoc);
+  const invoiceActual = Buffer.byteLength(canonicalize(invoiceDoc), 'utf8');
+  assert.ok(invoiceBound >= invoiceActual, `invoice bound ${invoiceBound} < actual ${invoiceActual}`);
+  assert.ok(invoiceBound <= invoiceActual * 2, `invoice bound ${invoiceBound} vs actual ${invoiceActual}`);
+  assert.doesNotThrow(() =>
+    attachmentDigestBase64('application/xml', invoice, BOUND_LIMITS, defaultInboundLimits.maxCanonicalBytes),
+  );
+
+  const text = plainTextDocument();
+  const textDoc = parseStrictXml(text, BOUND_LIMITS);
+  const textBound = canonicalSizeUpperBound(textDoc);
+  const textActual = Buffer.byteLength(canonicalize(textDoc), 'utf8');
+  assert.ok(textBound >= textActual && textBound <= textActual * 2, `text bound ${textBound} vs actual ${textActual}`);
+  assert.doesNotThrow(() =>
+    attachmentDigestBase64('application/xml', text, BOUND_LIMITS, defaultInboundLimits.maxCanonicalBytes),
+  );
+});
+
+test('an over-bound subtree is rejected before the canonicaliser runs', () => {
+  const inner = parseStrictXml(ancestorNamespaceDocument(), BOUND_LIMITS).documentElement.firstChild as Element;
+  const bound = canonicalSizeUpperBound(inner);
+  reset();
+  assert.throws(
+    () => canonicalizeWithin(inner, bound - 1),
+    (err) => err instanceof CanonicalizationLimitExceeded,
+  );
+  assert.equal(c14nCalls, 0);
+});
+
+// --- maxXmlBytes migration ---------------------------------------------------
+
+test('maxXmlBytes tightens but never loosens the DOM budget', () => {
+  assert.equal(resolveInboundLimits({ maxXmlBytes: 1024 }).maxDomXmlBytes, 1024);
+  assert.equal(resolveInboundLimits({ maxXmlBytes: 1 << 30 }).maxDomXmlBytes, 8 * 1024 * 1024);
+  assert.equal(resolveInboundLimits({ maxXmlBytes: 1024, maxDomXmlBytes: 4096 }).maxDomXmlBytes, 4096);
+  assert.notEqual(validateInboundLimits(resolveInboundLimits({ maxXmlBytes: Number.NaN })), null);
 });

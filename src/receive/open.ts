@@ -206,6 +206,7 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
     const structure = validateSoapStructure(document);
     if ('detail' in structure) return fail('xml', 'xml.malformed', structure.detail);
     const { messaging, body: soapBody } = structure;
+    if (abort?.aborted) return fail('transport', 'aborted');
 
     const verification = verifyWsSecuritySignature(document, { maxCanonicalBytes: limits.maxCanonicalBytes });
     if (!verification.ok) {

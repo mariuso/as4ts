@@ -195,8 +195,13 @@ export const defaultInboundLimits: InboundLimits = {
 /**
  * Merge caller-supplied limits over the defaults. Every property defaults
  * independently, so a legacy caller that supplies only `maxXmlBytes` still gets
- * the (smaller) DOM and canonicalisation budgets — a missing property never
- * silently removes a bound.
+ * every other bound — a missing property never silently removes a bound.
+ *
+ * `maxXmlBytes` used to bound DOM parsing, so lowering it must still tighten the
+ * DOM budget: when it is set and `maxDomXmlBytes` is not, the DOM budget becomes
+ * the smaller of the two. Raising `maxXmlBytes` never raises the DOM budget. An
+ * invalid `maxXmlBytes` (for example NaN) is left as-is so validation reports
+ * `limits.invalid` rather than silently picking a value.
  */
 export function resolveInboundLimits(partial?: Partial<InboundLimits>): InboundLimits {
   const resolved: { -readonly [K in keyof InboundLimits]: InboundLimits[K] } = { ...defaultInboundLimits };
@@ -204,6 +209,10 @@ export function resolveInboundLimits(partial?: Partial<InboundLimits>): InboundL
   for (const key of Object.keys(defaultInboundLimits) as Array<keyof InboundLimits>) {
     const value = partial[key];
     if (value !== undefined) resolved[key] = value;
+  }
+  const legacy = partial.maxXmlBytes;
+  if (partial.maxDomXmlBytes === undefined && legacy !== undefined && Number.isSafeInteger(legacy)) {
+    resolved.maxDomXmlBytes = Math.min(defaultInboundLimits.maxDomXmlBytes, legacy);
   }
   return resolved;
 }

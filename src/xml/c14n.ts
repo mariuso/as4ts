@@ -52,22 +52,91 @@ export class CanonicalizationLimitExceeded extends Error {
   }
 }
 
+/** UTF-8 byte length, without allocating. */
+function utf8(value: string): number {
+  return Buffer.byteLength(value, 'utf8');
+}
+
+/** Characters exclusive C14N escapes in text, CDATA and attribute values. */
+function countEscaped(value: string): number {
+  let count = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (
+      code === 0x26 ||
+      code === 0x3c ||
+      code === 0x3e ||
+      code === 0x22 ||
+      code === 0x09 ||
+      code === 0x0a ||
+      code === 0x0d
+    ) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+/** Worst-case byte cost of a value once exclusive C14N escapes it. */
+function escapedBytes(value: string): number {
+  return utf8(value) + 5 * countEscaped(value);
+}
+
+/** Byte cost of a namespace declaration `xmlns[:prefix]="uri"` (leading space included). */
+function declarationCost(prefix: string, uri: string): number {
+  const name = prefix === '' ? 'xmlns' : `xmlns:${prefix}`;
+  return 1 + utf8(name) + 2 + escapedBytes(uri) + 1;
+}
+
 /**
- * A conservative upper bound on the UTF-8 size of a node's exclusive-C14N form.
- *
- * This is deliberately an upper bound, not the exact output size: it sums every
- * element's markup and closing tag, its attributes with worst-case escaping
- * (six bytes per input character), every in-scope namespace declaration that
- * exclusive C14N might repeat on an element (a long URI declared once can be
- * rendered on every descendant that uses it), and CDATA/comments/PIs. It walks
- * the already-constructed DOM, so it bounds the *canonical string* allocation,
- * which is the allocation this check guards. The DOM itself is bounded earlier
- * by the byte/depth/node preflight.
+ * The in-scope URI for a prefix at `element` (including `element` itself).
+ * `#default` means the default namespace. Returns null when no declaration is in
+ * scope or when it is unset (`xmlns=""`).
  */
-export function canonicalSizeUpperBound(root: Element | Document): number {
+function inScopeNamespace(element: Element, prefix: string): string | null {
+  const wanted = prefix === '#default' ? null : prefix;
+  let node: Node | null = element;
+  while (node && node.nodeType === 1) {
+    const current = node as Element;
+    if (wanted === null) {
+      const declared = current.getAttribute('xmlns');
+      if (declared !== null) return declared === '' ? null : declared;
+      if (!current.prefix && current.namespaceURI) return current.namespaceURI;
+    } else {
+      const declared = current.getAttribute(`xmlns:${wanted}`);
+      if (declared !== null) return declared === '' ? null : declared;
+      if (current.prefix === wanted && current.namespaceURI) return current.namespaceURI;
+    }
+    node = current.parentNode;
+  }
+  return null;
+}
+
+/**
+ * A conservative upper bound on the UTF-8 size of a node's exclusive-C14N form,
+ * built from the rules the canonicaliser actually applies:
+ *
+ *  - element and attribute names are measured in UTF-8 bytes, with their markup
+ *    and closing tags;
+ *  - text, CDATA and attribute values are charged worst-case escaping (five extra
+ *    bytes per special character);
+ *  - the namespaces an element *visibly uses* — its own namespace and each
+ *    prefixed attribute's namespace, taken from `namespaceURI` the way xml-crypto
+ *    does — so a declaration made on an ancestor outside the subtree is still
+ *    charged once per element that uses it;
+ *  - every `xmlns`/`xmlns:*` attribute literally present (including
+ *    `materializeInclusiveNamespaces` redeclarations), charged once on the
+ *    declaring element and not cascaded to descendants;
+ *  - the inclusive prefixes on the apex, resolved through the ancestor chain;
+ *  - comments (dropped by this canonicaliser, but charged harmlessly) and
+ *    processing instructions.
+ *
+ * The walk is O(nodes + characters) with no allocation proportional to the input,
+ * so it bounds the *canonical string* allocation — the allocation this check
+ * guards. The DOM itself is bounded earlier by the SAX preflight.
+ */
+export function canonicalSizeUpperBound(root: Element | Document, inclusivePrefixes?: readonly string[]): number {
   let total = 0;
-  const namespaceStack: number[] = [];
-  let namespaceSum = 0;
 
   const visitNode = (node: Node): void => {
     switch (node.nodeType) {
@@ -75,16 +144,14 @@ export function canonicalSizeUpperBound(root: Element | Document): number {
         visitElement(node as Element);
         return;
       case 3: // text
-        total += 6 * (node.nodeValue?.length ?? 0);
+      case 4: // CDATA — written as escaped character data
+        total += escapedBytes(node.nodeValue ?? '');
         return;
-      case 4: // CDATA — rendered as escaped character data
-        total += 6 * (node.nodeValue?.length ?? 0) + 4;
-        return;
-      case 8: // comment
-        total += 7 + 6 * (node.nodeValue?.length ?? 0);
+      case 8: // comment (dropped by C14N; charged conservatively)
+        total += 7 + escapedBytes(node.nodeValue ?? '');
         return;
       case 7: // processing instruction
-        total += 3 + (node.nodeName?.length ?? 0) + 6 * (node.nodeValue?.length ?? 0) + 2;
+        total += 4 + utf8(node.nodeName ?? '') + 1 + utf8(node.nodeValue ?? '');
         return;
       default:
         return;
@@ -93,27 +160,36 @@ export function canonicalSizeUpperBound(root: Element | Document): number {
 
   const visitElement = (element: Element): void => {
     const name = element.nodeName;
-    total += 2 + name.length; // '<' + name
-    let declared = 0;
+    total += 1 + utf8(name) + 1; // '<name>'
+    total += 2 + utf8(name) + 1; // '</name>'
+
+    let defaultNamespace: string | null = null;
+    const prefixes = new Map<string, string>();
+    const ownPrefix = element.prefix ?? '';
+    if (ownPrefix !== '') prefixes.set(ownPrefix, element.namespaceURI ?? '');
+    else defaultNamespace = element.namespaceURI ?? '';
+
     const attributes = element.attributes;
     if (attributes) {
       for (let i = 0; i < attributes.length; i += 1) {
         const attribute = attributes.item(i);
         if (!attribute) continue;
         const attributeName = attribute.nodeName;
-        const valueCost = 6 * (attribute.value?.length ?? 0);
         if (attributeName === 'xmlns' || attributeName.startsWith('xmlns:')) {
-          const cost = 1 + attributeName.length + 3 + valueCost;
-          namespaceStack.push(cost);
-          namespaceSum += cost;
-          declared += 1;
-        } else {
-          total += 1 + attributeName.length + 3 + valueCost;
+          const prefix = attributeName === 'xmlns' ? '' : attributeName.slice('xmlns:'.length);
+          total += declarationCost(prefix, attribute.value ?? '');
+          continue;
+        }
+        total += 1 + utf8(attributeName) + 2 + escapedBytes(attribute.value ?? '') + 1;
+        const attributePrefix = attribute.prefix ?? '';
+        if (attributePrefix !== '' && !prefixes.has(attributePrefix)) {
+          prefixes.set(attributePrefix, attribute.namespaceURI ?? '');
         }
       }
     }
-    total += namespaceSum; // every in-scope namespace may be rendered here
-    total += 1; // '>'
+    if (defaultNamespace !== null) total += declarationCost('', defaultNamespace);
+    for (const [prefix, uri] of prefixes) total += declarationCost(prefix, uri);
+
     const children = element.childNodes;
     if (children) {
       for (let i = 0; i < children.length; i += 1) {
@@ -121,10 +197,9 @@ export function canonicalSizeUpperBound(root: Element | Document): number {
         if (child) visitNode(child);
       }
     }
-    total += 3 + name.length; // '</' + name + '>'
-    for (let i = 0; i < declared; i += 1) namespaceSum -= namespaceStack.pop()!;
   };
 
+  const apex = root.nodeType === 1 ? (root as Element) : (root as Document).documentElement;
   if (root.nodeType === 1) {
     visitElement(root as Element);
   } else {
@@ -132,8 +207,17 @@ export function canonicalSizeUpperBound(root: Element | Document): number {
     if (children) {
       for (let i = 0; i < children.length; i += 1) {
         const child = children.item(i);
-        if (child) visitNode(child);
+        if (child) {
+          total += 1; // document-level newline between top-level nodes
+          visitNode(child);
+        }
       }
+    }
+  }
+  if (apex && inclusivePrefixes && inclusivePrefixes.length > 0) {
+    for (const prefix of inclusivePrefixes) {
+      const uri = inScopeNamespace(apex, prefix);
+      if (uri !== null && uri !== '') total += declarationCost(prefix === '#default' ? '' : prefix, uri);
     }
   }
   return total;
@@ -156,7 +240,7 @@ export function canonicalizeWithin(
   inclusivePrefixes?: readonly string[],
 ): string {
   assertCanonicalBudget(maxBytes);
-  const bound = canonicalSizeUpperBound(node);
+  const bound = canonicalSizeUpperBound(node, inclusivePrefixes);
   if (bound > maxBytes) throw new CanonicalizationLimitExceeded(bound, maxBytes);
   return canonicalize(node, inclusivePrefixes);
 }

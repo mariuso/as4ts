@@ -13,6 +13,7 @@ import { buildMultipartBody } from '../src/multipart.js';
 import { openAs4Message } from '../src/receive/open.js';
 import { multipartHooks } from '../src/receive/multipart.js';
 import { payloadHooks } from '../src/receive/payload-hooks.js';
+import { xmlHooks } from '../src/xml/hooks.js';
 import type { InboundKeyHolder, OpenAs4MessageInput } from '../src/receive/types.js';
 import { createTestPki } from './helpers/pki.js';
 import { testValidator } from './helpers/input.js';
@@ -377,12 +378,46 @@ test('an invalid limit configuration fails open with limits.invalid and no corre
 
 test('a SOAP canonicalisation budget failure fails open before identity binding', async () => {
   await withRequest(async (request) => {
-    const result = await openAs4Message(openInput(request, { limits: { maxCanonicalBytes: 1 } }));
-    assert.equal(result.ok, false);
-    if (!result.ok) {
-      assert.equal(result.stage, 'xml');
-      assert.equal(result.reason, 'xml.too-large');
-      assert.equal(result.answerable, false, 'no trusted correlation before identity binding');
+    let canonicalizations = 0;
+    xmlHooks.onCanonicalize = () => {
+      canonicalizations += 1;
+    };
+    try {
+      const result = await openAs4Message(openInput(request, { limits: { maxCanonicalBytes: 1 } }));
+      assert.equal(result.ok, false);
+      if (!result.ok) {
+        assert.equal(result.stage, 'xml');
+        assert.equal(result.reason, 'xml.too-large');
+        assert.equal(result.answerable, false, 'no trusted correlation before identity binding');
+        assert.equal(result.correlation, undefined);
+      }
+      assert.equal(canonicalizations, 0, 'the canonicaliser must not run over budget');
+    } finally {
+      delete xmlHooks.onCanonicalize;
+    }
+  });
+});
+
+test('an abort during synchronous XML work is honoured at the next checkpoint', async () => {
+  await withRequest(async (request) => {
+    const controller = new AbortController();
+    const directories: string[] = [];
+    multipartHooks.onDirectory = (dir) => directories.push(dir);
+    // The DOM parse is synchronous and cannot be interrupted mid-call; aborting
+    // here only proves the next checkpoint is honoured.
+    xmlHooks.onDomParse = () => controller.abort();
+    try {
+      const result = await openAs4Message(openInput(request, { signal: controller.signal }));
+      assert.equal(result.ok, false, JSON.stringify(result));
+      if (!result.ok) {
+        assert.equal(result.stage, 'transport');
+        assert.equal(result.reason, 'aborted');
+      }
+      assert.ok(directories.length >= 1, 'the parser created a spool directory');
+      assert.equal(existsSync(directories[0]!), false, 'the parser spool was cleaned up after the abort');
+    } finally {
+      delete multipartHooks.onDirectory;
+      delete xmlHooks.onDomParse;
     }
   });
 });

@@ -64,8 +64,8 @@ export type SignatureFailureReason = 'malformed' | 'bad-signature' | 'digest-mis
 export interface VerifySignatureOptions {
   /**
    * Conservative upper bound on any single canonicalisation's output. When
-   * omitted, canonicalisation is unbounded (the receipt/sender path operates on
-   * locally produced documents).
+   * omitted, canonicalisation is unbounded. Receipts come from the remote access
+   * point, so bounding receipt and lookup parsing is tracked separately.
    */
   readonly maxCanonicalBytes?: number;
 }

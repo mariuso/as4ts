@@ -3,7 +3,12 @@ import type { ReceiptEvidence, ReceiptFailureReason, ValidateCertificate } from 
 import { commonNameOf, normalizePem, parseCertificate, sameCertificate } from '../util.js';
 import { elementsByLocalName, firstByLocalName, attrOf, textOf } from '../xml/nodes.js';
 import type { ParsedSignal } from '../xml/signal.js';
-import { verifyWsSecuritySignature, type SignedReference, type VerifiedReference } from '../xml/ws-security.js';
+import {
+  verifyWsSecuritySignature,
+  type SignatureFailureReason,
+  type SignedReference,
+  type VerifiedReference,
+} from '../xml/ws-security.js';
 
 export type { SignedReference } from '../xml/ws-security.js';
 
@@ -33,6 +38,29 @@ export type ReceiptCheck =
 const fail = (reason: ReceiptFailureReason, detail: string): ReceiptCheck => ({ ok: false, reason, detail });
 
 /**
+ * Map a signature failure to a receipt failure reason. Exhaustive: a new
+ * `SignatureFailureReason` fails typecheck here rather than silently producing a
+ * reason outside `ReceiptFailureReason`. Receipts are verified without a
+ * canonicalisation budget, so `too-large` cannot occur today; mapping it to
+ * `receipt.malformed` keeps the union closed.
+ */
+function receiptFailureReason(reason: SignatureFailureReason): ReceiptFailureReason {
+  switch (reason) {
+    case 'malformed':
+    case 'too-large':
+      return 'receipt.malformed';
+    case 'bad-signature':
+      return 'receipt.bad-signature';
+    case 'digest-mismatch':
+      return 'receipt.digest-mismatch';
+    default: {
+      const exhaustive: never = reason;
+      return exhaustive;
+    }
+  }
+}
+
+/**
  * Verify an AS4 receipt fully. The WS-Security signature itself is verified by
  * the direction-neutral {@link verifyWsSecuritySignature}; on top of that this
  * applies the receipt-specific rules. Acceptance requires all of:
@@ -54,7 +82,7 @@ export async function verifyReceipt(input: ReceiptCheckInput): Promise<ReceiptCh
 
   const signature = verifyWsSecuritySignature(signal.document);
   if (!signature.ok) {
-    return fail(`receipt.${signature.reason}` as ReceiptFailureReason, signature.detail);
+    return fail(receiptFailureReason(signature.reason), signature.detail);
   }
 
   // The signature must cover the exact eb:Messaging / SignalMessage we parsed.

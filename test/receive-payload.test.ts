@@ -355,6 +355,21 @@ test('rejects an XML representation larger than maxDomXmlBytes before reading it
   if (!result.ok) assert.equal(result.reason, 'xml.too-large');
 });
 
+test('an XML attachment over the canonicalisation budget fails as an xml limit', async () => {
+  const built = await makeInbound(DOCUMENT, {
+    mediaType: 'application/xml',
+    digest: attachmentDigestBase64('application/xml', DOCUMENT),
+  });
+  const result = await recoverInboundPayload(
+    inputFor(built, { compression: { kind: 'none' }, limits: { ...defaultInboundLimits, maxCanonicalBytes: 1 } }),
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.stage, 'xml');
+    assert.equal(result.reason, 'xml.too-large');
+  }
+});
+
 test('cancellation after materialization is observed (uncompressed and XML)', async () => {
   const binary = Buffer.from('plain binary payload', 'utf8');
   for (const [representation, options] of [
