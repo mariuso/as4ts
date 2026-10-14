@@ -390,10 +390,11 @@ export async function respondAs4Message(input: RespondAs4MessageInput): Promise<
     if (!signed.ok) return signed;
     if (input.signal?.aborted) return refuse('aborted');
 
-    const signal = parseSignal(Buffer.from(signed.xml, 'utf8'));
-    if (!signal || signal.kind !== (input.kind === 'accepted' ? 'receipt' : 'error')) {
+    const parsed = parseSignal(Buffer.from(signed.xml, 'utf8'));
+    if (!parsed.ok || parsed.signal.kind !== (input.kind === 'accepted' ? 'receipt' : 'error')) {
       return refuse('respond.self-check-failed', 'the response signal did not parse as expected');
     }
+    const signal = parsed.signal;
     const expectedRef = input.kind === 'accepted' ? input.receipt.messageId : input.correlation.messageId;
     if (signal.refToMessageId !== expectedRef) {
       return refuse('respond.self-check-failed', 'RefToMessageId does not match');

@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EBMS_NS, SOAP_11_NS, SOAP_ENV_NS } from '../src/constants.js';
-import { extractSoapEnvelope, parseSignal } from '../src/xml/signal.js';
+import { extractSoapEnvelope } from '../src/xml/signal.js';
+import { parseSignalOrNull } from './helpers/signal.js';
 
 /**
  * The signal parser must be strict about SOAP structure: it reads facts only
@@ -25,12 +26,12 @@ const RECEIPT = `<eb:Messaging><eb:SignalMessage>${MESSAGE_INFO}<eb:Receipt/></e
 const ERROR = `<eb:Messaging><eb:SignalMessage>${MESSAGE_INFO}<eb:Error errorCode="EBMS:0001" severity="failure"/></eb:SignalMessage></eb:Messaging>`;
 
 test('accepts a SOAP 1.2 and a SOAP 1.1 receipt', () => {
-  assert.equal(parseSignal(envelope(RECEIPT))?.kind, 'receipt');
-  assert.equal(parseSignal(envelope(RECEIPT, { ns: SOAP_11_NS, prefix: 'SOAP-ENV' }))?.kind, 'receipt');
+  assert.equal(parseSignalOrNull(envelope(RECEIPT))?.kind, 'receipt');
+  assert.equal(parseSignalOrNull(envelope(RECEIPT, { ns: SOAP_11_NS, prefix: 'SOAP-ENV' }))?.kind, 'receipt');
 });
 
 test('rejects an envelope outside a supported SOAP namespace', () => {
-  assert.equal(parseSignal(envelope(RECEIPT, { ns: 'http://example.com/soap' })), null);
+  assert.equal(parseSignalOrNull(envelope(RECEIPT, { ns: 'http://example.com/soap' })), null);
 });
 
 test('rejects a missing Header or Body', () => {
@@ -38,42 +39,42 @@ test('rejects a missing Header or Body', () => {
     `<env:Envelope xmlns:env="${SOAP_ENV_NS}" xmlns:eb="${EBMS_NS}"><env:Header>${RECEIPT}</env:Header></env:Envelope>`,
     'utf8',
   );
-  assert.equal(parseSignal(noBody), null);
+  assert.equal(parseSignalOrNull(noBody), null);
 
   const noHeader = Buffer.from(
     `<env:Envelope xmlns:env="${SOAP_ENV_NS}" xmlns:eb="${EBMS_NS}"><env:Body/></env:Envelope>`,
     'utf8',
   );
-  assert.equal(parseSignal(noHeader), null);
+  assert.equal(parseSignalOrNull(noHeader), null);
 });
 
 test('rejects a Messaging element that is not a direct child of Header', () => {
   const nested = envelope(`<env:Wrapper>${RECEIPT}</env:Wrapper>`);
-  assert.equal(parseSignal(nested), null);
+  assert.equal(parseSignalOrNull(nested), null);
 });
 
 test('rejects a SignalMessage that carries both a Receipt and an Error', () => {
   const mixed = `<eb:Messaging><eb:SignalMessage>${MESSAGE_INFO}<eb:Receipt/><eb:Error errorCode="EBMS:0001" severity="failure"/></eb:SignalMessage></eb:Messaging>`;
-  assert.equal(parseSignal(envelope(mixed)), null);
+  assert.equal(parseSignalOrNull(envelope(mixed)), null);
 });
 
 test('rejects more than one Messaging or SignalMessage', () => {
-  assert.equal(parseSignal(envelope(RECEIPT + ERROR)), null);
+  assert.equal(parseSignalOrNull(envelope(RECEIPT + ERROR)), null);
   const twoSignals = `<eb:Messaging><eb:SignalMessage>${MESSAGE_INFO}<eb:Receipt/></eb:SignalMessage><eb:SignalMessage>${MESSAGE_INFO}<eb:Receipt/></eb:SignalMessage></eb:Messaging>`;
-  assert.equal(parseSignal(envelope(twoSignals)), null);
+  assert.equal(parseSignalOrNull(envelope(twoSignals)), null);
 });
 
 test('keeps the shortDescription attribute and the Description element distinct', () => {
   const attributeOnly = `<eb:Error errorCode="EBMS:0001" severity="failure" shortDescription="attr text"/>`;
   const childOnly = `<eb:Error errorCode="EBMS:0001" severity="failure"><eb:Description>child text</eb:Description></eb:Error>`;
 
-  const withAttribute = parseSignal(
+  const withAttribute = parseSignalOrNull(
     envelope(`<eb:Messaging><eb:SignalMessage>${MESSAGE_INFO}${attributeOnly}</eb:SignalMessage></eb:Messaging>`),
   );
   assert.equal(withAttribute?.errors[0]?.shortDescription, 'attr text');
   assert.equal(withAttribute?.errors[0]?.description, null);
 
-  const withChild = parseSignal(
+  const withChild = parseSignalOrNull(
     envelope(`<eb:Messaging><eb:SignalMessage>${MESSAGE_INFO}${childOnly}</eb:SignalMessage></eb:Messaging>`),
   );
   assert.equal(withChild?.errors[0]?.shortDescription, null);
@@ -86,13 +87,13 @@ test('rejects a document type declaration', () => {
       `<env:Header>${RECEIPT}</env:Header><env:Body/></env:Envelope>`,
     'utf8',
   );
-  assert.equal(parseSignal(withDoctype), null);
+  assert.equal(parseSignalOrNull(withDoctype), null);
 });
 
 test('rejects an element tree beyond the depth budget', () => {
   const deep = '<eb:X>'.repeat(70) + '</eb:X>'.repeat(70);
   const header = `<eb:Messaging><eb:SignalMessage>${MESSAGE_INFO}<eb:Receipt/>${deep}</eb:SignalMessage></eb:Messaging>`;
-  assert.equal(parseSignal(envelope(header)), null);
+  assert.equal(parseSignalOrNull(envelope(header)), null);
 });
 
 test('bounds MIME part count and per-part header size', () => {

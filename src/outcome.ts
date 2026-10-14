@@ -159,6 +159,7 @@ export const DEFAULT_CLASSIFY_TABLE: ClassifyTable = {
     'certificate.unavailable': 'retryable',
     'spool.failed': 'retryable',
     aborted: 'retryable',
+    'limits.invalid': 'fatal',
     'internal.error': 'unknown',
   },
 };

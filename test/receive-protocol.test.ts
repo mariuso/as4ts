@@ -17,7 +17,7 @@ import { verifyReceipt } from '../src/receipt/verify.js';
 import { canonicalizeDigest } from '../src/xml/c14n.js';
 import { elementsByLocalName, firstByLocalName, parseXml, serializeXml } from '../src/xml/nodes.js';
 import { signSignedInfo } from '../src/xml/security.js';
-import { parseSignal } from '../src/xml/signal.js';
+import { parseSignalOrThrow } from './helpers/signal.js';
 import { createTestPki } from './helpers/pki.js';
 import { testValidator } from './helpers/input.js';
 
@@ -221,7 +221,7 @@ test('a real sender -> receiver -> receipt exchange verifies end to end', async 
       });
       assert.equal(receipt.ok, true, JSON.stringify(receipt));
       if (!receipt.ok) return;
-      const signal = parseSignal(Buffer.from(receipt.body));
+      const signal = parseSignalOrThrow(Buffer.from(receipt.body));
       assert.ok(signal, 'the receipt parses');
       const check = await verifyReceipt({
         signal: signal!,

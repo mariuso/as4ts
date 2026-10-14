@@ -3,6 +3,7 @@ import type { ReceiptEvidence, ReceiptFailureReason, ValidateCertificate } from 
 import { commonNameOf, normalizePem, parseCertificate, sameCertificate } from '../util.js';
 import { elementsByLocalName, firstByLocalName, attrOf, textOf } from '../xml/nodes.js';
 import type { ParsedSignal } from '../xml/signal.js';
+import { defaultResponseLimits, type ResponseLimits } from '../response-limits.js';
 import {
   verifyWsSecuritySignature,
   type SignatureFailureReason,
@@ -26,6 +27,11 @@ export interface ReceiptCheckInput {
   readonly signedReferences: readonly (SignedReference | VerifiedReference)[];
   /** Required. Validates the receipt signer before the receipt is accepted. */
   readonly validateCertificate: ValidateCertificate;
+  /**
+   * Bounds for the receipt's canonicalisation. Defaults to `defaultResponseLimits`.
+   * The canonicalisation budget is a total across SignedInfo and every reference.
+   */
+  readonly limits?: ResponseLimits;
   readonly now: () => Date;
   /** Caller abort signal; aborts a revocation check during receipt verification. */
   readonly abort?: AbortSignal;
@@ -40,9 +46,9 @@ const fail = (reason: ReceiptFailureReason, detail: string): ReceiptCheck => ({ 
 /**
  * Map a signature failure to a receipt failure reason. Exhaustive: a new
  * `SignatureFailureReason` fails typecheck here rather than silently producing a
- * reason outside `ReceiptFailureReason`. Receipts are verified without a
- * canonicalisation budget, so `too-large` cannot occur today; mapping it to
- * `receipt.malformed` keeps the union closed.
+ * reason outside `ReceiptFailureReason`. A canonicalisation budget failure
+ * (`too-large`) on an otherwise well-formed receipt is reported as
+ * `receipt.malformed`.
  */
 function receiptFailureReason(reason: SignatureFailureReason): ReceiptFailureReason {
   switch (reason) {
@@ -79,8 +85,11 @@ function receiptFailureReason(reason: SignatureFailureReason): ReceiptFailureRea
  */
 export async function verifyReceipt(input: ReceiptCheckInput): Promise<ReceiptCheck> {
   const signal = input.signal;
+  const limits = input.limits ?? defaultResponseLimits;
 
-  const signature = verifyWsSecuritySignature(signal.document);
+  const signature = verifyWsSecuritySignature(signal.document, {
+    maxTotalCanonicalBytes: limits.maxCanonicalBytes,
+  });
   if (!signature.ok) {
     return fail(receiptFailureReason(signature.reason), signature.detail);
   }

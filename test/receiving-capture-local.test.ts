@@ -16,7 +16,7 @@ import { respondAs4Message } from '../src/receive/respond.js';
 import { verifyReceipt } from '../src/receipt/verify.js';
 import { PACKAGE_VERSION } from '../src/version.js';
 import { parseXml } from '../src/xml/nodes.js';
-import { parseSignal } from '../src/xml/signal.js';
+import { parseSignalOrThrow } from './helpers/signal.js';
 import { verifyWsSecuritySignature } from '../src/xml/ws-security.js';
 import type { CaptureMetadata, CaptureReference } from './helpers/capture.js';
 import { loadCapture, splitPemCertificates, verifyCapture } from './helpers/capture.js';
@@ -160,7 +160,7 @@ async function writeLocalCapture(dir: string, as4MessageId: string): Promise<voi
         if (!receipt.ok) throw new Error('unreachable');
         // Run the sender's verifier before recording that the sender accepted the
         // receipt: the recorded result must reflect a verified receipt.
-        const signal = parseSignal(Buffer.from(receipt.body));
+        const signal = parseSignalOrThrow(Buffer.from(receipt.body));
         assert.ok(signal, 'the generated receipt parses as a signal');
         const check = await verifyReceipt({
           signal: signal!,

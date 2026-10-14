@@ -20,7 +20,8 @@ import { wrapSessionKey } from '../src/crypto/session-key.js';
 import { preparePayload } from '../src/crypto/payload.js';
 import { buildMultipartBody } from '../src/multipart.js';
 import { signerFromKey, peppolProfile } from '../src/index.js';
-import { extractSoapEnvelope, parseSignal } from '../src/xml/signal.js';
+import { extractSoapEnvelope } from '../src/xml/signal.js';
+import { parseSignalOrNull } from './helpers/signal.js';
 import { decodeOid, derOid, parseDer, derSequence, derInteger } from '../src/pki/asn1.js';
 import { canonicalize, materializeInclusiveNamespaces } from '../src/xml/c14n.js';
 import { parseXml, firstByLocalName, textOf, attrOf } from '../src/xml/nodes.js';
@@ -148,14 +149,14 @@ test('signal: parses ebMS error and multipart responses, rejects non-signals', (
       `</eb:SignalMessage></eb:Messaging></env:Header><env:Body/></env:Envelope>`,
     'utf8',
   );
-  const signal = parseSignal(errorXml);
+  const signal = parseSignalOrNull(errorXml);
   assert.equal(signal?.kind, 'error');
   assert.equal(signal?.errors[0]?.code, 'EBMS:0004');
   assert.equal(signal?.errors[0]?.shortDescription, 'short text');
   assert.equal(signal?.errors[0]?.description, 'not serviced');
 
-  assert.equal(parseSignal(Buffer.from('<html>not soap</html>')), null);
-  assert.equal(parseSignal(Buffer.from('x')), null);
+  assert.equal(parseSignalOrNull(Buffer.from('<html>not soap</html>')), null);
+  assert.equal(parseSignalOrNull(Buffer.from('x')), null);
   assert.equal(extractSoapEnvelope(undefined, Buffer.alloc(0)), null);
 });
 
@@ -170,7 +171,7 @@ test('signal: extracts a SOAP envelope from a multipart/related response', () =>
   );
   const extracted = extractSoapEnvelope(`multipart/related; type="application/soap+xml"; boundary="${boundary}"`, body);
   assert.ok(extracted);
-  const signal = parseSignal(extracted!);
+  const signal = parseSignalOrNull(extracted!);
   assert.equal(signal?.kind, 'receipt');
   assert.equal(signal?.messageId, 'r@x');
 });

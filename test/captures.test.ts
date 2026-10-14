@@ -7,7 +7,8 @@ import { createCertificateValidator, defaultRevocationPolicy } from '../src/cert
 import { DS_NS, EBBP_SIGNALS_NS, WSSE_NS } from '../src/constants.js';
 import { verifyReceipt } from '../src/receipt/verify.js';
 import { elementsByLocalName, firstByLocalName, textOf } from '../src/xml/nodes.js';
-import { parseSignal, type ParsedSignal } from '../src/xml/signal.js';
+import { type ParsedSignal } from '../src/xml/signal.js';
+import { parseSignalOrThrow } from './helpers/signal.js';
 import { normalizePem } from '../src/util.js';
 
 /**
@@ -53,7 +54,7 @@ assert.ok(captures.length > 0, 'no golden captures committed');
 
 for (const file of captures) {
   test(`verifies the captured receipt ${file}`, async () => {
-    const signal = parseSignal(readFileSync(join(fixtures, file)));
+    const signal = parseSignalOrThrow(readFileSync(join(fixtures, file)));
     assert.ok(signal, `${file}: could not parse a signal`);
     assert.equal(signal.kind, 'receipt', `${file}: not a receipt`);
     assert.ok(signal.timestamp, `${file}: receipt has no timestamp`);

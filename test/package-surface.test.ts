@@ -19,6 +19,7 @@ const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
 test('the sender entry point exports a stable surface', async () => {
   const module = await import('../src/index.js');
   assert.deepEqual(Object.keys(module).sort(), [
+    'defaultResponseLimits',
     'loadPreparedMessage',
     'peppolProfile',
     'prepareAs4',

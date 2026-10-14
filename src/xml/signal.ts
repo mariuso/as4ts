@@ -1,11 +1,11 @@
 import { EBMS_NS, SOAP_11_NS, SOAP_ENV_NS, WSU_NS } from '../constants.js';
-import { attrOf, firstByLocalName, parseXml, textOf } from './nodes.js';
+import { defaultResponseLimits, type ResponseLimits } from '../response-limits.js';
+import { attrOf, firstByLocalName, textOf } from './nodes.js';
+import { XmlFault, parseStrictXml, type XmlFaultReason } from './strict.js';
 
-/** Bounds applied to a response before it is trusted. */
+/** Bounds applied to the MIME wrapper before the SOAP part is parsed. */
 const MAX_MIME_PARTS = 32;
 const MAX_MIME_HEADER_BYTES = 16 * 1024;
-const MAX_SIGNAL_ELEMENTS = 20_000;
-const MAX_SIGNAL_DEPTH = 64;
 
 export interface ParsedEbmsError {
   readonly code: string;
@@ -36,6 +36,17 @@ export interface ParsedSignal {
   readonly timestamp: string | null;
   readonly errors: readonly ParsedEbmsError[];
 }
+
+/**
+ * Why a response could not be read as a signal. `signal.shape` is the "valid XML
+ * but not a single unambiguous signal" case; the rest are strict-parser reasons
+ * (`xml.malformed`, `xml.doctype`, `xml.too-large`, ...). The value is
+ * secret-free and never echoes response content.
+ */
+export type ParseSignalReason = XmlFaultReason | 'signal.shape';
+
+export type ParseSignalResult =
+  { readonly ok: true; readonly signal: ParsedSignal } | { readonly ok: false; readonly reason: ParseSignalReason };
 
 /** Choose the SOAP envelope out of a `multipart/related` or plain response. */
 export function extractSoapEnvelope(contentType: string | undefined, body: Buffer): Buffer | null {
@@ -90,40 +101,50 @@ function extractFromMultipart(contentType: string, body: Buffer): Buffer | null 
 }
 
 /**
- * Parse a received signal message. This is pure parsing; it makes no trust
- * decision — but it is strict about shape, because a response with more than one
- * eb:Messaging or SignalMessage is exactly the shape a forged-receipt attack
- * takes, and reading facts from elements outside the expected structure is how
- * such an attack succeeds. The envelope must be SOAP 1.1 or 1.2 with exactly one
- * Header and Body; Messaging must be a direct child of Header; SignalMessage or
- * UserMessage a direct child of Messaging. A response that is not a single,
- * unambiguous signal returns null.
+ * Parse a received signal message under the shared strict parser. This is pure
+ * parsing; it makes no trust decision — but it is strict about both bytes and
+ * shape, because a response with more than one eb:Messaging or SignalMessage is
+ * exactly the shape a forged-receipt attack takes, and reading facts from
+ * elements outside the expected structure is how such an attack succeeds.
+ *
+ * The bytes are validated (encoding, DOCTYPE, size, depth, nodes, attributes,
+ * tokens) *before* any DOM is built: a malformed, encoding-mismatched,
+ * DOCTYPE-bearing or over-limit response is never repaired. The envelope must be
+ * SOAP 1.1 or 1.2 with exactly one Header and Body; Messaging must be a direct
+ * child of Header; SignalMessage or UserMessage a direct child of Messaging.
  */
-export function parseSignal(envelopeBytes: Buffer): ParsedSignal | null {
-  if (hasDoctype(envelopeBytes)) return null;
+export function parseSignal(envelopeBytes: Buffer, limits: ResponseLimits = defaultResponseLimits): ParseSignalResult {
   let document: Document;
   try {
-    document = parseXml(envelopeBytes);
-  } catch {
-    return null;
+    document = parseStrictXml(envelopeBytes, {
+      maxBytes: limits.maxXmlBytes,
+      maxDepth: limits.maxDepth,
+      maxNodes: limits.maxNodes,
+      maxAttributes: limits.maxAttributes,
+      maxTokenBytes: limits.maxTokenBytes,
+    });
+  } catch (error) {
+    if (error instanceof XmlFault) return { ok: false, reason: error.reason };
+    throw error;
   }
+
+  const shape: ParseSignalResult = { ok: false, reason: 'signal.shape' };
   const envelope = document.documentElement;
-  if (!envelope || envelope.localName !== 'Envelope') return null;
-  if (!withinBudget(envelope)) return null;
+  if (!envelope || envelope.localName !== 'Envelope') return shape;
   const soapNs = envelope.namespaceURI;
-  if (!soapNs || !SUPPORTED_SOAP_NAMESPACES.has(soapNs)) return null;
+  if (!soapNs || !SUPPORTED_SOAP_NAMESPACES.has(soapNs)) return shape;
 
   const headers = directChildren(envelope, soapNs, 'Header');
   const bodies = directChildren(envelope, soapNs, 'Body');
-  if (headers.length !== 1 || bodies.length !== 1) return null;
+  if (headers.length !== 1 || bodies.length !== 1) return shape;
 
   const messagingElements = directChildren(headers[0]!, EBMS_NS, 'Messaging');
-  if (messagingElements.length !== 1) return null;
+  if (messagingElements.length !== 1) return shape;
   const messagingElement = messagingElements[0]!;
 
   const signalMessages = directChildren(messagingElement, EBMS_NS, 'SignalMessage');
   const userMessages = directChildren(messagingElement, EBMS_NS, 'UserMessage');
-  if (signalMessages.length + userMessages.length !== 1) return null;
+  if (signalMessages.length + userMessages.length !== 1) return shape;
   const signalMessage = signalMessages[0] ?? null;
   const userMessage = userMessages[0] ?? null;
   const signalElement: Element = signalMessage ?? userMessage!;
@@ -132,8 +153,8 @@ export function parseSignal(envelopeBytes: Buffer): ParsedSignal | null {
   const receipts = directChildren(signalElement, EBMS_NS, 'Receipt');
   // A SignalMessage carries either a single Receipt or one or more Errors, never
   // both and never more than one Receipt.
-  if (receipts.length > 1) return null;
-  if (receipts.length === 1 && errorElements.length > 0) return null;
+  if (receipts.length > 1) return shape;
+  if (receipts.length === 1 && errorElements.length > 0) return shape;
 
   const messageInfo = directChildren(signalElement, EBMS_NS, 'MessageInfo')[0] ?? null;
   const errors: ParsedEbmsError[] = errorElements.map((e) => ({
@@ -152,18 +173,21 @@ export function parseSignal(envelopeBytes: Buffer): ParsedSignal | null {
   else kind = 'unrecognized';
 
   return {
-    kind,
-    raw: envelopeBytes,
-    document,
-    signalElement,
-    messagingElement,
-    messagingId:
-      attrOf(messagingElement, 'Id', WSU_NS) ?? attrOf(messagingElement, 'Id') ?? attrOf(messagingElement, 'id'),
-    signalId: attrOf(signalElement, 'Id') ?? attrOf(signalElement, 'id'),
-    messageId: textOf(firstByLocalName(messageInfo, EBMS_NS, 'MessageId')),
-    refToMessageId: textOf(firstByLocalName(messageInfo, EBMS_NS, 'RefToMessageId')),
-    timestamp: textOf(firstByLocalName(messageInfo, EBMS_NS, 'Timestamp')),
-    errors,
+    ok: true,
+    signal: {
+      kind,
+      raw: envelopeBytes,
+      document,
+      signalElement,
+      messagingElement,
+      messagingId:
+        attrOf(messagingElement, 'Id', WSU_NS) ?? attrOf(messagingElement, 'Id') ?? attrOf(messagingElement, 'id'),
+      signalId: attrOf(signalElement, 'Id') ?? attrOf(signalElement, 'id'),
+      messageId: textOf(firstByLocalName(messageInfo, EBMS_NS, 'MessageId')),
+      refToMessageId: textOf(firstByLocalName(messageInfo, EBMS_NS, 'RefToMessageId')),
+      timestamp: textOf(firstByLocalName(messageInfo, EBMS_NS, 'Timestamp')),
+      errors,
+    },
   };
 }
 
@@ -181,26 +205,4 @@ function directChildren(node: Node, ns: string, localName: string): Element[] {
     if (element.namespaceURI === ns && element.localName === localName) out.push(element);
   }
   return out;
-}
-
-/** An XML document type declaration is rejected: it only enables entity tricks. */
-function hasDoctype(bytes: Buffer): boolean {
-  return bytes.indexOf('<!DOCTYPE') !== -1 || bytes.indexOf('<!doctype') !== -1;
-}
-
-/** A structural budget, so a hostile response cannot force unbounded DOM work. */
-function withinBudget(root: Element): boolean {
-  let elements = 0;
-  const stack: Array<{ node: Node; depth: number }> = [{ node: root, depth: 1 }];
-  while (stack.length > 0) {
-    const current = stack.pop()!;
-    elements += 1;
-    if (elements > MAX_SIGNAL_ELEMENTS || current.depth > MAX_SIGNAL_DEPTH) return false;
-    const children = current.node.childNodes;
-    for (let i = 0; i < children.length; i += 1) {
-      const child = children.item(i);
-      if (child && child.nodeType === 1) stack.push({ node: child, depth: current.depth + 1 });
-    }
-  }
-  return true;
 }

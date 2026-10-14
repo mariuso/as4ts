@@ -13,8 +13,6 @@ import { normalizePem, parseCertificate, safeMessage } from '../util.js';
 import {
   CanonicalizationLimitExceeded,
   canonicalize,
-  canonicalizeDigest,
-  canonicalizeDigestWithin,
   canonicalizeWithin,
   materializeInclusiveNamespaces,
 } from './c14n.js';
@@ -60,14 +58,49 @@ export interface VerifiedSignature {
 
 export type SignatureFailureReason = 'malformed' | 'bad-signature' | 'digest-mismatch' | 'too-large';
 
-/** Options for verification. `maxCanonicalBytes` bounds canonicalisation expansion. */
+/** Options for verification. */
 export interface VerifySignatureOptions {
   /**
    * Conservative upper bound on any single canonicalisation's output. When
-   * omitted, canonicalisation is unbounded. Receipts come from the remote access
-   * point, so bounding receipt and lookup parsing is tracked separately.
+   * omitted, a single canonicalisation is unbounded.
    */
   readonly maxCanonicalBytes?: number;
+  /**
+   * Shared budget across SignedInfo and every reference in one verification. A
+   * receipt may declare up to 64 references, so a per-call bound alone would
+   * allow 64× the intended work. When set, each canonicalisation is limited to
+   * `min(maxCanonicalBytes, remaining)` before it runs, and its actual UTF-8 byte
+   * length is deducted afterwards.
+   */
+  readonly maxTotalCanonicalBytes?: number;
+}
+
+/** Mutable remaining budget shared across the canonicalisations of one verification. */
+interface CanonicalBudget {
+  remaining: number;
+}
+
+/**
+ * Canonicalise one node under the per-call bound and/or the shared total budget.
+ * The bound is checked before the canonicaliser runs, so an over-budget node is
+ * never allocated.
+ */
+function canonicalizeNode(
+  node: Element,
+  inclusivePrefixes: readonly string[],
+  maxCanonicalBytes: number | undefined,
+  budget: CanonicalBudget | undefined,
+): string {
+  if (budget) {
+    const limit = Math.min(maxCanonicalBytes ?? Number.MAX_SAFE_INTEGER, budget.remaining);
+    const canonical = canonicalizeWithin(node, limit, inclusivePrefixes.length ? inclusivePrefixes : undefined);
+    budget.remaining -= Buffer.byteLength(canonical, 'utf8');
+    return canonical;
+  }
+  if (maxCanonicalBytes === undefined) {
+    return inclusivePrefixes.length ? canonicalize(node, inclusivePrefixes) : canonicalize(node);
+  }
+  return canonicalizeWithin(node, maxCanonicalBytes, inclusivePrefixes.length ? inclusivePrefixes : undefined);
 }
 
 export interface SignatureVerificationFailure {
@@ -106,6 +139,8 @@ export type SignatureVerification =
  */
 export function verifyWsSecuritySignature(doc: Document, options: VerifySignatureOptions = {}): SignatureVerification {
   const maxCanonicalBytes = options.maxCanonicalBytes;
+  const budget: CanonicalBudget | undefined =
+    options.maxTotalCanonicalBytes === undefined ? undefined : { remaining: options.maxTotalCanonicalBytes };
   try {
     const selected = selectSignature(doc);
     if (!selected.ok) return selected;
@@ -129,12 +164,7 @@ export function verifyWsSecuritySignature(doc: Document, options: VerifySignatur
 
     const inclusivePrefixes = inclusivePrefixList(c14nMethod);
     materializeInclusiveNamespaces(signedInfo, inclusivePrefixes);
-    const canonicalSignedInfo =
-      maxCanonicalBytes === undefined
-        ? inclusivePrefixes.length
-          ? canonicalize(signedInfo, inclusivePrefixes)
-          : canonicalize(signedInfo)
-        : canonicalizeWithin(signedInfo, maxCanonicalBytes, inclusivePrefixes.length ? inclusivePrefixes : undefined);
+    const canonicalSignedInfo = canonicalizeNode(signedInfo, inclusivePrefixes, maxCanonicalBytes, budget);
 
     const signatureValue = textOf(firstByLocalName(signature, DS_NS, 'SignatureValue'));
     if (!signatureValue) return fail('malformed', 'no SignatureValue');
@@ -147,7 +177,7 @@ export function verifyWsSecuritySignature(doc: Document, options: VerifySignatur
     );
     if (!signatureOk) return fail('bad-signature', 'SignatureValue does not verify over SignedInfo');
 
-    const references = verifyReferences(doc, signedInfo, maxCanonicalBytes);
+    const references = verifyReferences(doc, signedInfo, maxCanonicalBytes, budget);
     if (!references.ok) return references;
     if (references.coveredElements.length === 0) {
       return fail('malformed', 'no verifiable in-envelope references');
@@ -215,7 +245,12 @@ type ReferencesVerification =
  * references are returned as validated-and-declared; their content is
  * authenticated by the receiving layer after decryption.
  */
-function verifyReferences(doc: Document, signedInfo: Element, maxCanonicalBytes?: number): ReferencesVerification {
+function verifyReferences(
+  doc: Document,
+  signedInfo: Element,
+  maxCanonicalBytes?: number,
+  budget?: CanonicalBudget,
+): ReferencesVerification {
   const references = elementsByLocalName(signedInfo, DS_NS, 'Reference');
   if (references.length === 0) return fail('malformed', 'SignedInfo has no references');
   if (references.length > MAX_REFERENCES) return fail('malformed', 'too many references');
@@ -257,12 +292,8 @@ function verifyReferences(doc: Document, signedInfo: Element, maxCanonicalBytes?
 
     const prefixes = transforms[0].inclusivePrefixes;
     materializeInclusiveNamespaces(resolved.element, prefixes);
-    const actual =
-      maxCanonicalBytes === undefined
-        ? prefixes.length
-          ? createHash('sha256').update(canonicalize(resolved.element, prefixes), 'utf8').digest('base64')
-          : canonicalizeDigest(resolved.element)
-        : canonicalizeDigestWithin(resolved.element, maxCanonicalBytes, prefixes.length ? prefixes : undefined);
+    const canonical = canonicalizeNode(resolved.element, prefixes, maxCanonicalBytes, budget);
+    const actual = createHash('sha256').update(canonical, 'utf8').digest('base64');
     if (actual !== digest) return fail('digest-mismatch', `digest mismatch for ${uri}`);
     declared.push(verified);
     coveredElements.push(resolved.element);

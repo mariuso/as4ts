@@ -17,7 +17,8 @@ import {
   WSU_NS,
 } from '../src/constants.js';
 import { classifyEbmsError, EBMS_ERROR_TABLE } from '../src/outcome.js';
-import { extractSoapEnvelope, parseSignal } from '../src/xml/signal.js';
+import { extractSoapEnvelope } from '../src/xml/signal.js';
+import { parseSignalOrNull } from './helpers/signal.js';
 import { isValidMessageId } from '../src/util.js';
 
 // Expectations extracted from the phase4 / Oxalis-NG crypto test suites
@@ -104,7 +105,7 @@ test('multipart response: quoted boundary, extra part, SOAP 1.1 envelope', () =>
   ]);
   const soap = extractSoapEnvelope(ct, body);
   assert.ok(soap);
-  const signal = parseSignal(soap!);
+  const signal = parseSignalOrNull(soap!);
   assert.equal(signal?.kind, 'receipt');
   assert.equal(signal?.messageId, 'r11@x');
 });
@@ -117,7 +118,7 @@ test('multipart response: base64 transfer encoding', () => {
   const body = multipart(ct, [
     `Content-Type: application/soap+xml\r\nContent-Transfer-Encoding: base64\r\n\r\n${encoded}\r\n`,
   ]);
-  const signal = parseSignal(extractSoapEnvelope(ct, body)!);
+  const signal = parseSignalOrNull(extractSoapEnvelope(ct, body)!);
   assert.equal(signal?.kind, 'receipt');
   assert.equal(signal?.messageId, 'r@x');
 });

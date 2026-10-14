@@ -25,7 +25,7 @@ import type {
   RespondAs4MessageInput,
 } from '../src/receive/types.js';
 import type { Signer } from '../src/types.js';
-import { parseSignal } from '../src/xml/signal.js';
+import { parseSignalOrThrow } from './helpers/signal.js';
 import { createTestPki } from './helpers/pki.js';
 import { testValidator } from './helpers/input.js';
 
@@ -131,7 +131,7 @@ test('builds a signed receipt that the sender verifies', async () => {
     assert.equal(result.status, 200);
     assert.match(result.contentType, /application\/soap\+xml/);
 
-    const signal = parseSignal(Buffer.from(result.body));
+    const signal = parseSignalOrThrow(Buffer.from(result.body));
     assert.ok(signal, 'the response parses as a signal');
     assert.equal(signal.kind, 'receipt');
     assert.equal(signal.refToMessageId, AS4_MESSAGE_ID);
@@ -164,7 +164,7 @@ test('builds a signed Not-serviced error with EBMS:0004 and PEPPOL:NOT_SERVICED'
   });
   assert.equal(result.ok, true, JSON.stringify(result));
   if (!result.ok) return;
-  const signal = parseSignal(Buffer.from(result.body));
+  const signal = parseSignalOrThrow(Buffer.from(result.body));
   assert.ok(signal, 'the response parses as a signal');
   assert.equal(signal.kind, 'error');
   assert.equal(signal.refToMessageId, AS4_MESSAGE_ID);
@@ -198,7 +198,7 @@ test('a serialised receipt context is enough to rebuild the response', async () 
     });
     assert.equal(result.ok, true, JSON.stringify(result));
     if (!result.ok) return;
-    const signal = parseSignal(Buffer.from(result.body));
+    const signal = parseSignalOrThrow(Buffer.from(result.body));
     assert.ok(signal);
     const check = await verifyReceipt({
       signal: signal!,

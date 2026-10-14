@@ -2,6 +2,7 @@ import { prepareAs4Internal } from './prepare.js';
 import { transmitAs4 } from './transmit.js';
 import { createTempWorkspace, type TempWorkspace, type TempWorkspaceOptions } from './temp-file.js';
 import { cleanupQuietly } from './send-common.js';
+import { resolveResponseLimits, validateResponseLimits } from './response-limits.js';
 import { commonNameOf, parseCertificate } from './util.js';
 import type { Entropy } from './entropy.js';
 import type { NotSentReason, SendAs4Input, SendAs4Result } from './types.js';
@@ -40,6 +41,12 @@ export async function sendAs4Internal(
     ...(detail ? { detail } : {}),
   });
 
+  // Validate the response limits before any work: a configuration error must not
+  // create a spool or open a connection.
+  const responseLimits = resolveResponseLimits(input.responseLimits);
+  const invalidLimits = validateResponseLimits(responseLimits);
+  if (invalidLimits !== null) return notSent('limits.invalid', invalidLimits);
+
   const prepared = await prepareAs4Internal(
     {
       payload: input.payload,
@@ -70,6 +77,7 @@ export async function sendAs4Internal(
       message: prepared.message,
       validateCertificate: input.validateCertificate,
       http: input.http,
+      ...(input.responseLimits ? { responseLimits: input.responseLimits } : {}),
       ...(input.signal ? { signal: input.signal } : {}),
       ...(input.onEvent ? { onEvent: input.onEvent } : {}),
       now: input.now,

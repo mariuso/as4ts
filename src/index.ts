@@ -7,6 +7,8 @@ export { signerFromKey } from './signer.js';
 export { peppolProfile } from './profile.js';
 export { transmitAs4 } from './transmit.js';
 export { loadPreparedMessage } from './artifact.js';
+export { defaultResponseLimits } from './response-limits.js';
+export type { ResponseLimits } from './response-limits.js';
 
 export type {
   CertificatePurpose,

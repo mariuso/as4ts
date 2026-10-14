@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ALGO_EXC_C14N, ALGO_SHA256, SWA_TRANSFORM_SIGNATURE } from '../src/constants.js';
 import { defaultRevocationPolicy } from '../src/certificate-validator.js';
-import { parseSignal } from '../src/xml/signal.js';
+import { parseSignalOrNull, parseSignalOrThrow } from './helpers/signal.js';
 import { verifyReceipt, type SignedReference } from '../src/receipt/verify.js';
 import type { VerifiedReference } from '../src/xml/ws-security.js';
 import { createTestPki } from './helpers/pki.js';
@@ -212,7 +212,7 @@ test('rejects a response with a forged unsigned receipt prepended to a genuine o
   assert.ok(forgedMessaging);
   const attacked = genuine.xml.replace('<env:Header>', `<env:Header>${forgedMessaging}`);
   // The ambiguity (two eb:Messaging) is rejected outright, so no trust decision is made.
-  assert.equal(parseSignal(Buffer.from(attacked)), null);
+  assert.equal(parseSignalOrNull(Buffer.from(attacked)), null);
 });
 
 test('rejects a signature that does not cover the signal message we read', async () => {
@@ -226,7 +226,7 @@ test('rejects a response with a duplicate element id', async () => {
   const bst = /<wsse:BinarySecurityToken[\s\S]*?<\/wsse:BinarySecurityToken>/.exec(built.xml)?.[0];
   assert.ok(bst);
   const attacked = built.xml.replace('<wsse:Security>', `<wsse:Security>${bst}`);
-  const signal = parseSignal(Buffer.from(attacked));
+  const signal = parseSignalOrThrow(Buffer.from(attacked));
   assert.ok(signal); // still a single Messaging/SignalMessage...
   const result = await verifyReceipt({
     signal,

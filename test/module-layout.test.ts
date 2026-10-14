@@ -135,3 +135,51 @@ test('the guard allows shared and third-party imports', () => {
   ]);
   assert.deepEqual(violations, []);
 });
+
+/**
+ * The lenient `parseXml` silently repairs malformed input, ignores the declared
+ * encoding and accepts a DOCTYPE, so remote XML must go through the strict
+ * parser. This guard keeps it out of the receipt, signal and lookup paths.
+ */
+const NODES_MODULE = normalizeExtension(relative(src, join(src, 'xml', 'nodes.ts')).replace(/\\/g, '/'));
+
+function findLenientXmlImports(files: readonly SourceFile[]): string[] {
+  const violations: string[] = [];
+  for (const { file, text } of files) {
+    for (const match of text.matchAll(/\bimport\s+(?:type\s+)?\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]/g)) {
+      const names = match[1]!.split(',').map((entry) =>
+        entry
+          .trim()
+          .split(/\s+as\s+/)[0]!
+          .trim(),
+      );
+      if (!names.includes('parseXml')) continue;
+      const specifier = match[2]!;
+      if (!specifier.startsWith('.')) continue;
+      const resolved = normalizeExtension(relative(src, resolve(dirname(file), specifier)).replace(/\\/g, '/'));
+      if (resolved === NODES_MODULE) violations.push(`${relative(here, file)} -> ${specifier}`);
+    }
+  }
+  return violations;
+}
+
+function remoteXmlFiles(): string[] {
+  // `src/lookup` joins this list once its parser is strict (Phase 3).
+  return [...walk(join(src, 'receipt')), join(src, 'xml', 'signal.ts')];
+}
+
+test('receipt and signal paths do not import the lenient parseXml', () => {
+  const violations = findLenientXmlImports(load(remoteXmlFiles()));
+  assert.deepEqual(violations, [], `remote XML must not use parseXml:\n${violations.join('\n')}`);
+});
+
+test('the lenient-XML guard catches a deliberate violation', () => {
+  const fake = join(src, 'lookup', 'fake.ts');
+  assert.deepEqual(findLenientXmlImports([{ file: fake, text: `import { parseXml } from '../xml/nodes.js';` }]), [
+    `${relative(here, fake)} -> ../xml/nodes.js`,
+  ]);
+  assert.deepEqual(
+    findLenientXmlImports([{ file: fake, text: `import { firstByLocalName } from '../xml/nodes.js';` }]),
+    [],
+  );
+});

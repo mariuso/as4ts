@@ -13,7 +13,8 @@ import {
 } from '../../src/constants.js';
 import { canonicalize, canonicalizeDigest } from '../../src/xml/c14n.js';
 import { parseXml, serializeXml } from '../../src/xml/nodes.js';
-import { parseSignal, type ParsedSignal } from '../../src/xml/signal.js';
+import { type ParsedSignal } from '../../src/xml/signal.js';
+import { parseSignalOrThrow } from './signal.js';
 import { createSelfSignedCert, type TestCert } from './pki.js';
 
 /**
@@ -209,7 +210,7 @@ export function buildSignedReceipt(options: ReceiptBuildOptions): { xml: string;
 
   const xml = `<?xml version="1.0" encoding="UTF-8"?>${serializeXml(envelope)}`;
   const raw = Buffer.from(xml, 'utf8');
-  const signal = parseSignal(raw);
+  const signal = parseSignalOrThrow(raw);
   if (!signal) throw new Error('failed to parse generated receipt');
   return { xml, raw, signal };
 }

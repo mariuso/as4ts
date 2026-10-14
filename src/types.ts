@@ -1,4 +1,5 @@
 import type { Readable } from 'node:stream';
+import type { ResponseLimits } from './response-limits.js';
 import type { SignedReference } from './xml/ws-security.js';
 
 /** A participant identifier: a scheme and a value, e.g. iso6523-actorid-upis / 0192:123456789. */
@@ -157,6 +158,11 @@ export interface HttpOptions {
   readonly http: HttpOptions;
   /** Spool directory for the encrypted payload. Defaults to the OS temp directory. */
   readonly spoolDirectory?: string;
+  /**
+   * Limits for parsing a receipt or error signal returned by the receiver. Any
+   * omitted property falls back to `defaultResponseLimits`.
+   */
+  readonly responseLimits?: Partial<ResponseLimits>;
   /** Observe phase timings. Never receives payload bytes, keys or certificates. */
   readonly onEvent?: OnEvent;
   /** Deterministic clock. */
@@ -212,6 +218,7 @@ export type NotSentReason =
   | 'certificate.unavailable'
   | 'spool.failed'
   | 'aborted'
+  | 'limits.invalid'
   | 'internal.error';
 
 interface ResultBase {
@@ -263,6 +270,12 @@ export interface NoSignalResult extends ResultBase {
   readonly outcome: 'no-signal';
   readonly status: number;
   readonly bodyEmpty: boolean;
+  /**
+   * Why the response was not a readable signal, when it contained a SOAP part:
+   * a strict-parser reason (`xml.too-large`, `xml.doctype`, ...) or `signal.shape`.
+   * Secret-free; never echoes response content.
+   */
+  readonly detail?: string;
 }
 
 export interface TransportFailureResult extends ResultBase {
@@ -364,5 +377,10 @@ export interface TransmitAs4Input {
   readonly http: HttpOptions;
   readonly signal?: AbortSignal;
   readonly onEvent?: OnEvent;
+  /**
+   * Limits for parsing a receipt or error signal. Any omitted property falls
+   * back to `defaultResponseLimits`.
+   */
+  readonly responseLimits?: Partial<ResponseLimits>;
   readonly now: () => Date;
 }

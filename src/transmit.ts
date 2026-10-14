@@ -2,6 +2,7 @@ import { buildMultipartBody } from './multipart.js';
 import { sendHttp } from './http/send.js';
 import { extractSoapEnvelope, parseSignal, type ParsedSignal } from './xml/signal.js';
 import { verifyReceipt } from './receipt/verify.js';
+import { resolveResponseLimits, validateResponseLimits, type ResponseLimits } from './response-limits.js';
 import { TransportError } from './errors.js';
 import { attachmentPathOf } from './artifact.js';
 import { safeMessage } from './util.js';
@@ -47,6 +48,12 @@ export async function transmitAs4(input: TransmitAs4Input): Promise<SendAs4Resul
 
   if (abort?.aborted) return notSent('aborted');
 
+  // Resolve and validate the response limits before any HTTP, so a bad override
+  // costs nothing but still reports a configuration error.
+  const responseLimits = resolveResponseLimits(input.responseLimits);
+  const invalidLimits = validateResponseLimits(responseLimits);
+  if (invalidLimits !== null) return notSent('limits.invalid', invalidLimits);
+
   try {
     const multipart = buildMultipartBody({
       soapXml: message.soapXml,
@@ -68,7 +75,7 @@ export async function transmitAs4(input: TransmitAs4Input): Promise<SendAs4Resul
       }),
     );
 
-    return await classifyResponse({ input, base, response, message, abort, onEvent });
+    return await classifyResponse({ input, base, response, message, abort, onEvent, limits: responseLimits });
   } catch (err) {
     if (err instanceof TransportError) {
       return {
@@ -91,6 +98,7 @@ interface ClassifyArgs {
   readonly message: PreparedMessage;
   readonly abort: AbortSignal | undefined;
   readonly onEvent: OnEvent | undefined;
+  readonly limits: ResponseLimits;
 }
 
 async function classifyResponse(args: ClassifyArgs): Promise<SendAs4Result> {
@@ -98,8 +106,9 @@ async function classifyResponse(args: ClassifyArgs): Promise<SendAs4Result> {
   const soap = extractSoapEnvelope(response.headers['content-type'], response.body);
 
   if (soap) {
-    const signal = parseSignal(soap);
-    if (signal) {
+    const parsed = parseSignal(soap, args.limits);
+    if (parsed.ok) {
+      const signal = parsed.signal;
       if (signal.kind === 'error') {
         const refToMessageId = signal.refToMessageId;
         const correlation: ErrorCorrelation =
@@ -116,6 +125,16 @@ async function classifyResponse(args: ClassifyArgs): Promise<SendAs4Result> {
       if (signal.kind === 'receipt') {
         return verifyReceiptResult(args, signal);
       }
+    } else {
+      // A response that could not be read strictly is a no-signal, with the
+      // strict, secret-free reason (e.g. `xml.too-large`, `xml.doctype`).
+      return {
+        ...args.base(),
+        outcome: 'no-signal',
+        status: response.status,
+        bodyEmpty: response.body.length === 0,
+        detail: parsed.reason,
+      };
     }
   }
 
@@ -138,6 +157,7 @@ async function verifyReceiptResult(args: ClassifyArgs, signal: ParsedSignal): Pr
         // The original signed references, not a rebuild.
         signedReferences: message.signedReferences,
         validateCertificate: input.validateCertificate,
+        limits: args.limits,
         now: input.now,
         ...(abort ? { abort } : {}),
       }),

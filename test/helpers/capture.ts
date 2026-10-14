@@ -11,7 +11,7 @@ import { defaultInboundLimits } from '../../src/receive/types.js';
 import type { InboundLimits, OpenSuccess } from '../../src/receive/types.js';
 import { verifyReceipt } from '../../src/receipt/verify.js';
 import type { ScopedId, ValidateCertificate } from '../../src/types.js';
-import { parseSignal } from '../../src/xml/signal.js';
+import { parseSignalOrThrow } from './signal.js';
 
 /**
  * Load and verify a recorded inbound capture through the real receiving path
@@ -427,7 +427,7 @@ async function assertFacts(
   if (metadata.senderAcceptance.accepted) {
     assert.ok(capture.acceptanceResponse, `${name}: an accepted exchange must record the accepted response bytes`);
     const response = capture.acceptanceResponse ?? Buffer.alloc(0);
-    const signal = parseSignal(response);
+    const signal = parseSignalOrThrow(response);
     assert.ok(signal, `${name}: the recorded response must be an AS4 signal`);
     if (signal) {
       const check = await verifyReceipt({
