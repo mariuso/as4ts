@@ -286,7 +286,9 @@ test('spool open, write and delayed close failures are all payload.spool-failed'
             callback();
           },
         });
-        process.nextTick(() => writer.destroy(Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })));
+        process.nextTick(() =>
+          writer.destroy(Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })),
+        );
         return writer;
       };
       const openFailure = await openAs4Message(openInput(request));

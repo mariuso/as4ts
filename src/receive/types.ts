@@ -286,7 +286,8 @@ export interface OpenSuccess {
  * The parser's own reason is preserved so byte, node and depth exhaustion stay
  * distinguishable.
  */
-export type SbdhResourceLimit = 'xml.too-large' | 'xml.too-many-nodes' | 'xml.too-deep';
+export type SbdhResourceLimit =
+  'xml.too-large' | 'xml.too-many-nodes' | 'xml.too-deep' | 'xml.too-many-attributes' | 'xml.token-too-large';
 
 /**
  * The outcome of the SBDH consistency check. Consistency is reported as distinct

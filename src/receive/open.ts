@@ -14,7 +14,8 @@ import {
 } from './multipart.js';
 import { recoverInboundPayload } from './payload.js';
 import { payloadHooks } from './payload-hooks.js';
-import { checkSbdh, documentTypeFromAction } from './sbdh.js';
+import { documentTypeFromAction } from './sbdh.js';
+import { checkSbdhStream, defaultSbdhStreamLimits } from './sbdh-stream.js';
 import { abortableStream, isAbortError } from './streams.js';
 import { AddressingFault, isSupportedCompression, readUserMessage } from './user-message.js';
 import { defaultXmlLimits, parseStrictXml, XmlFault } from './xml.js';
@@ -29,7 +30,6 @@ import type {
   OnInboundEvent,
   OpenAs4MessageInput,
   OpenResult,
-  PayloadHandle,
   ReceiptContext,
   SbdhConsistency,
 } from './types.js';
@@ -143,23 +143,6 @@ async function readPart(part: MultipartPart, signal: AbortSignal | undefined): P
   const chunks: Buffer[] = [];
   for await (const chunk of abortableStream(part.read(), signal)) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks);
-}
-
-/** Read a payload up to `maxBytes`, cancelling on the signal and detecting overflow. */
-async function readPayload(
-  handle: PayloadHandle,
-  maxBytes: number,
-  signal: AbortSignal | undefined,
-): Promise<{ bytes: Buffer; tooLarge: boolean }> {
-  payloadHooks.onReadPayload?.();
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of abortableStream(handle.read(), signal)) {
-    total += chunk.byteLength;
-    if (total > maxBytes) return { bytes: Buffer.alloc(0), tooLarge: true };
-    chunks.push(Buffer.from(chunk));
-  }
-  return { bytes: Buffer.concat(chunks), tooLarge: false };
 }
 
 export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenResult> {
@@ -313,19 +296,18 @@ export async function openAs4Message(input: OpenAs4MessageInput): Promise<OpenRe
     // From here the recovered bundle is owned: any later failure must dispose it.
     let sbdh: SbdhConsistency;
     try {
-      const payload = await readPayload(recovered.payload, limits.maxXmlBytes, abort);
-      sbdh = payload.tooLarge
-        ? { status: 'resource-limit', reason: 'xml.too-large' }
-        : checkSbdh(
-            payload.bytes,
-            { ...defaultXmlLimits, maxBytes: limits.maxXmlBytes },
-            {
-              originalSender: headers.originalSender,
-              finalRecipient: headers.finalRecipient,
-              process: headers.service,
-              documentType: documentTypeFromAction(headers.action),
-            },
-          );
+      payloadHooks.onReadPayload?.();
+      sbdh = await checkSbdhStream(
+        recovered.payload.read(),
+        { ...defaultSbdhStreamLimits, documentBytes: limits.maxXmlBytes },
+        {
+          originalSender: headers.originalSender,
+          finalRecipient: headers.finalRecipient,
+          process: headers.service,
+          documentType: documentTypeFromAction(headers.action),
+        },
+        abort,
+      );
     } catch (err) {
       await recovered.dispose();
       if (isAbortError(err)) return fail('transport', 'aborted', 'aborted while reading the payload');

@@ -201,10 +201,10 @@ test('reports a missing or malformed SBDH distinctly', async () => {
   });
 });
 
-test('reports SBDH resource exhaustion as a resource limit, not malformed XML', async () => {
-  // A well-formed, SBDH-wrapped document with more nodes than the default
-  // inspection budget allows. The message is accepted; only the SBDH fact is a
-  // resource limit, and it must not be reported as a malformed business document.
+test('a large valid invoice with many elements is consistent (no global node budget)', async () => {
+  // Many business elements (well beyond the old global 100k node budget) but a
+  // small SBDH header: the streaming inspection retains only the header, so the
+  // document is consistent rather than a resource limit.
   const extra = '<i>x</i>'.repeat(60_000);
   const document = Buffer.from(
     sbdhDocument(SENDER.value)
@@ -217,7 +217,7 @@ test('reports SBDH resource exhaustion as a resource limit, not malformed XML', 
     assert.equal(result.ok, true, JSON.stringify(result));
     if (!result.ok) return;
     try {
-      assert.deepEqual(result.sbdh, { status: 'resource-limit', reason: 'xml.too-many-nodes' });
+      assert.deepEqual(result.sbdh, { status: 'consistent' });
     } finally {
       await result.dispose();
     }

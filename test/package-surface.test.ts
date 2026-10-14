@@ -94,10 +94,11 @@ test('package metadata points at the GitHub repository', () => {
   assert.match(pkg.homepage ?? '', /github\.com\/mariuso\/as4ts/);
 });
 
-test('runtime dependencies stay at two caret ranges whose floor is the pinned version', () => {
+test('runtime dependencies stay at three caret ranges whose floor is the pinned version', () => {
   const deps = pkg.dependencies;
-  assert.deepEqual(Object.keys(deps).sort(), ['@xmldom/xmldom', 'xml-crypto']);
+  assert.deepEqual(Object.keys(deps).sort(), ['@xmldom/xmldom', 'saxes', 'xml-crypto']);
   assert.equal(deps['@xmldom/xmldom'], '^0.8.15');
+  assert.equal(deps['saxes'], '^6.0.0');
   assert.equal(deps['xml-crypto'], '^6.3.3');
 });
 
