@@ -5,6 +5,10 @@
  * `signal` aborts, and on every early exit it signals the producer's `return()`
  * **without awaiting it** — an external iterator's cleanup may stall or throw,
  * and neither must be able to hang recovery.
+ *
+ * Each wait for the next chunk is bounded by a per-step `abortableAwait`
+ * listener that is removed as soon as the step settles, so a consumed chunk is
+ * never retained for the life of the stream.
  */
 export function abortError(): Error {
   const error = new Error('aborted');
@@ -47,25 +51,13 @@ export async function* abortableStream(
   signal: AbortSignal | undefined,
 ): AsyncGenerator<Uint8Array> {
   const iterator = source[Symbol.asyncIterator]();
-  let onAbort: (() => void) | null = null;
-  const abortPromise = signal
-    ? new Promise<never>((_resolve, reject) => {
-        const fail = (): void => reject(abortError());
-        if (signal.aborted) fail();
-        else {
-          onAbort = fail;
-          signal.addEventListener('abort', fail, { once: true });
-        }
-      })
-    : null;
   try {
     for (;;) {
-      const result = abortPromise ? await Promise.race([iterator.next(), abortPromise]) : await iterator.next();
+      const result = await abortableAwait(iterator.next(), signal);
       if (result.done) break;
       yield result.value;
     }
   } finally {
-    if (onAbort && signal) signal.removeEventListener('abort', onAbort);
     // Non-blocking on every early-exit path: signal the producer to stop, but do
     // not wait for its cleanup, and guard a synchronous throw.
     let returned: unknown;
