@@ -68,7 +68,7 @@ On success you get verified facts plus owned handles:
 | `representation`                                                             | `RepresentationHandle`: the authenticated compressed/original bytes and their digests                       |
 | `evidence`                                                                   | `EvidenceHandle`: the original envelope bytes, the verified references and the signer cert                  |
 | `receipt`                                                                    | `ReceiptContext`: the plain, serialisable context for step 2                                                |
-| `sbdh`                                                                       | `SbdhConsistency`: `consistent` / `inconsistent` / `missing` / `malformed` / `too-large`                    |
+| `sbdh`                                                                       | `SbdhConsistency`: `consistent` / `inconsistent` / `missing` / `malformed` / `resource-limit`               |
 
 `receipt` is deliberately **serialisable**, so a caller that committed the
 document but crashed before responding can persist it and still build the receipt.
@@ -80,11 +80,11 @@ idempotent. Call it on every path.
 `defaultInboundLimits` bounds the request (`maxRequestBytes`), the envelope XML
 (`maxEnvelopeBytes`), the MIME parts and headers, the decrypted representation
 (`maxRepresentationBytes`), the decompressed output per attachment and in aggregate
-(`maxDecompressedBytes`, `maxAggregateOutputBytes`), the XML handed to the DOM
-parser (`maxXmlBytes`), and the number of decryption credentials tried
-(`maxKeyCandidates`). Limits are applied before any trust decision and validated
-as facts. The full table, what is buffered versus streamed, and the current
-size-envelope limitations are in
+(`maxDecompressedBytes`, `maxAggregateOutputBytes`), the recovered XML read by
+streaming SBDH inspection (`maxXmlBytes`), and the number of decryption credentials
+tried (`maxKeyCandidates`). Limits are applied before any trust decision and
+validated as facts. The full table, what is buffered versus streamed, and the
+current size-envelope limitations are in
 [receiving-limits.md](receiving-limits.md).
 
 ### Key holders and rollover
