@@ -114,6 +114,11 @@ issuer's OCSP responder or CRL, and an answer that cannot be obtained is `unknow
   checked; it is expected to be directly issued by the configured CA and
   short-lived. This is a stated limit, not an authorization bypass.
 
+Answers are cached for up to `maxCacheMs` (default 60 min), bounded by the
+answer's own validity. An `unknown` answer is cached for at most
+`unknownCacheMs` (default 60 s), so an outage doesn't outlast the service's
+recovery by more than that.
+
 ## Limits of this profile
 
 This is a constrained validator, not a general RFC 5280 implementation. It does

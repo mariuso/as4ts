@@ -6,7 +6,7 @@
  * `validateCertificate` function the sender requires. The sender never imports
  * this module.
  */
-import { RevocationCache, type RevocationPolicy } from './pki/revocation.js';
+import { DEFAULT_UNKNOWN_CACHE_MS, RevocationCache, type RevocationPolicy } from './pki/revocation.js';
 import { validateCertificatePem } from './pki/validate.js';
 import type { CertificatePurpose, CertificateValidation, CertificateValidationInput } from './types.js';
 
@@ -78,6 +78,7 @@ export function defaultRevocationPolicy(overrides: Partial<RevocationPolicy> = {
     maxResponseBytes: 1024 * 1024,
     ocspMaxAgeMs: 24 * 60 * 60 * 1000,
     maxCacheMs: 60 * 60 * 1000,
+    unknownCacheMs: DEFAULT_UNKNOWN_CACHE_MS,
     ...overrides,
   };
 }

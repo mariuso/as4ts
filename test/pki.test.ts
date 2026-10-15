@@ -19,7 +19,12 @@ import {
   tlv,
 } from '../src/pki/asn1.js';
 import { parseCertificate } from '../src/util.js';
-import { defaultRevocationPolicy, RevocationCache } from '../src/certificate-validator.js';
+import {
+  createCertificateValidator,
+  defaultRevocationPolicy,
+  RevocationCache,
+  type RevocationPolicy,
+} from '../src/certificate-validator.js';
 import { createTestPki, createDelegatedResponder, type TestCert } from './helpers/pki.js';
 
 const DAY = 24 * 3600 * 1000;
@@ -619,6 +624,199 @@ test('the revocation cache never stores a non-finite expiry', () => {
   const now = new Date();
   cache.set('key', { status: 'good', source: 'crl', reason: 'x', expiresAt: new Date(NaN) }, now, 1000);
   assert.equal(cache.get('key', new Date(now.getTime() + 24 * 3600_000)), null);
+});
+
+/**
+ * A CRL distribution point that can be "down" (HTTP 404, an unreachable
+ * service) or "up" (the CRL). Every fetch through the CRL URL is counted.
+ */
+function togglableCrlServer(
+  crl: Buffer,
+  initiallyUp: boolean,
+): {
+  readonly fetchImpl: typeof fetch;
+  readonly fetches: () => number;
+  readonly setUp: (up: boolean) => void;
+} {
+  let up = initiallyUp;
+  let fetches = 0;
+  const fetchImpl = (async (input: RequestInfo | URL) => {
+    if (!String(input).includes('crl')) return new Response('', { status: 404 });
+    fetches += 1;
+    return up ? new Response(new Uint8Array(crl), { status: 200 }) : new Response('', { status: 404 });
+  }) as unknown as typeof fetch;
+  return {
+    fetchImpl,
+    fetches: () => fetches,
+    setUp: (value) => {
+      up = value;
+    },
+  };
+}
+
+/** Check the test PKI's receiver against a single CRL distribution point. */
+function checkReceiver(
+  pki: ReturnType<typeof createTestPki>,
+  policy: RevocationPolicy,
+  nowMs: () => number,
+  fetchImpl: typeof fetch,
+  cache: RevocationCache,
+) {
+  return checkRevocation(
+    parseCertificate(pki.receiver.certPem),
+    pki.intermediate.cert,
+    {
+      ocsp: [],
+      crl: ['http://crl.example/root.crl'],
+    },
+    {
+      policy,
+      now: () => new Date(nowMs()),
+      fetchImpl,
+      cache,
+    },
+  );
+}
+
+test('caches an unreachable revocation answer for 60 s, not for maxCacheMs', async () => {
+  const pki = createTestPki();
+  const server = togglableCrlServer(pki.makeCrl([]), false);
+  const t0 = new Date().getTime();
+  let nowMs = t0;
+  const policy = defaultRevocationPolicy({ ocsp: false, crl: true, timeoutMs: 2000 });
+  const cache = new RevocationCache();
+
+  const first = await checkReceiver(pki, policy, () => nowMs, server.fetchImpl, cache);
+  assert.equal(first.status, 'unknown', first.reason);
+  assert.equal(server.fetches(), 1);
+
+  nowMs = t0 + 30_000;
+  const cached = await checkReceiver(pki, policy, () => nowMs, server.fetchImpl, cache);
+  assert.equal(cached.status, 'unknown', cached.reason);
+  assert.match(cached.reason, /\(cached\)$/);
+  assert.equal(server.fetches(), 1, 'a 30 s-old unknown answer is served from cache');
+
+  server.setUp(true);
+  nowMs = t0 + 61_000;
+  const recovered = await checkReceiver(pki, policy, () => nowMs, server.fetchImpl, cache);
+  assert.equal(recovered.status, 'good', recovered.reason);
+  assert.equal(server.fetches(), 2, 'the recovered service is tried again after the short lifetime');
+});
+
+test('a good answer is still cached for the full maxCacheMs', async () => {
+  const pki = createTestPki();
+  const server = togglableCrlServer(pki.makeCrl([]), true);
+  const t0 = new Date().getTime();
+  let nowMs = t0;
+  const policy = defaultRevocationPolicy({ ocsp: false, crl: true, timeoutMs: 2000 });
+  const cache = new RevocationCache();
+
+  const first = await checkReceiver(pki, policy, () => nowMs, server.fetchImpl, cache);
+  assert.equal(first.status, 'good', first.reason);
+  assert.equal(server.fetches(), 1);
+
+  nowMs = t0 + 30 * 60_000;
+  const cached = await checkReceiver(pki, policy, () => nowMs, server.fetchImpl, cache);
+  assert.equal(cached.status, 'good', cached.reason);
+  assert.match(cached.reason, /\(cached\)$/);
+  assert.equal(server.fetches(), 1, 'a 30 min-old good answer stays cached');
+});
+
+test('unknownCacheMs: 0 disables caching of an unknown answer', async () => {
+  const pki = createTestPki();
+  const server = togglableCrlServer(pki.makeCrl([]), false);
+  const policy = defaultRevocationPolicy({ ocsp: false, crl: true, timeoutMs: 2000, unknownCacheMs: 0 });
+  const cache = new RevocationCache();
+
+  const first = await checkReceiver(pki, policy, () => new Date().getTime(), server.fetchImpl, cache);
+  const second = await checkReceiver(pki, policy, () => new Date().getTime(), server.fetchImpl, cache);
+  assert.equal(first.status, 'unknown', first.reason);
+  assert.equal(second.status, 'unknown', second.reason);
+  assert.equal(server.fetches(), 2, 'both unreachable checks fetch');
+});
+
+test('the unknown cache lifetime is capped by maxCacheMs', async () => {
+  const pki = createTestPki();
+  const server = togglableCrlServer(pki.makeCrl([]), false);
+  const t0 = new Date().getTime();
+  let nowMs = t0;
+  const policy = defaultRevocationPolicy({
+    ocsp: false,
+    crl: true,
+    timeoutMs: 2000,
+    unknownCacheMs: 10 * 60_000,
+    maxCacheMs: 5_000,
+  });
+  const cache = new RevocationCache();
+
+  const first = await checkReceiver(pki, policy, () => nowMs, server.fetchImpl, cache);
+  assert.equal(first.status, 'unknown', first.reason);
+  assert.equal(server.fetches(), 1);
+
+  nowMs = t0 + 6_000;
+  const second = await checkReceiver(pki, policy, () => nowMs, server.fetchImpl, cache);
+  assert.equal(second.status, 'unknown', second.reason);
+  assert.equal(server.fetches(), 2, 'the lifetime is capped at maxCacheMs, not unknownCacheMs');
+});
+
+test('a policy literal without unknownCacheMs gets the 60 s default', async () => {
+  assert.equal(defaultRevocationPolicy().unknownCacheMs, 60_000);
+
+  const pki = createTestPki();
+  const server = togglableCrlServer(pki.makeCrl([]), false);
+  const t0 = new Date().getTime();
+  let nowMs = t0;
+  // Built by hand, as a caller that predates the field would: no unknownCacheMs.
+  const policy: RevocationPolicy = {
+    unreachable: 'strict',
+    ocsp: false,
+    crl: true,
+    timeoutMs: 2000,
+    maxCacheMs: 60 * 60_000,
+  };
+  const cache = new RevocationCache();
+
+  const first = await checkReceiver(pki, policy, () => nowMs, server.fetchImpl, cache);
+  assert.equal(first.status, 'unknown', first.reason);
+
+  nowMs = t0 + 30_000;
+  const cached = await checkReceiver(pki, policy, () => nowMs, server.fetchImpl, cache);
+  assert.match(cached.reason, /\(cached\)$/);
+  assert.equal(server.fetches(), 1);
+
+  server.setUp(true);
+  nowMs = t0 + 61_000;
+  const recovered = await checkReceiver(pki, policy, () => nowMs, server.fetchImpl, cache);
+  assert.equal(recovered.status, 'good', recovered.reason);
+  assert.equal(server.fetches(), 2);
+});
+
+test('strict validation recovers from an outage once the short lifetime passes', async () => {
+  const pki = createTestPki({ crlUrl: 'http://crl.example/root.crl' });
+  const server = togglableCrlServer(pki.makeCrl([]), false);
+  const t0 = new Date().getTime();
+  const validator = createCertificateValidator({
+    roots: [pki.root.certPem],
+    intermediates: [pki.intermediate.certPem],
+    revocation: defaultRevocationPolicy({ timeoutMs: 2000 }),
+    fetch: server.fetchImpl,
+  });
+
+  const down = await validator.validate({
+    certificatePem: pki.receiver.certPem,
+    purpose: 'message-signer',
+    now: new Date(t0),
+  });
+  assert.equal(down.ok, false);
+  if (!down.ok) assert.equal(down.status, 'unavailable');
+
+  server.setUp(true);
+  const up = await validator.validate({
+    certificatePem: pki.receiver.certPem,
+    purpose: 'message-signer',
+    now: new Date(t0 + 61_000),
+  });
+  assert.equal(up.ok, true, up.ok ? '' : up.reason);
 });
 
 function certIdFromRequest(requestDer: Buffer): Buffer {

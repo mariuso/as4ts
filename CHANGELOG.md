@@ -13,6 +13,8 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bound receipt, error-signal and SMP lookup XML parsing and canonicalisation.
 - The `limits.invalid` not-sent reason (classified `fatal`) and an optional,
   secret-free `detail` on `NoSignalResult`.
+- `RevocationPolicy.unknownCacheMs`, the maximum cache lifetime for an `unknown`
+  revocation answer (default 60 s).
 
 ### Changed
 
@@ -20,6 +22,9 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`parseStrictXml`): malformed, encoding-mismatched or DOCTYPE-bearing responses
   that were previously repaired are now `no-signal` / `unavailable`, and receipt
   and SMP canonicalisation are bounded before they run.
+- An unreachable revocation service is now remembered for 60 s instead of the
+  full `maxCacheMs` (60 min by default), so a recovered service is used again
+  quickly.
 
 ## [0.2.0-rc.1] - 2026-10-13
 

@@ -43,6 +43,17 @@ export interface RevocationPolicy {
   readonly ocspMaxAgeMs?: number;
   /** Maximum cache lifetime for a positive/negative revocation answer, milliseconds. */
   readonly maxCacheMs: number;
+  /**
+   * Maximum cache lifetime for an `unknown` answer (no revocation service could
+   * be reached, or the responder answered "unknown"), milliseconds. Kept short
+   * so a recovered service is used again quickly. `0` disables caching of
+   * `unknown`. Never longer than `maxCacheMs`. Defaults to 60 000.
+   *
+   * A non-positive or non-finite value (such as `0`, a negative number or `NaN`)
+   * also means "not cached": `RevocationCache.set` refuses any entry that would
+   * not outlive `now`, so the safe direction needs no separate validation.
+   */
+  readonly unknownCacheMs?: number;
 }
 
 export interface RevocationEndpoints {
@@ -665,6 +676,9 @@ const DEFAULT_MAX_REVOCATION_RESPONSE_BYTES = 1024 * 1024;
 /** Default maximum age of an OCSP answer that carries no `nextUpdate`. */
 const DEFAULT_OCSP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
+/** Default maximum cache lifetime for an `unknown` revocation answer. */
+export const DEFAULT_UNKNOWN_CACHE_MS = 60_000;
+
 /**
  * Fetch a revocation resource and read at most `maxBytes` of its body while the
  * deadline and caller cancellation stay active. The previous helper cleared its
@@ -769,7 +783,16 @@ export async function checkRevocation(
   };
 
   const answer = await attempt();
-  if (cache) cache.set(cacheKey(cert), answer, current, policy.maxCacheMs);
+  if (cache) {
+    // An `unknown` answer means no revocation service could be reached. Cache it
+    // only briefly, so a service that has recovered is used again quickly,
+    // instead of the outage being remembered for the full `maxCacheMs`.
+    const maxCacheMs =
+      answer.status === 'unknown'
+        ? Math.min(policy.unknownCacheMs ?? DEFAULT_UNKNOWN_CACHE_MS, policy.maxCacheMs)
+        : policy.maxCacheMs;
+    cache.set(cacheKey(cert), answer, current, maxCacheMs);
+  }
   return answer;
 }
 
