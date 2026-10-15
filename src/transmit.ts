@@ -106,7 +106,20 @@ async function classifyResponse(args: ClassifyArgs): Promise<SendAs4Result> {
   const soap = extractSoapEnvelope(response.headers['content-type'], response.body);
 
   if (soap) {
-    const parsed = parseSignal(soap, args.limits);
+    let parsed: ReturnType<typeof parseSignal>;
+    try {
+      parsed = parseSignal(soap, args.limits);
+    } catch {
+      // The request has definitely been sent, so an unexpected failure reading
+      // its response must not be reported as `not-sent`. It is a no-signal.
+      return {
+        ...args.base(),
+        outcome: 'no-signal',
+        status: response.status,
+        bodyEmpty: response.body.length === 0,
+        detail: 'internal.error',
+      };
+    }
     if (parsed.ok) {
       const signal = parsed.signal;
       if (signal.kind === 'error') {
