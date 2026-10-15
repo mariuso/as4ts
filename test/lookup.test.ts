@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { X509Certificate } from 'node:crypto';
 import { createCertificateValidator, defaultRevocationPolicy } from '../src/certificate-validator.js';
 import { lookupParticipant } from '../src/lookup/index.js';
+import { verifySmpSignature } from '../src/lookup/smp-signature.js';
+import { defaultLookupLimits } from '../src/lookup/limits.js';
+import { parseStrictXml } from '../src/xml/strict.js';
 import { participantDnsName, participantHash } from '../src/lookup/sml.js';
 import type { LookupInput, LookupResult } from '../src/lookup/index.js';
 import type { ParticipantId, ScopedId } from '../src/types.js';
@@ -461,5 +464,44 @@ test('an over-canonical-budget SMP response is signature-invalid without canonic
     assert.equal(canonicalizations, 0, 'the canonicaliser must not run over budget');
   } finally {
     delete xmlHooks.onCanonicalize;
+  }
+});
+
+test('an over-canonical-budget SMP response never clones the document', () => {
+  const document = parseStrictXml(Buffer.from(metadata(), 'utf8'), {
+    maxBytes: defaultLookupLimits.maxMetadataBytes,
+    maxDepth: defaultLookupLimits.maxDepth,
+    maxNodes: defaultLookupLimits.maxMetadataNodes,
+    maxAttributes: defaultLookupLimits.maxAttributes,
+    maxTokenBytes: defaultLookupLimits.maxTokenBytes,
+  });
+  let clones = 0;
+  const original = document.cloneNode.bind(document);
+  (document as unknown as { cloneNode: typeof original }).cloneNode = (...args: Parameters<typeof original>) => {
+    clones += 1;
+    return original(...args);
+  };
+  const result = verifySmpSignature(document, { ...defaultLookupLimits, maxCanonicalBytes: 8 });
+  assert.equal(result.ok, false);
+  assert.equal(clones, 0, 'an over-budget response must not be cloned');
+});
+
+test('lookupParticipant rejects a hostile redirect target with the strict reason', async () => {
+  const result = await lookupParticipant(
+    baseInput({
+      fetch: mockFetch([
+        { contains: '/services/', body: metadata({ redirectHref: `${SMP_BASE}/redirected.xml` }) },
+        { contains: 'redirected.xml', body: '<!DOCTYPE x []><x/>' },
+        {
+          contains: encodeURIComponent(SEGMENT),
+          body: buildServiceGroup(PARTICIPANT, [{ documentType: DOCUMENT_TYPE, href: refHref() }]),
+        },
+      ]),
+    }),
+  );
+  assert.equal(result.outcome, 'unavailable');
+  if (result.outcome === 'unavailable') {
+    assert.match(result.reason, /xml\.doctype/);
+    assert.match(result.reason, /redirected\.xml/);
   }
 });
