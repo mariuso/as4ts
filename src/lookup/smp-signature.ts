@@ -9,6 +9,9 @@ import { attrOf, firstByLocalName, textOf } from '../xml/nodes.js';
 import { ALGO_ENVELOPED_SIGNATURE, ALGO_INCLUSIVE_C14N, ALGO_RSA_SHA256, ALGO_SHA256, SMP_NS } from './constants.js';
 import { defaultLookupLimits, type LookupLimits } from './limits.js';
 
+/** The XML namespace, whose attributes xml-crypto copies from ancestors to the apex. */
+const XML_NAMESPACE = 'http://www.w3.org/XML/1998/namespace';
+
 /**
  * Inclusive C14N 1.0, which the SMP specification mandates (SMP v1.4.0 §5.5.1,
  * `http://www.w3.org/TR/2001/REC-xml-c14n-20010315`). This differs from the
@@ -128,16 +131,11 @@ export function inclusiveCanonicalSizeUpperBound(
   skip?: (child: Node) => boolean,
 ): number {
   let total = 0;
-  const scope: Array<{ prefix: string; cost: number }> = ancestorNamespaces.map((namespace) => ({
-    prefix: namespace.prefix,
-    cost: declarationCost(namespace.prefix, namespace.namespaceURI),
-  }));
-  let scopeSum = scope.reduce((sum, entry) => sum + entry.cost, 0);
 
   const visitNode = (child: Node): void => {
     switch (child.nodeType) {
       case 1:
-        visitElement(child as Element);
+        visitElement(child as Element, false);
         return;
       case 3: // text
       case 4: // CDATA — written as escaped character data
@@ -153,59 +151,51 @@ export function inclusiveCanonicalSizeUpperBound(
     }
   };
 
-  const visitElement = (element: Element): void => {
+  const visitElement = (element: Element, checkSkip: boolean): void => {
     const name = element.nodeName;
     total += 1 + utf8(name) + 1; // '<name'
-    const restore: Array<{ prefix: string; previous: number | null }> = [];
     for (let i = 0; i < element.attributes.length; i += 1) {
       const attribute = element.attributes.item(i);
       if (!attribute) continue;
       const attributeName = attribute.nodeName;
       if (attributeName === 'xmlns' || attributeName.startsWith('xmlns:')) {
+        // Every declaration xml-crypto renders is either a literal declaration in
+        // this subtree (charged here, once per declaration) or part of the top
+        // element's ancestor set (charged on the apex below). A descendant's
+        // element or attribute prefix is always declared literally somewhere in
+        // the subtree by the time it is used — an undeclared prefix is a parse
+        // error — so only the apex can rely on a declaration above the subtree.
         const prefix = attributeName === 'xmlns' ? '' : attributeName.slice('xmlns:'.length);
-        const cost = declarationCost(prefix, attribute.value ?? '');
-        const index = scope.findIndex((entry) => entry.prefix === prefix);
-        if (index >= 0) {
-          restore.push({ prefix, previous: scope[index]!.cost });
-          scopeSum -= scope[index]!.cost;
-          scope[index]!.cost = cost;
-          scopeSum += cost;
-        } else {
-          restore.push({ prefix, previous: null });
-          scope.push({ prefix, cost });
-          scopeSum += cost;
-        }
+        total += declarationCost(prefix, attribute.value ?? '');
       } else {
         total += 1 + utf8(attributeName) + 2 + escapedBytes(attribute.value ?? '') + 1;
       }
     }
     total += 1; // '>'
-    total += scopeSum; // every in-scope declaration may be rendered here
     const children = element.childNodes;
     for (let i = 0; i < children.length; i += 1) {
       const child = children.item(i);
-      if (child && !(skip && skip(child))) visitNode(child);
+      // `skip` removes only the *direct* children of the bound's starting node
+      // (the envelope signature the digest excludes), never a nested element.
+      if (child && !(checkSkip && skip && skip(child))) visitNode(child);
     }
     total += 2 + utf8(name) + 1; // '</name>'
-    for (let i = restore.length - 1; i >= 0; i -= 1) {
-      const entry = restore[i]!;
-      const index = scope.findIndex((candidate) => candidate.prefix === entry.prefix);
-      if (index < 0) continue;
-      scopeSum -= scope[index]!.cost;
-      if (entry.previous === null) scope.splice(index, 1);
-      else {
-        scope[index]!.cost = entry.previous;
-        scopeSum += entry.previous;
-      }
-    }
   };
 
   if (node.nodeType === 1) {
     const element = node as Element;
-    // Seed the in-scope set from the ancestors as well as the caller's list:
-    // xml-crypto renders inherited namespaces (including the default) on the
-    // apex, and `findAncestorNsForElement` excludes the apex's own prefix.
-    const seen = new Set(scope.map((entry) => entry.prefix));
+    const charged = new Set<string>();
+    let inheritedDefault: string | null = null;
+    for (const namespace of ancestorNamespaces) {
+      if (charged.has(namespace.prefix)) continue;
+      charged.add(namespace.prefix);
+      total += declarationCost(namespace.prefix, namespace.namespaceURI);
+      if (namespace.prefix === '' && namespace.namespaceURI !== '') {
+        inheritedDefault = namespace.namespaceURI;
+      }
+    }
+    // Declarations `findAncestorNsForElement` drops — notably the default
+    // namespace, which it excludes when the apex has no prefix.
     let ancestor: Node | null = element.parentNode;
     while (ancestor && ancestor.nodeType === 1) {
       const parent = ancestor as Element;
@@ -213,29 +203,36 @@ export function inclusiveCanonicalSizeUpperBound(
         const attribute = parent.attributes.item(i);
         if (!attribute) continue;
         const attributeName = attribute.nodeName;
-        if (attributeName === 'xmlns' || attributeName.startsWith('xmlns:')) {
-          const prefix = attributeName === 'xmlns' ? '' : attributeName.slice('xmlns:'.length);
-          if (!seen.has(prefix)) {
-            seen.add(prefix);
-            const cost = declarationCost(prefix, attribute.value ?? '');
-            scope.push({ prefix, cost });
-            scopeSum += cost;
-          }
+        if (attributeName !== 'xmlns' && !attributeName.startsWith('xmlns:')) continue;
+        const prefix = attributeName === 'xmlns' ? '' : attributeName.slice('xmlns:'.length);
+        if (charged.has(prefix)) continue;
+        charged.add(prefix);
+        const value = attribute.value ?? '';
+        total += declarationCost(prefix, value);
+        if (prefix === '' && value !== '') inheritedDefault = value;
+      }
+      ancestor = parent.parentNode;
+    }
+    // xml-crypto renders an inherited default namespace twice on the apex: once
+    // from its `nodeDefaultNs !== defaultNs` branch and once from the ancestor
+    // loop, which treats only a *literal* apex declaration as shadowing.
+    if (inheritedDefault !== null) total += declarationCost('', inheritedDefault);
+    // xml-crypto copies every ancestor attribute in the XML namespace
+    // (`xml:lang`, `xml:space`, `xml:base`, `xml:id`, ...) onto the apex.
+    // Charge every occurrence; over-counting is sound.
+    ancestor = element.parentNode;
+    while (ancestor && ancestor.nodeType === 1) {
+      const parent = ancestor as Element;
+      for (let i = 0; i < parent.attributes.length; i += 1) {
+        const attribute = parent.attributes.item(i);
+        if (!attribute) continue;
+        if (attribute.namespaceURI === XML_NAMESPACE || attribute.prefix === 'xml') {
+          total += 1 + utf8(attribute.nodeName) + 2 + escapedBytes(attribute.value ?? '') + 1;
         }
       }
       ancestor = parent.parentNode;
     }
-    visitElement(element);
-    // xml-crypto copies inherited xml:lang / xml:space onto the apex.
-    ancestor = element.parentNode;
-    while (ancestor && ancestor.nodeType === 1) {
-      const parent = ancestor as Element;
-      for (const attributeName of ['xml:lang', 'xml:space']) {
-        const value = parent.getAttribute(attributeName);
-        if (value !== null) total += 1 + utf8(attributeName) + 2 + escapedBytes(value) + 1;
-      }
-      ancestor = parent.parentNode;
-    }
+    visitElement(element, true);
   } else {
     const children = node.childNodes;
     for (let i = 0; i < children.length; i += 1) {
