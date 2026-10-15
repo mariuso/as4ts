@@ -207,8 +207,8 @@ for it; the directory is empty after every open is disposed.
 
 **Cost.** At 512 MiB × 4 concurrency, with a caller signal: about 78 s for the
 compressible document and 75 s for the barely-compressible one — roughly 26 and
-27 MiB/s recovered in aggregate across the four receives (Linux/Docker on the
-same host: 121 s and 63 s, about 17 and 33 MiB/s).
+27 MiB/s recovered, **aggregate across the four concurrent receives**
+(Linux/Docker on the same host: 121 s and 63 s, about 17 and 33 MiB/s aggregate).
 
 **Measured status.** The claim is met on both macOS and Linux, with the measured
 process run under plain `node` from a bundle, at concurrency 4, with and without a
