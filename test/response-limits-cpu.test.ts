@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { canonicalSizeUpperBound, canonicalize } from '../src/xml/c14n.js';
 import { parseStrictXml } from '../src/xml/strict.js';
 import { defaultLookupLimits } from '../src/lookup/limits.js';
+import { defaultResponseLimits } from '../src/response-limits.js';
 import { inclusiveCanonicalSizeUpperBound, inclusiveCanonicalize } from '../src/lookup/smp-signature.js';
 
 /**
@@ -56,8 +57,13 @@ test('the worst-case document stays under two seconds on both canonical paths', 
   const inclusiveBoundMs = performance.now() - started;
   assert.ok(inclusiveBoundMs < 2000, `the inclusive bound took ${inclusiveBoundMs.toFixed(0)} ms`);
 
+  // The bound must be within its budget, or the timing below would be skipped.
+  assert.ok(
+    inclusiveBound <= defaultLookupLimits.maxCanonicalBytes,
+    `inclusive bound ${inclusiveBound} exceeds the default canonical budget`,
+  );
   started = performance.now();
-  if (inclusiveBound <= defaultLookupLimits.maxCanonicalBytes) inclusiveCanonicalize(root);
+  inclusiveCanonicalize(root);
   const inclusiveC14nMs = performance.now() - started;
   assert.ok(inclusiveC14nMs < 2000, `inclusive C14N took ${inclusiveC14nMs.toFixed(0)} ms`);
 
@@ -65,6 +71,10 @@ test('the worst-case document stays under two seconds on both canonical paths', 
   const exclusiveBound = canonicalSizeUpperBound(root);
   const exclusiveBoundMs = performance.now() - started;
   assert.ok(exclusiveBoundMs < 2000, `the exclusive bound took ${exclusiveBoundMs.toFixed(0)} ms`);
+  assert.ok(
+    exclusiveBound <= defaultResponseLimits.maxCanonicalBytes,
+    `exclusive bound ${exclusiveBound} exceeds the default response canonical budget`,
+  );
 
   started = performance.now();
   canonicalize(root);

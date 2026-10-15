@@ -481,8 +481,16 @@ test('an over-canonical-budget SMP response never clones the document', () => {
     clones += 1;
     return original(...args);
   };
+
+  // Positive control: the spy sees the clone a normal verification makes, so a
+  // zero count below means "did not clone", not "the spy never fires".
+  assert.equal(verifySmpSignature(document, defaultLookupLimits).ok, true);
+  assert.ok(clones >= 1, 'a verified response clones the document');
+
+  clones = 0;
   const result = verifySmpSignature(document, { ...defaultLookupLimits, maxCanonicalBytes: 8 });
   assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.reason, /canonicalisation budget/);
   assert.equal(clones, 0, 'an over-budget response must not be cloned');
 });
 
