@@ -5,4 +5,4 @@
  * package.json by test/package-surface.test.ts.
  */
 export const PACKAGE_NAME = 'as4ts';
-export const PACKAGE_VERSION = '0.2.0-rc.2';
+export const PACKAGE_VERSION = '0.2.0-rc.3';
