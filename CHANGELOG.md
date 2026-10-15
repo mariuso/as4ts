@@ -6,8 +6,38 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0-rc.3] - 2026-10-15
+
+A release candidate that completes the bounded, streaming receive path. The
+receiving side now parses MIME incrementally with spooled parts, inspects the SBDH
+header while streaming the recovered document, and preflights and bounds every XML
+parse and canonicalisation, with a measured 500 MiB / four-concurrent-open
+contract. On the sending side it bounds receipt, error-signal and SMP lookup
+parsing, and it no longer caches a revocation-service outage for a full hour.
+
 ### Added
 
+- **Bounded inbound limits (`InboundLimits`).** `openAs4Message` now accepts
+  `limits: Partial<InboundLimits>`: every omitted property falls back to its
+  default, so supplying one bound never silently removes another. New fields:
+  `maxDomXmlBytes` (uncompressed XML eligible for DOM processing),
+  `maxCanonicalBytes`, and the structural `maxXmlDepth`, `maxXmlNodes`,
+  `maxXmlAttributes` and `maxXmlTokenBytes`. `maxXmlBytes` now bounds only the
+  incrementally inspected (SBDH) document, not DOM parsing. `resolveInboundLimits`
+  and `validateInboundLimits` are exported, and an invalid configuration is
+  reported as the new receiving `limits.invalid` failure before anything is
+  parsed. A caller that still passes only `maxXmlBytes` gets
+  `maxDomXmlBytes = min(default, maxXmlBytes)`: lowering the legacy limit still
+  tightens the DOM budget, raising it never raises it.
+- **New inbound failure reasons** `xml.too-many-attributes` and
+  `xml.token-too-large`, also members of `SbdhResourceLimit`, so an over-limit
+  header is reported as `sbdh.status: 'resource-limit'` with the parser's reason
+  rather than as malformed.
+- **`ResolvedAttachment.spoolPath`.** The MIME parser now hands recovery a
+  parser-owned spool to move (a single rename on the same filesystem) instead of a
+  ciphertext stream to copy; `source` is correspondingly optional, for a caller
+  that drives recovery directly. A failed transfer is a local storage failure
+  (`payload.spool-failed`), never a silent re-spool.
 - `responseLimits` on `sendAs4` / `transmitAs4` and `limits` on `lookupParticipant`,
   with `defaultResponseLimits` / `defaultLookupLimits` and their types exported, to
   bound receipt, error-signal and SMP lookup XML parsing and canonicalisation.
@@ -15,9 +45,29 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   secret-free `detail` on `NoSignalResult`.
 - `RevocationPolicy.unknownCacheMs`, the maximum cache lifetime for an `unknown`
   revocation answer (default 60 s).
+- **A measured receiving contract and harness.** `npm run measure:receive`
+  generates deterministic signed fixtures and measures the bundled receiver in a
+  fresh child under plain `node`; the 500 MiB claim, its limits override and how to
+  reproduce it are in [`docs/receiving-limits.md`](docs/receiving-limits.md), with
+  the recorded macOS and Linux results in
+  [`docs/receiving-measurements.md`](docs/receiving-measurements.md).
 
 ### Changed
 
+- **MIME parsing is incremental.** Each non-SOAP part is streamed into a
+  parser-owned spool file with backpressure rather than buffered, so peak memory
+  does not grow with the request body; only the bounded SOAP envelope is held in
+  memory. The parser's spool and recovery's workspace share the caller's
+  `spoolDirectory` filesystem, and the transfer between them is a rename.
+- **SBDH inspection streams.** The recovered document is inspected incrementally
+  with bounded retention of only the SBDH facts needed for comparison, while the
+  whole document is still parsed, so malformed content after the header and a
+  second header are still detected. The header budgets are separate from the
+  document budget.
+- **XML is preflighted and bounded.** Before the DOM is built, a bounded SAX pass
+  enforces depth, node, attribute and lexical-token limits, and canonicalisation
+  checks a conservative expansion bound before allocating. Only XML 1.0 is
+  accepted (XML 1.1 is rejected) on both the streaming and DOM paths.
 - Receipts, error signals and SMP lookup responses are parsed strictly
   (`parseStrictXml`): malformed, encoding-mismatched or DOCTYPE-bearing responses
   that were previously repaired are now `no-signal` / `unavailable`, and receipt
@@ -25,6 +75,26 @@ to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - An unreachable revocation service is now remembered for 60 s instead of the
   full `maxCacheMs` (60 min by default), so a recovered service is used again
   quickly.
+
+### Fixed
+
+- **`abortableStream` no longer retains consumed chunks.** Before the fix the MIME
+  parser kept the whole request body in memory while parsing — before
+  authentication, up to `maxRequestBytes` per concurrent receive — and the SBDH
+  and spool readers retained their streams when the caller passed a signal.
+- **The sender no longer reports `not-sent` for an unexpected parse error after
+  the request went out.** Reading or parsing a response that throws unexpectedly
+  now yields `no-signal` with `detail: 'internal.error'`, instead of claiming a
+  request that was definitely sent was never sent.
+- The MIME parser honours the configured `spoolDirectory`. It previously always
+  spooled under the OS temporary directory, so the initial quarantine ignored the
+  caller's storage choice and a cross-filesystem rename could fail.
+- Filesystem failures while parsing are reported as `payload.spool-failed`
+  (stage `payload`) instead of an internal error.
+- SBDH header accounting is bound to the namespace-validated header element, and
+  an XML 1.1 declaration or a lexical/SAX divergence fails closed, so an
+  over-limit or lookalike header can no longer be silently reported as
+  consistent.
 
 ## [0.2.0-rc.1] - 2026-10-13
 
